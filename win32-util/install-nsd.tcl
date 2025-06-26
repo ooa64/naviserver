@@ -104,7 +104,15 @@ proc copy_catch {from to} {
    # files.  Looks like the -force has no effect when recursively copying
    # whole directory trees:  --atp@piskorski.com, 2004/06/24 00:58 EDT
 
-   if { [catch { file copy -force -- "$from" "$to" } errmsg] } {
+   # NOTE: recursively copy/overwrite directory trees. ooa64@ua.fm, 2025/06/26
+   if {![file exists "$to"]} {
+       file mkdir "$to"
+   }
+   if { [file isdirectory "$from"] } {
+       foreach f [glob -directory $from -nocomplain *] {
+           copy_catch $f [file join $to [file tail $from]]
+       }
+   } elseif { [catch { file copy -force -- "$from" "$to" } errmsg] } {
       if { [string match {*error copying*file already exists*} $errmsg] } {
          puts "Notice: Did NOT overwrite these files:\n  $errmsg"
       } else {
@@ -156,7 +164,7 @@ proc install_naviserver_core {core_dir install_dir} {
    foreach ff [list nsd-config.tcl simple-config.tcl openacs-config.tcl sample-config.tcl] {
       lappend cp_list $ff {conf/}
    }
-   foreach ff [list index.adp bitbucket-install.tcl tests] {
+   foreach ff [list index.adp tests] {
       lappend cp_list $ff {pages/}
    }
    foreach [list from to] $cp_list {

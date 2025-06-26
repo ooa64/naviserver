@@ -119,8 +119,19 @@ NS_DB_P=0
 # To activate zlib, provide location of include and library files here
 # and activate HAVE_ZLIB in nsconfig-win32.h, and make sure, zlib is
 # installed on your system
+
+!if "" == "$(ZLIB)"
+!if "" == "$(ZLIBSRC)"
 zlib_lib=c:\P\lib
 zlib_include=c:\P\include
+!else
+zlib_lib=..\nsd\zlib
+zlib_include=$(ZLIBSRC)
+!endif
+!else
+zlib_lib=$(ZLIB)\lib
+zlib_include=$(ZLIB)\include
+!endif
 
 # For past OpenSSL-related link problems, see:
 #   https://sourceforge.net/p/naviserver/mailman/message/36519758/
@@ -137,10 +148,15 @@ zlib_include=c:\P\include
 # - openssl-1.0.2q-x64_86-win64.zip, openssl-1.0.2q-x64_86-win64_LinkLibs.zip
 #   Use:  openssl_libs = ssleay32.lib libeay32.lib
 
-openssl_64 = C:\P\OpenSSL-Win64-3.1.0
+!if "" == "$(OPENSSL)"
+openssl_64 = C:\P\OpenSSL-Win64
 openssl_32 = C:\P\OpenSSL-Win32
 #openssl_64 = C:\P\openssl-indy_1.0.2q\64
 #openssl_32 = C:\P\openssl-indy_1.0.2q\32
+!else
+openssl_64 = $(OPENSSL)
+openssl_32 = $(OPENSSL)
+!endif
 
 # Make sure you also add e.g. C:\P\OpenSSL-Win64\bin to your system PATH,
 # so that NaviServer finds the libssl*.dll it needs when it runs.

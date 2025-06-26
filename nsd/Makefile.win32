@@ -1,0 +1,33 @@
+#
+# nsd/Makefile.win32
+#
+
+!if "$ZLIBSRC" == "" || "$ZLIB" != ""
+!include Makefile
+!else
+
+DEFS = $(DEFS) /D HAVE_ZLIB_H /I $(ZLIBSRC) /I zlib
+LIBS = $(LIBS) zlib\zlib.lib
+BUILD= $(BUILD) build-zlib
+CLEAN= $(CLEAN) clean-zlib
+
+!include Makefile
+
+ZLIBOBJS = zlib\adler32.obj zlib\compress.obj zlib\crc32.obj zlib\deflate.obj zlib\infback.obj zlib\inffast.obj zlib\inflate.obj zlib\inftrees.obj zlib\trees.obj zlib\uncompr.obj zlib\zutil.obj
+# add for nszlib
+ZLIBOBJS = $(ZLIBOBJS) zlib\gzlib.obj zlib\gzread.obj zlib\gzwrite.obj zlib\gzclose.obj
+
+build-zlib: zlib\zlib.lib
+
+clean-zlib:
+	-$(RM) zlib\unistd.h zlib\*.obj zlib\zlib.lib
+
+zlib\zlib.lib: $(ZLIBOBJS)
+	lib -nologo -out:zlib\zlib.lib $(ZLIBOBJS)
+
+{$(ZLIBSRC)}.c{zlib}.obj:
+	@if not exist zlib (mkdir zlib)
+	@if not exist zlib\unistd.h (echo /* Fake include for MSVC */ > zlib\unistd.h)
+	$(CC) $(CFLAGS) /c /Fo$*.obj $<
+
+!endif
