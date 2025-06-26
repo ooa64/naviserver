@@ -2,7 +2,7 @@
 # nsd/Makefile.win32
 #
 
-!if "$ZLIBSRC" == "" || "$ZLIB" != ""
+!if "$(ZLIBSRC)" == "" || "$(ZLIB)" != ""
 !include Makefile
 !else
 

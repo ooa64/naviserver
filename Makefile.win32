@@ -173,7 +173,7 @@ _install:
 !if "" == "$(INSTALLDIR)"
 	$(TCLSH) win32-util/install-nsd.tcl -i 1
 !else
-	$(TCLSH) win32-util/install-nsd.tcl -i 1 -t $(INSTALLDIR)\ -c 0
+	$(TCLSH) win32-util/install-nsd.tcl -i 1 -t $(INSTALLDIR)\ -c 0 -m "nsoracle nszlib"
 !endif
 
 _cert: $(PEM_FILE)
