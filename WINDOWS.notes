@@ -1,0 +1,23 @@
+Using Naviserver 5.00/Tcl 9.0 on Windows.
+
+...
+
+The Windows "registry" package should be removed or rebuilt without exporting the "Registry_Unload" symbol.
+Loading this standard package directly or indirectly (e.g. via [clock format]) may result in critical errors:
+
+... Notice: start update interpreter default to epoch 1, concurrent 1
+... Notice: update interpreter default to epoch 1 done, trace none, time 0.000000 secs concurrent 1
+... Error: no library with prefix "Registry" is loaded statically
+:    no library with prefix "Registry" is loaded statically
+:        while executing
+:    "load {} Registry"
+:    (context: update interpreter) line 2
+... Error: invalid command name "ns_init"
+:    invalid command name "ns_init"
+:        while executing
+:    "ns_init"
+:        while executing callback
+:    ns:tcltrace ns_init
+:    (context: trace proc) line 1
+...
+
