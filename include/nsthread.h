@@ -268,6 +268,10 @@ MSVC++ 14.2 _MSC_VER == 1920 (Visual Studio 2019 version 16.0)
 #  define NS_INVALID_SOCKET     (-1)
 #  define NS_INVALID_FD         (-1)
 
+#  define strcoll_l             _strcoll_l
+#  define locale_t              _locale_t
+#  define gettimeofday          mingw_gettimeofday
+
 typedef int ns_sockerrno_t;
 typedef long uid_t;
 typedef long gid_t;
@@ -1314,6 +1318,7 @@ NS_EXTERN ssize_t ns_read(int fildes, void *buf, size_t nbyte);
 NS_EXTERN off_t   ns_lseek(int fildes, off_t offset, int whence);
 NS_EXTERN ssize_t ns_recv(NS_SOCKET socket, void *buffer, size_t length, int flags);
 NS_EXTERN ssize_t ns_send(NS_SOCKET socket, const void *buffer, size_t length, int flags);
+NS_EXTERN ssize_t ns_getline(char **lineptr, size_t *n, FILE *stream);
 NS_EXTERN int     ns_snprintf(char *buf, size_t len, const char *fmt, ...);
 #endif
 

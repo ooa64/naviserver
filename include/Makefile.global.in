@@ -209,3 +209,7 @@ endif
 ifneq (,$(findstring OpenBSD,$(uname)))
     NSLIBS += -lpthread
 endif
+
+ifneq (,$(findstring MINGW,$(uname)))
+    NSLIBS += -static-libgcc -Wl,-Bstatic -lpthread -lz -ltclstub86 -lws2_32 -lcrypt32
+endif

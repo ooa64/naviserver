@@ -121,7 +121,7 @@ install-certificates: $(PEM_FILE) ca-bundle.crt
 		$(INSTALL_DATA) $$i $(DESTDIR)$(NAVISERVER)/certificates/; \
 	done
 	@if [ -n "$(OPENSSL_LIBS)" ]; then \
-		$(OPENSSL) rehash $(DESTDIR)$(NAVISERVER)/certificates ; \
+		($(OPENSSL) rehash $(DESTDIR)$(NAVISERVER)/certificates 2>/dev/null || true) ; \
 	fi
 	$(INSTALL_DATA) ca-bundle.crt $(DESTDIR)$(NAVISERVER)/
 
