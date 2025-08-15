@@ -32,6 +32,10 @@
 # endif
 #endif
 
+#ifdef USE_TCL_STUBS
+# error USE_TCL_STUBS should be undefined
+#endif
+
 /*
  * Do we allow relative URI is the "Location" header field?
  *
@@ -148,6 +152,9 @@
 # ifndef _WIN32_WINNT
 #  define _WIN32_WINNT                0x0600
 # endif
+# if _WIN32_WINNT < 0x0600
+#  error _WIN32_WINNT should be >= 0x0600
+# endif
 
 # include <windows.h>
 # include <winsock2.h>
@@ -263,6 +270,7 @@ MSVC++ 14.2 _MSC_VER == 1920 (Visual Studio 2019 version 16.0)
 /*
  * MinGW
  */
+
 #  define NS_SOCKET             int
 #  define NS_INVALID_PID        (-1)
 #  define NS_INVALID_SOCKET     (-1)

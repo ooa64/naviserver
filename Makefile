@@ -19,7 +19,7 @@ include include/Makefile.global
 dirs    = nsthread nsd nssock nscgi nscp nslog nsperm nsdb nsdbtest nsssl revproxy
 
 # Unix only modules
-ifeq (,$(findstring MINGW,$(uname)))
+ifneq (.exe,$(EXEEXT))
    dirs += nsproxy
 endif
 
@@ -234,14 +234,23 @@ build-doc:
 ifeq ($(shell id -u),0)
 NS_TEST_CFG	= -u nsadmin -c -d -t $(srcdir)/tests/test.nscfg
 else
+ifneq (.exe,$(EXEEXT))
 NS_TEST_CFG	= -c -d -t $(srcdir)/tests/test.nscfg
+else
+NS_TEST_CFG	= -c -t $(srcdir)/tests/test.nscfg
+endif
 endif
 
 
 NS_TEST_ALL	= $(srcdir)/tests/all.tcl $(TESTFLAGS)
+ifneq (.exe,$(EXEEXT))
 NS_LD_LIBRARY_PATH	= \
    LD_LIBRARY_PATH="$(srcdir)/nsd:$(srcdir)/nsthread:$(srcdir)/nsdb:$(srcdir)/nsproxy:$$LD_LIBRARY_PATH" \
    DYLD_LIBRARY_PATH="$(srcdir)/nsd:$(srcdir)/nsthread:$(srcdir)/nsdb:$(srcdir)/nsproxy:$$DYLD_LIBRARY_PATH"
+else
+NS_LD_LIBRARY_PATH	= \
+   PATH="$(srcdir)/nsd:$(srcdir)/nsthread:$(srcdir)/nsdb:$(srcdir)/nsproxy:$$PATH"
+endif
 
 EXTRA_TEST_DIRS =
 ifneq ($(OPENSSL_LIBS),)
