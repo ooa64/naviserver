@@ -21,3 +21,14 @@ Loading this standard package directly or indirectly (e.g. via [clock format]) m
 :    (context: trace proc) line 1
 ...
 
+
+Compile using MSYS and MINGW (Windows):
+
+- install MSYS
+- install winlibs MINGW into /mingw
+- configure
+	PATH=/mingw/bin:$PATH LIBS="-lcrypto -lcrypt32 -lws2_32" \
+	sh ./autogen.sh --prefix=/opt/naviserver --with-tcl=/opt/naviserver/lib64 --with-openssl=/opt/naviserver --with-zlib=/opt/naviserver
+- make and install
+	PATH=/mingw/bin:$PATH make CFLAGS_DEFAULT="-D_WIN32_WINNT=0x600"
+- note some thing working bad (at least locale)
