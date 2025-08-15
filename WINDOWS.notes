@@ -25,10 +25,41 @@ Loading this standard package directly or indirectly (e.g. via [clock format]) m
 Compile using MSYS and MINGW (Windows):
 
 - install MSYS
-- install winlibs MINGW into /mingw
+- install winlibs MINGW into MSYS's /mingw
+- build static openssl using mingw, install into /opt/naviserver
+	PATH=/mingw/bin:$PATH perl Configure mingw64 no-shared --prefix=/opt/naviserver
+	make install_dev
+- build tcl using mingw, install into /opt/naviserver
+	PATH=/mingw/bin:$PATH sh configure --prefix=/opt/naviserver
+	PATH=/mingw/bin:$PATH make install
+- build zlib, install into /opt/naviserver
+	PATH=/mingw/bin:$PATH make -f win32/Makefile.gcc DESTDIR=/opt/naviserver INCLUDE_PATH=/include LIBRARY_PATH=/lib install
 - configure
 	PATH=/mingw/bin:$PATH LIBS="-lcrypto -lcrypt32 -lws2_32" \
 	sh ./autogen.sh --prefix=/opt/naviserver --with-tcl=/opt/naviserver/lib64 --with-openssl=/opt/naviserver --with-zlib=/opt/naviserver
 - make and install
 	PATH=/mingw/bin:$PATH make CFLAGS_DEFAULT="-D_WIN32_WINNT=0x600"
 - note some thing working bad (at least locale)
+
+
+Crosscompile (SUSE Linux)
+
+- install mingw64 cross compiler
+	zypper in mingw64-cross-gcc-c++ mingw64-cross-pkgconf
+- build openssl, install into /windows/naviserver
+	./Configure mingw64 --cross-compile-prefix=x86_64-w64-mingw32- --prefix=/windows/naviserver
+	make install_dev
+- build tcl, install into /windows/naviserver
+	./configure --host=x86_64-w64-mingw32 --prefix=/windows/naviserver
+	make install
+- install zlib from tcl sources to /windows/naviserver
+	cp compat/zlib/win64/libz.dll.a /windows/naviserver/lib64/
+	cp compat/zlib/zconf.h /windows/naviserver/include/
+	cp compat/zlib/zlib.h /windows/naviserver/include/
+  or build from sources and install into /windows/naviserver 
+- build naviserver
+	ipath=/windows/naviserver
+	CFLAGS="-D_WIN32_WINNT=0x0600" LIBS="-lws2_32 -lcrypt32" ./autogen.sh --host=x86_64-w64-mingw32 \
+              --prefix=$ipath --with-zlib=$ipath --with-openssl=$ipath --with-tcl=$ipath/lib64
+	CFLAGS="-D_WIN32_WINNT=0x0600" make install
+ 
