@@ -1,8 +1,10 @@
-Using Naviserver 5.00/Tcl 9.0 on Windows.
+Using Naviserver 5.00 on Windows.
+
+Configuration parameter tmpfir or environment variable TMPDIR should be defined and points to the writable directory!
 
 ...
 
-The Windows "registry" package should be removed or rebuilt without exporting the "Registry_Unload" symbol.
+Tcl 9.0: The Windows "registry" package should be removed or rebuilt without exporting the "Registry_Unload" symbol.
 Loading this standard package directly or indirectly (e.g. via [clock format]) may result in critical errors:
 
 ... Notice: start update interpreter default to epoch 1, concurrent 1
@@ -20,7 +22,6 @@ Loading this standard package directly or indirectly (e.g. via [clock format]) m
 :    ns:tcltrace ns_init
 :    (context: trace proc) line 1
 ...
-
 
 Compile using MSYS and MINGW (Windows):
 
