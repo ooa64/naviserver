@@ -160,6 +160,8 @@ proc install_naviserver_core {core_dir install_dir} {
       contrib/examples         pages/
       win32/test/servers/test  servers/
       win32/test/nsd.tcl       servers/test/
+      ca-bundle.crt            {}
+      tests/testserver/certificates/server.pem certificates/
    }
    foreach ff [list nsd-config.tcl simple-config.tcl openacs-config.tcl sample-config.tcl] {
       lappend cp_list $ff {conf/}

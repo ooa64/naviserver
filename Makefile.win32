@@ -182,7 +182,7 @@ $(PEM_FILE): $(PEM_PRIVATE)
 	openssl req -new -config $(SSLCONFIG) -x509 -nodes -sha1 -days 365 -key host.key > host.cert
 	copy host.cert+host.key server.pem
 	del host.cert
-        del host.key
+    del host.key
 	openssl dhparam 1024 >> server.pem
 	move server.pem $(PEM_FILE)
 	-openssl rehash $(TEST_CERTIFICATES)
