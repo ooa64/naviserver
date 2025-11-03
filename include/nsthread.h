@@ -965,6 +965,14 @@ typedef int bool;
 # define NSSOCK2PTR(p) INT2PTR(p)
 #endif
 
+#ifndef	SSIZE_MAX
+/* We assume, HAVE_64BIT implies __WORDSIZE == 64 */
+# if defined(HAVE_64BIT)
+#  define SSIZE_MAX	LONG_MAX
+# else
+#  define SSIZE_MAX	INT_MAX
+# endif
+#endif
 
 #if defined(F_DUPFD_CLOEXEC)
 # define ns_dup(fd)     fcntl((fd), F_DUPFD_CLOEXEC, 0)

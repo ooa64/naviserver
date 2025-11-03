@@ -301,7 +301,16 @@ Ns_ParseRequest(Ns_Request *request, const char *line, size_t len)
              * The last token does not have the form of an HTTP-version
              * string. Report result as invalid request.
              */
+#ifdef HTTP09_UNSAFE_URL
+            /*
+             * allow spaces in the URL for HTTP 0.9
+             */
+            if (*url != '/') {
+                goto done;
+            }
+#else
             goto done;
+#endif
         }
     } else {
         /*

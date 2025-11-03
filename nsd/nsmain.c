@@ -633,7 +633,7 @@ Ns_Main(int argc, char *const* argv, Ns_ServerInitProc *initProc)
         response = setlocale(LC_COLLATE, localeString);
         if (response != NULL) {
 #ifdef _WIN32
-            nsconf.locale = _create_locale(LC_COLLATE, localeString);
+            nsconf.locale = _create_locale(LC_COLLATE, response);
 #else
             nsconf.locale = newlocale(LC_COLLATE_MASK, localeString, (locale_t)0);
 #endif

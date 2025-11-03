@@ -14,15 +14,38 @@
 #    "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat"
 #    "%ProgramFiles%\Microsoft SDKs\Windows\v7.1\Bin\SetEnv.Cmd" /Debug /x64 /win7
 #
-# 4. nmake -f Makefile.win32
+# 4. Define environment variables
+#    TCLPATH - tcl install dir
+#    TCLLIB - tcl library name (tcl90.lib tclstub.lib)
+#    TCLSH - tcl shell (path\tclsh90.exe)
+#    ZLIBSRC - tcl sources (to compile zlib) or
+#    ZLIB - zlib install dir 
+# OPENSSL - openssl install dir
+# INSTALLDIR - install path
+#
+# 5. nmake -f Makefile.win32
 #
 
+!if "" == "$(TCLPATH)"
 tcl_64 = C:\P\Tcl-64-8.6
 #tcl_64 = C:\P\ActiveTcl
 tcl_32 = C:\P\Tcl-32
+!else
+tcl_64 = "$(TCLPATH)"
+tcl_32 = "$(TCLPATH)"
+!endif
 
+!if "" == "$(TCLLIB)"
 tcllib_64 = tcl86t.lib
 tcllib_32 = tcl85.lib
+!else
+tcllib_64 = "$(TCLLIB)"
+tcllib_32 = "$(TCLLIB)"
+!endif
+
+!if "" == "$(TCLSH)"
+TCLSH = tclsh
+!endif
 
 !if "" == "$(TARGET_CPU)"
 TARGET_CPU = $(VSCMD_ARG_TGT_ARCH)
@@ -83,6 +106,8 @@ DEBUG=1
 
 PWD = $(MAKEDIR)
 PEM_FILE  = tests/testserver/etc/server.pem
+PEM_PRIVATE = tests/testserver/etc/myprivate.pem
+PEM_PUBLIC  = tests/testserver/etc/mypublic.pem
 SSLCONFIG = tests/testserver/etc/openssl.cnf
 
 # nmake command to exec for each module:
@@ -124,8 +149,7 @@ NMAKE = nmake /nologo TCLPATH="$(TCLPATH)" TCLLIB="$(TCLLIB)" LIB="$(LIB)" DEBUG
 # --atp@piskorski.com, 2014/10/10 17:25 EDT
 
 core_targets = _nsthread _nsd _nscgi _nscp _nsdb _nsdbtest _nssock _nslog _nsperm _nsssl _nsproxy
-module_targets = _nsoracle
-
+module_targets = _nsoracle _nszlib 
 tgts_core_clean = $(core_targets:_=C)
 tgts_modl_clean = $(module_targets:_=C)
 tgts_core_inst  = $(core_targets:_=I)
@@ -165,14 +189,29 @@ $(tgts_modl_clean):
 	pushd "..\$(@:C=)" & $(NMAKE) -f Makefile.win32 clean & popd )
 
 _nsversion:
-	tclsh win32-util/configure.tcl
+	$(TCLSH) win32-util/configure.tcl
+        @if not exist sample-config.tcl copy sample-config.tcl.in sample-config.tcl
 _install:
-	tclsh win32-util/install-nsd.tcl -i 1
+!if "" == "$(INSTALLDIR)"
+	$(TCLSH) win32-util/install-nsd.tcl -i 1
+!else
+	$(TCLSH) win32-util/install-nsd.tcl -i 1 -t $(INSTALLDIR)\ -c 0
+!endif
 
 _cert: $(PEM_FILE)
-$(PEM_FILE):
-	openssl req -new -config $(SSLCONFIG) -x509 -nodes -sha1 -days 365 -keyout $(PEM_FILE) -out $(PEM_FILE)
-	openssl dhparam 1024 >> $(PEM_FILE)
+$(PEM_FILE): $(PEM_PRIVATE)
+	openssl genrsa 2048 > host.key
+	openssl req -new -config $(SSLCONFIG) -x509 -nodes -sha1 -days 365 -key host.key > host.cert
+	cat host.cert host.key > server.pem
+	rm -rf host.cert host.key
+	openssl dhparam 1024 >> server.pem
+	mv server.pem $(PEM_FILE)
+
+$(PEM_PRIVATE):
+	openssl genrsa -out $(PEM_PRIVATE) 512
+	openssl rsa -in $(PEM_PRIVATE) -pubout > $(PEM_PUBLIC)
+
+
 
 # Nmake has NO GOOD WAY to save the output of a shell command into a variable!
 # Thus we use a static output filename here, rather than e.g. embedding the current date/time.
@@ -182,3 +221,17 @@ _test:
 
 _test_one:
 	PATH=$(PWD)\nsd;$(PWD)\nsthread;$(PWD)\nsdb;$(PWD)\nsproxy;$(PATH) & $(PWD)\nsd\nsd.exe -c -t $(PWD)/tests/test.nscfg $(PWD)/tests/all.tcl -verbose sp -file ns_thread.test
+
+NS_TEST_CFG	= -c -t $(MAKEDIR)/tests/test.nscfg
+NS_TEST_ALL	= all.tcl $(TESTFLAGS) -outfile $(MAKEDIR)\test.log
+NS_LD_LIBRARY_PATH= $(MAKEDIR)\nsd;$(MAKEDIR)\nsthread;$(MAKEDIR)\nsdb;$(TCLSRC)\win\$(TCLBUILDDIR);$(openssl_dir)\bin;$(INSTALLDIR)\bin
+test: $(PEM_FILE)
+        setlocal
+        set LANG=C
+        set LC_ALL=C
+        set NAVISERVER=$(MAKEDIR)
+        set TMPDIR=$(TEMP)
+        set PATH=$(NS_LD_LIBRARY_PATH);%PATH%
+        set TCL_LIBRARY=$(TCLSRC)\library
+        $(MAKEDIR)\nsd\nsd $(NS_TEST_CFG) $(NS_TEST_ALL) $(TESTFLAGS)
+	endlocal
