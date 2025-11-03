@@ -203,8 +203,8 @@ Ns_SockaddrSameIP(const struct sockaddr *addr1, const struct sockaddr *addr2)
                           4) == 0 ? NS_TRUE : NS_FALSE;
         }
         return NS_FALSE;
-    }
 #endif
+    }
     /*
      * Family mismatch.
      */
