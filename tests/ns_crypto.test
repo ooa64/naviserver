@@ -16,11 +16,15 @@ tcltest::testConstraint argon2 [expr {![catch {::ns_crypto::argon2 -variant ARGO
 
 
 #######################################################################################
-#  Syntax tests no covered below
+#  Syntax tests not covered below
 #######################################################################################
 test ns_crypto::randombytes-1.0 {syntax: ns_crypto::randombytes} -body {
     ns_crypto::randombytes
 } -returnCodes error -result {wrong # args: should be "ns_crypto::randombytes ?-encoding hex|base64url|base64|binary? /nrbytes[1,MAX]/"}
+
+test ns_crypto::uuid-1.0 {syntax: ns_crypto::uuid} -body {
+    ns_crypto::uuid -
+} -returnCodes error -result {wrong # args: should be "ns_crypto::uuid ?-version v4|v7?"}
 
 
 #######################################################################################
@@ -240,41 +244,41 @@ test ns_hmac_sha1-1.3 {ns_hmac binary operation (example from RFC 4226, appendix
 #######################################################################################
 
 
-test ns_md-1.0 {syntax: ns_md subcommands} -constraints crypto -body {
+test ns_md-1.0 {syntax: ns_md subcommands} -constraints {crypto nsf} -body {
     ns_md ?
 } -returnCodes error -result {method '?' unknown for ::ns_md; in order to create an instance of class ::ns_md, consider using '::ns_md create ? ?...?'}
 
-test ns_md-1.1 {syntax: ns_md new} -constraints crypto -body {
+test ns_md-1.1 {syntax: ns_md new} -constraints {crypto nsf} -body {
     ns_md new -x
 } -returnCodes error -match glob -result {* ?-digest /value/? *}
 # "ns_md new: don't advertise all {wrong # args: should be "ns_md new ?-digest /value/?"}
 
-test ns_md-1.2 {syntax: ns_md file} -constraints crypto -body {
+test ns_md-1.2 {syntax: ns_md file} -constraints {crypto nsf} -body {
     ns_md file
 } -returnCodes error -match glob -result {*ns_md file ?-digest /value/? ?-encoding /value/? /filename/ ?/arg .../?}
 # "ns_md file" don't advertise all {wrong # args: should be "ns_md file ?-digest /value/? ?-encoding /value/? /filename/ ?/filename .../?"}
 
-test ns_md-1.3 {syntax: ns_md string} -constraints crypto -body {
+test ns_md-1.3 {syntax: ns_md string} -constraints {crypto nsf} -body {
     ns_md string
 } -returnCodes error -match glob -result {*ns_md string ?-digest /value/? ?-encoding /value/? /message/}
 # "ns_md string" don't advertise all {wrong # args: should be "ns_md string ?-digest /value/? ?-encoding /value/? /message/"}
 
 
-test ns_hmac-1.0 {syntax: ns_hmac sucommands} -constraints crypto -body {
+test ns_hmac-1.0 {syntax: ns_hmac sucommands} -constraints {crypto nsf} -body {
     ns_hmac ?
 } -returnCodes error -result {method '?' unknown for ::ns_hmac; in order to create an instance of class ::ns_hmac, consider using '::ns_hmac create ? ?...?'}
 
-test ns_hmac-1.1 {syntax: ns_hmac new} -constraints crypto -body {
+test ns_hmac-1.1 {syntax: ns_hmac new} -constraints {crypto nsf} -body {
     ns_hmac new -x
 } -returnCodes error -match glob -result {* -key /value/ ?-digest /value/? *}
 # "ns_hmac new: don't advertise all {wrong # args: should be "ns_hmac new ?-digest /value/? -key /value/"}
 
-test ns_hmac-1.2 {syntax: ns_hmac file} -constraints crypto -body {
+test ns_hmac-1.2 {syntax: ns_hmac file} -constraints {crypto nsf} -body {
     ns_hmac file
 } -returnCodes error -match glob -result {*ns_hmac file ?-digest /value/? ?-encoding /value/? /key/ /filename/ ?/arg .../?}
 # "ns_hmac file" don't advertise all {wrong # args: should be "ns_hmac file ?-digest /value/? ?-encoding /value/?  /key/ /filename .../"}
 
-test ns_hmac-1.3 {syntax: ns_hmac string} -constraints crypto -body {
+test ns_hmac-1.3 {syntax: ns_hmac string} -constraints {crypto nsf} -body {
     ns_hmac string
 } -returnCodes error -match glob -result {*ns_hmac string ?-digest /value/? ?-encoding /value/? /key/ /message/}
 # "ns_hmac string" don't advertise all {wrong # args: should be "ns_hmac string ?-digest /value/? ?-encoding /value/? /key/ /message/"}
@@ -366,7 +370,7 @@ test pbkdf2_hmac-sha256.5 {Testcase 4 for pbkdf2-hmac-sha256, forcing a differen
 
 test ns_hotp-1.0 {syntax: ns_hotp} -constraints {crypto nsf} -body {
     ns_hotp x y
-} -returnCodes error -result {invalid argument 'y', maybe too many arguments; should be "ns_hotp ?-digest /value/? ?-digits /integer/? ?-key /value/? /data/"}
+} -returnCodes error -result {invalid argument 'y', maybe too many arguments; should be "ns_hotp ?-digest /value/? ?-digits /integer/? ?-key /value/? /counter/"}
 
 test hotp-1.1 {
 
@@ -612,7 +616,7 @@ test aead-1.1 {aead::encrypt and decrypt} -body {
 ############################################################################
 # Test Cases for ns_crypto::scrypt
 ############################################################################
-test ns_crypto::scrypt-1.0 {syntax: ns_crypto::scrypt} -constraints {crypto scrypt} -body {
+test scrypt-1.0 {syntax: ns_crypto::scrypt} -constraints {crypto scrypt} -body {
     ns_crypto::scrypt ?
 } -returnCodes error -result {wrong # args: should be "ns_crypto::scrypt ?-binary? ?-salt /value/? ?-secret /value/? ?-n /integer[1,MAX]/? ?-p /integer[1,MAX]/? ?-r /integer[1,MAX]/? ?-encoding hex|base64url|base64|binary?"}
 
@@ -637,7 +641,7 @@ test scrypt-1.2 {
 ############################################################################
 # Test Cases for ns_crypto::argon2
 ############################################################################
-test ns_crypto::argon2-1.0 {syntax: ns_crypto::argon2} -constraints {crypto argon2} -body {
+test argon2-1.0 {syntax: ns_crypto::argon2} -constraints {crypto argon2} -body {
     ns_crypto::argon2 ?
 } -returnCodes error -result {wrong # args: should be "ns_crypto::argon2 ?-ad /value/? ?-binary? ?-encoding hex|base64url|base64|binary? ?-iter /integer[1,MAX]/? ?-lanes /integer[1,MAX]/? ?-memcost /integer[1,MAX]/? ?-outlen /integer[1,MAX]/? ?-password /value/? ?-salt /value/? ?-secret /value/? ?-threads /integer/? ?-variant /value/?"}
 
@@ -770,6 +774,16 @@ test ns_crypto::eckey-1.6 {syntax: ns_crypto::eckey sharedsecret} -body {
     ns_crypto::eckey sharedsecret
 } -returnCodes error -result {wrong # args: should be "ns_crypto::eckey sharedsecret ?-binary? ?-encoding hex|base64url|base64|binary? ?-passphrase /value/? ?-pem /value/? ?--? /pubkey/"}
 
+############################################################################
+# Test Cases for ns_crypto::uuid
+############################################################################
+test ns_crypto::uuid-1.1 {UUID v4, length of UUID} -constraints crypto -body {
+    string length [ns_crypto::uuid -version v4]
+} -returnCodes {error ok} -result {36}
+
+test ns_crypto::uuid-1.2 {UUID v7, length of UUID} -constraints crypto -body {
+    string length [ns_crypto::uuid -version v7]
+} -returnCodes {error ok} -result {36}
 
 #
 # Local variables:

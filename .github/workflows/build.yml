@@ -18,7 +18,7 @@ jobs:
         include:
           - os: ubuntu-latest
             compiler: gcc-14
-            tcltag: core-8-6-16
+            tcltag: core-8-6-17
             nsf_version: 2.3.0
             tdom_version: 0.9.1
             with_deprecated: 1
@@ -86,6 +86,11 @@ jobs:
           echo GITHUB_REF=${GITHUB_REF} PWD=`pwd`
           cat /etc/os-release
           ls -ltr
+      - name: Set MAKEFLAGS for parallel build
+        shell: bash
+        run: |
+          CORES="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu || echo 1)"
+          echo "MAKEFLAGS=-j${CORES} -Oline" >> "$GITHUB_ENV"
       - name: Compile all
         run: |
           sudo \

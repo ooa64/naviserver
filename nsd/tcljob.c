@@ -428,7 +428,7 @@ JobCreateObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T ob
 {
     int               result = TCL_OK, maxThreads = NS_JOB_DEFAULT_MAXTHREADS;
     Tcl_Obj          *queueIdObj;
-    char             *descString  = (char *)"";
+    const char       *descString  = NS_EMPTY_STRING;
     Ns_ObjvValueRange maxThreadsRange = {1, INT_MAX};
     Ns_ObjvSpec       lopts[] = {
         {"-desc",   Ns_ObjvString,   &descString,   NULL},
@@ -450,7 +450,7 @@ JobCreateObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T ob
         Ns_MutexLock(&tp.queuelock);
         hPtr = Tcl_CreateHashEntry(&tp.queues, queueIdString, &isNew);
         if (isNew != 0) {
-            Queue *queue = NewQueue(Tcl_GetHashKey(&tp.queues, hPtr), descString, maxThreads);
+            Queue *queue = NewQueue(Ns_TclGetHashKeyString(&tp.queues, hPtr), descString, maxThreads);
 
             Tcl_SetHashValue(hPtr, queue);
         }
@@ -1036,7 +1036,7 @@ JobJobsObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T objc
              hPtr != NULL;
              hPtr = Tcl_NextHashEntry(&search)
              ) {
-            const char *jobIdString = Tcl_GetHashKey(&queue->jobs, hPtr);
+            const char *jobIdString = Ns_TclGetHashKeyString(&queue->jobs, hPtr);
 
             Tcl_ListObjAppendElement(interp, listObj, Tcl_NewStringObj(jobIdString, TCL_INDEX_NONE));
         }
@@ -1150,7 +1150,7 @@ JobJobListObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T o
             char        threadId[32];
             Job        *jobPtr = (Job *)Tcl_GetHashValue(hPtr);
 
-            jobId1     = Tcl_GetHashKey(&queue->jobs, hPtr);
+            jobId1     = Ns_TclGetHashKeyString(&queue->jobs, hPtr);
             jobCode    = GetJobCodeStr( jobPtr->code);
             jobState   = GetJobStateStr(jobPtr->state);
             jobType    = GetJobTypeStr( jobPtr->type);
@@ -1499,7 +1499,7 @@ JobThread(void *UNUSED(arg))
         /*
          * Get an interpreter....
          */
-        interp = NsTclAllocateInterp((NsServer*)jobPtr->servPtr);
+        interp = NsTclAllocateInterp((const NsServer*)jobPtr->servPtr);
 
         /*
          * Initialize times ...
@@ -1777,8 +1777,8 @@ FreeQueue(Queue *queue)
 
     Ns_MutexDestroy(&queue->lock);
     Tcl_DeleteHashTable(&queue->jobs);
-    ns_free((char *)queue->desc);
-    ns_free((char *)queue->name);
+    ns_free_const(queue->desc);
+    ns_free_const(queue->name);
     ns_free(queue);
 }
 
@@ -1850,7 +1850,7 @@ FreeJob(Job *jobPtr)
     Tcl_DStringFree(&jobPtr->script);
     Tcl_DStringFree(&jobPtr->id);
 
-    ns_free((char *)jobPtr->queueId);
+    ns_free_const(jobPtr->queueId);
     ns_free(jobPtr->errorCode);
     ns_free(jobPtr->errorInfo);
     ns_free(jobPtr);

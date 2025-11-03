@@ -941,7 +941,7 @@ SchedLogRollCallback(void *arg, int UNUSED(id))
 static void
 SchedLogArg(Tcl_DString *dsPtr, const void *arg)
 {
-    const NsServer *servPtr = (NsServer *)arg;
+    const NsServer *servPtr = arg;
 
     Tcl_DStringAppendElement(dsPtr, servPtr->httpclient.logFileName);
 }
@@ -1247,13 +1247,21 @@ Ns_HttpParseHost(
     char **hostStart,
     char **portStart
 ) {
-    char *end;
+    const char *h = NULL, *p = NULL;
+    char       *e = NULL;
 
     NS_NONNULL_ASSERT(hostString != NULL);
     NS_NONNULL_ASSERT(portStart != NULL);
 
-    (void) Ns_HttpParseHost2(hostString, NS_FALSE, hostStart, portStart, &end);
-    if (*portStart != NULL) {
+    (void) Ns_HttpParseHost2(hostString, NS_FALSE, &h, &p, &e);
+
+    /* Copy pointer values back into legacy char** without casts */
+    if (hostStart != NULL) {
+        memcpy(hostStart, &h, sizeof h);
+    }
+    memcpy(portStart, &p, sizeof p);
+
+    if (p != NULL) {
         /*
          * The old version was returning in portStart the position of the
          * character BEFORE the port (usually ':'). So, keep compatibility.
@@ -1305,8 +1313,8 @@ bool
 Ns_HttpParseHost2(
     char *hostString,
     bool strict,
-    char **hostStart,
-    char **portStart,
+    const char **hostStart,
+    const char **portStart,
     char **end
 ) {
     bool ipLiteral = NS_FALSE, success = NS_TRUE;
@@ -1680,8 +1688,8 @@ NsTclParseHeaderObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SI
     int          result = TCL_OK;
     Ns_Set      *set;
     Ns_HeaderCaseDisposition disp = Preserve;
-    char        *headerString = (char *)NS_EMPTY_STRING,
-                *dispositionString = NULL,
+    const char  *headerString = NS_EMPTY_STRING;
+    char        *dispositionString = NULL,
                 *prefix = NULL;
     Ns_ObjvSpec opts[] = {
         {"-prefix",  Ns_ObjvString,  &prefix,  NULL},
@@ -2257,7 +2265,7 @@ HttpListObjCmd(
     char          *idString = NULL;
     int            result = TCL_OK;
     Ns_ObjvSpec    args[] = {
-        {"?id", Ns_ObjvObj, &idString, NULL},
+        {"?id", Ns_ObjvString, &idString, NULL},
         {NULL, NULL, NULL, NULL}
     };
 
@@ -2380,7 +2388,7 @@ HttpStatsObjCmd(
     char          *idString = NULL;
     int            result = TCL_OK;
     Ns_ObjvSpec    args[] = {
-        {"?id", Ns_ObjvObj, &idString, NULL},
+        {"?id", Ns_ObjvString, &idString, NULL},
         {NULL, NULL, NULL, NULL}
     };
 
@@ -2825,7 +2833,7 @@ HttpTaskTimeoutSet(NsHttpTask *httpPtr, const Ns_Time *timeoutPtr)
         *httpPtr->timeout = *timeoutPtr;
 
     } else if (httpPtr->timeout != NULL) {
-        ns_free((void *)httpPtr->timeout);
+        ns_free_const(httpPtr->timeout);
         httpPtr->timeout = NULL;
     }
 }
@@ -2895,14 +2903,14 @@ HttpQueue(
 #endif
     bool        verifyCert = NS_TRUE;
     NsHttpTask *httpPtr = NULL;
-    char       *cert = NULL,
+    const char *method = "GET",
                *caFile = NULL,
-               *caPath = NULL,
+               *caPath = NULL;
+    char       *cert = NULL,
                *sniHostname = NULL,
                *udsPath = NULL,
                *outputFileName = NULL,
                *outputChanName = NULL,
-               *method = (char *)"GET",
                *url = NULL,
                *urlCopy = NULL,
 #ifdef NS_WITH_DEPRECATED_5_0
@@ -3920,10 +3928,10 @@ HttpCheckSpool(
                     fd = ns_open(httpPtr->spoolFileName, flags, 0644);
                 } else {
                     const char *tmpDir, *tmpFile = "http.XXXXXX";
-                    size_t      tmpLen;
+                    size_t      dlen, flen = strlen(tmpFile);
 
                     tmpDir = nsconf.tmpDir;
-                    tmpLen = strlen(tmpDir) + 13;
+                    dlen = strlen(tmpDir);
 
                     /*
                      * This lock is necessary for [ns_http wait] backward
@@ -3931,8 +3939,13 @@ HttpCheckSpool(
                      * [ns_http wait] to disable options processing.
                      */
                     Ns_MutexLock(&httpPtr->lock);
-                    httpPtr->spoolFileName = ns_malloc(tmpLen);
-                    snprintf(httpPtr->spoolFileName, tmpLen, "%s/%s", tmpDir, tmpFile);
+                    {
+                        char *p = httpPtr->spoolFileName = ns_malloc(dlen + 1 + flen + 1);
+
+                        memcpy(p, tmpDir, dlen);
+                        p[dlen] = '/';
+                        memcpy(p + dlen + 1, tmpFile, flen + 1);  // includes NUL
+                    }
                     Ns_MutexUnlock(&httpPtr->lock);
 
                     fd = ns_mkstemp(httpPtr->spoolFileName);
@@ -4244,7 +4257,7 @@ EstablishTCPConnection(
 {
     Ns_ReturnCode    rc;
     Tcl_Interp      *interp = itPtr->interp;
-    char            *rhost = urlPtr->host;
+    const char      *rhost = urlPtr->host;
     unsigned short   rport = portNr;
     bool             reuseConnection;
     CloseWaitingData cwData;
@@ -5630,7 +5643,7 @@ HttpAppendChunked(
     size_t size
 ) {
     int          result = TCL_OK;
-    char        *buf = (char *)buffer;
+    const char  *buf = buffer;
     size_t       len = size;
     NsHttpChunk *chunkPtr;
     NsHttpParseProc *parseProcPtr = NULL;
@@ -5716,7 +5729,7 @@ HttpCleanupPerRequestData(
     }
     if (httpPtr->responseHeaderCallback != NULL) {
 #ifdef NS_TCLHTTP_CALLBACK_AS_STRING
-        ns_free((void *)httpPtr->responseHeaderCallback);
+        ns_free_const(httpPtr->responseHeaderCallback);
 #else
         Tcl_DecrRefCount(httpPtr->responseHeaderCallback);
 #endif
@@ -5724,7 +5737,7 @@ HttpCleanupPerRequestData(
     }
     if (httpPtr->responseDataCallback != NULL) {
 #ifdef NS_TCLHTTP_CALLBACK_AS_STRING
-        ns_free((void *)httpPtr->responseDataCallback);
+        ns_free_const(httpPtr->responseDataCallback);
 #else
         Tcl_DecrRefCount(httpPtr->responseDataCallback);
 #endif
@@ -5749,7 +5762,7 @@ HttpCleanupPerRequestData(
     }
     if (httpPtr->compress != NULL) {
         (void)Ns_InflateEnd(httpPtr->compress);
-        ns_free((void *)httpPtr->compress);
+        ns_free_const(httpPtr->compress);
         httpPtr->compress = NULL;
     }
     if (httpPtr->infoObj != NULL) {
@@ -5763,10 +5776,10 @@ HttpCleanupPerRequestData(
 
     HttpTaskTimeoutSet(httpPtr, NULL);
 
-    ns_free((void *)httpPtr->url);
+    ns_free_const(httpPtr->url);
     httpPtr->url = NULL;
 
-    ns_free((void *)httpPtr->method);
+    ns_free_const(httpPtr->method);
     httpPtr->method = NULL;
 
     Ns_MutexDestroy(&httpPtr->lock); /* Should not be held locked here! */
@@ -5887,10 +5900,10 @@ HttpClose(
 
     HttpCleanupPerRequestData(httpPtr);
     if (httpPtr->host != NULL) {
-        ns_free((void *)httpPtr->host);
+        ns_free_const(httpPtr->host);
     }
     if (httpPtr->outputChanName != NULL) {
-        ns_free((void *)httpPtr->outputChanName);
+      ns_free_const(httpPtr->outputChanName);
     }
 
     CkFree((void *)httpPtr, "finalising HttpClose");
@@ -5965,7 +5978,7 @@ HttpCancel(
     (void) Ns_TaskCancel(task);
     Ns_TaskWaitCompleted(task);
 
-    Ns_Log(Notice, "HttpCancel host %s:%hu pos %ld", httpPtr->host,  httpPtr->port, httpPtr->pos);
+    Ns_Log(Ns_LogTaskDebug, "HttpCancel host %s:%hu pos %ld", httpPtr->host,  httpPtr->port, httpPtr->pos);
     HttpCloseWaitingDataRelease(httpPtr);
 }
 
@@ -6047,8 +6060,7 @@ HttpTaskSend(
     NS_NONNULL_ASSERT(httpPtr != NULL);
     NS_NONNULL_ASSERT(buffer != NULL);
 
-    iov.iov_base = (char*)buffer;
-    iov.iov_len = length;
+    ns_iov_set(&iov, buffer, length);
 
     if (httpPtr->ssl == NULL) {
         sent = Ns_SockSendBufsEx(httpPtr->sock, bufs, nbufs, 0, &errorCode);
@@ -6860,9 +6872,10 @@ HttpCutChannel(
 
     if (interp != NULL) {
         if (Tcl_IsChannelShared(chan)) {
-            const char *errorMsg = "channel is shared";
+            const char       errorMsg[] = "channel is shared";
+            const TCL_SIZE_T errorLen = sizeof(errorMsg) - 1;
 
-            Tcl_SetResult(interp, (char*)errorMsg, TCL_STATIC);
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(errorMsg,errorLen));
             result = TCL_ERROR;
         } else {
             Tcl_DriverWatchProc *watchProc;
@@ -7073,12 +7086,12 @@ fail:
 static int
 ParseCRProc(
     NsHttpTask *UNUSED(httpPtr),
-    char **buffer,
+    const char **buffer,
     size_t *size
 ) {
-    char  *buf = *buffer;
-    int    result = TCL_OK;
-    size_t len = *size;
+    const char *buf = *buffer;
+    int         result = TCL_OK;
+    size_t      len = *size;
 
     Ns_Log(Ns_LogTaskDebug, "--- ParseCRProc char %c len %lu", *buf, len);
 
@@ -7122,12 +7135,12 @@ ParseCRProc(
 static int
 ParseLFProc(
     NsHttpTask *UNUSED(httpPtr),
-    char **buffer,
+    const char **buffer,
     size_t *size
 ) {
-    char  *buf  = *buffer;
-    int    result = TCL_OK;
-    size_t len = *size;
+    const char  *buf  = *buffer;
+    int          result = TCL_OK;
+    size_t       len = *size;
 
     Ns_Log(Ns_LogTaskDebug, "--- ParseLFProc");
 
@@ -7171,10 +7184,10 @@ ParseLFProc(
 static int
 ParseLengthProc(
     NsHttpTask *httpPtr,
-    char **buffer,
+    const char **buffer,
     size_t *size
 ) {
-    char        *buf = *buffer;
+    const char  *buf = *buffer;
     int          result = TCL_OK;
     size_t       len = *size;
     NsHttpChunk *chunkPtr = httpPtr->chunk;
@@ -7245,10 +7258,10 @@ ParseLengthProc(
 static int
 ParseBodyProc(
     NsHttpTask *httpPtr,
-    char **buffer,
+    const char **buffer,
     size_t *size
 ) {
-    char        *buf = *buffer;
+    const char  *buf = *buffer;
     int          result = TCL_OK;
     size_t       len = *size;
     NsHttpChunk *chunkPtr = httpPtr->chunk;
@@ -7337,10 +7350,10 @@ ParseBodyProc(
 static int
 ParseTrailerProc(
     NsHttpTask *httpPtr,
-    char **buffer,
+    const char **buffer,
     size_t *size
 ) {
-    char        *buf = *buffer;
+    const char  *buf = *buffer;
     int          result = TCL_OK;
     size_t       len = *size;
     NsHttpChunk *chunkPtr = httpPtr->chunk;
@@ -7404,7 +7417,7 @@ ParseTrailerProc(
 static int
 ParseEndProc(
     NsHttpTask *httpPtr,
-    char **UNUSED(buffer),
+    const char **UNUSED(buffer),
     size_t *size
 ) {
     Ns_Log(Ns_LogTaskDebug, "--- ParseEndProc");
@@ -7436,7 +7449,7 @@ ParseEndProc(
 static int
 ChunkInitProc(
     NsHttpTask *httpPtr,
-    char **UNUSED(buffer),
+    const char **UNUSED(buffer),
     size_t *UNUSED(size)
 ) {
     NsHttpChunk *chunkPtr = httpPtr->chunk;
@@ -7473,7 +7486,7 @@ ChunkInitProc(
 static int
 TrailerInitProc(
     NsHttpTask *httpPtr,
-    char **UNUSED(buffer),
+    const char **UNUSED(buffer),
     size_t *UNUSED(size)
 ) {
     NsHttpChunk *chunkPtr = httpPtr->chunk;
@@ -7711,7 +7724,7 @@ PersistentConnectionAdd(NsHttpTask *httpPtr, const char **reasonPtr)
     Ns_IncrTime(&cwDataPtr->expire, httpPtr->keepAliveTimeout.sec, httpPtr->keepAliveTimeout.usec);
 
     if (cwDataPtr->host != NULL) {
-        ns_free((char*)cwDataPtr->host);
+        ns_free_const(cwDataPtr->host);
     }
     cwDataPtr->host = ns_strdup(httpPtr->host);
     cwDataPtr->port = httpPtr->port;
@@ -7783,7 +7796,7 @@ CloseWaitingDataClean(CloseWaitingData *cwDataPtr)
         cwDataPtr->sock = NS_INVALID_SOCKET;
     }
     if (cwDataPtr->host != NULL) {
-        ns_free((char *)cwDataPtr->host);
+        ns_free_const(cwDataPtr->host);
         cwDataPtr->host = NULL;
     }
     cwDataPtr->state = CW_FREE;

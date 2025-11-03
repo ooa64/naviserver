@@ -370,7 +370,7 @@ int SetCleanupObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T objc,
         tablePtr = &itPtr->sets;
         hPtr = Tcl_FirstHashEntry(tablePtr, &search);
         while (hPtr != NULL) {
-            const char *key = Tcl_GetHashKey(tablePtr, hPtr);
+            const char *key = Ns_TclGetHashKeyString(tablePtr, hPtr);
 
             Ns_Log(Ns_LogNsSetDebug, "ns_set cleanup key <%s> dynamic %d",
                    key, IS_DYNAMIC(key));
@@ -599,7 +599,7 @@ static int SetDelkeyObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TC
 static int SetFormatObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *const* objv)
 {
     int         result = TCL_OK, noname = 0;
-    char       *leadString = (char*)"  ", *separatorString = (char*)": ";
+    const char *leadString = "  ", *separatorString = ": ";
     Ns_Set     *set;
     Ns_ObjvSpec opts[] = {
         {"-noname",    Ns_ObjvBool,   &noname,          INT2PTR(NS_TRUE)},
@@ -926,7 +926,7 @@ static int SetListObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T o
              hPtr != NULL;
              hPtr = Tcl_NextHashEntry(&search)
              ) {
-            const char *listKey = Tcl_GetHashKey(tablePtr, hPtr);
+            const char *listKey = Ns_TclGetHashKeyString(tablePtr, hPtr);
             Tcl_ListObjAppendElement(interp, listObj, Tcl_NewStringObj(listKey, TCL_INDEX_NONE));
         }
         Tcl_SetObjResult(interp, listObj);
@@ -1199,7 +1199,7 @@ static int SetSplitObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T 
 {
     int         result = TCL_OK;
     NsInterp   *itPtr = clientData;
-    char       *splitString = (char *)".";
+    const char *splitString = ".";
     Ns_Set     *set;
     Ns_ObjvSpec args[] = {
         {"setId",      Ns_ObjvSet,    &set,         NULL},
@@ -1216,17 +1216,20 @@ static int SetSplitObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T 
         result = TCL_ERROR;
 
     } else {
-        Tcl_Obj     *listObj = Tcl_NewListObj(0, NULL);
-        Ns_Set     **sets;
-        TCL_SIZE_T   i;
+        Tcl_Obj *listObj = Tcl_NewListObj(0, NULL);
+        size_t   i, len;
+        Ns_DList dl;
 
-        sets = Ns_SetSplit(set, *splitString);
-        for (i = 0; sets[i] != NULL; i++) {
+        Ns_DListInit(&dl);
+        len = Ns_SetSplitDList(set, *splitString, &dl);
+
+        for (i = 0; i < len; i++) {
             Tcl_ListObjAppendElement(interp, listObj,
-                                     EnterSet(itPtr, sets[i], NS_TCL_SET_DYNAMIC));
+                                     EnterSet(itPtr, dl.data[i], NS_TCL_SET_DYNAMIC));
         }
         Tcl_SetObjResult(interp, listObj);
-        ns_free(sets);
+        Ns_DListFree(&dl);
+
     }
     return result;
 }
@@ -1268,7 +1271,7 @@ static int SetStatsObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T 
              hPtr != NULL;
              hPtr = Tcl_NextHashEntry(&search)
              ) {
-            const char *key = Tcl_GetHashKey(tablePtr, hPtr);
+            const char *key = Ns_TclGetHashKeyString(tablePtr, hPtr);
             Ns_Set *set     = (Ns_Set *) Tcl_GetHashValue(hPtr);
 
             if (IS_DYNAMIC(key)) {

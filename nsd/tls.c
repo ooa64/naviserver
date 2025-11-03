@@ -17,8 +17,16 @@
 
 #include "nsd.h"
 
+//#define LOG_LOCAL_CERT
+
 static void ReportError(Tcl_Interp *interp, const char *fmt, ...)
     NS_GNUC_NONNULL(2) NS_GNUC_PRINTF(2,3);
+
+#ifdef LOG_LOCAL_CERT
+static void LogLocalCert(SSL *ssl, const char *tag)
+    NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
+#endif
+
 
 /*
  *----------------------------------------------------------------------
@@ -64,35 +72,14 @@ ReportError(Tcl_Interp *interp, const char *fmt, ...)
 # include <openssl/ssl.h>
 # include <openssl/err.h>
 
-/*
- * OpenSSL < 0.9.8f does not have SSL_set_tlsext_host_name() In some
- * versions, this function is defined as a macro, on some versions as
- * a library call, which complicates detection via m4.
- */
-# if OPENSSL_VERSION_NUMBER > 0x00908070
-#  define HAVE_SSL_set_tlsext_host_name 1
-# endif
-
-# ifndef HAVE_OPENSSL_PRE_1_1
-#  define OPENSSL_HAVE_DH_AUTO
-#  define OPENSSL_HAVE_READ_BUFFER_LEN
-# endif
-
-# ifndef HAVE_X509_STORE_CTX_GET_OBJ_BY_SUBJECT
-#  define OPENSSL_NO_OCSP 1
-# endif
-
-# ifndef OPENSSL_NO_OCSP
+# ifdef HAVE_OPENSSL_OCSP
 #  include <openssl/ocsp.h>
-# endif
 
-# ifndef OPENSSL_NO_OCSP
 /*
  * Structure passed to cert status callback
  */
 typedef struct {
     int            timeout;
-    //char          *respin;     /* File to load OCSP Response from (or NULL if no file) */
     int            verbose;
     OCSP_RESPONSE *OCSPresp;
     Ns_Time        OCSPexpire;
@@ -102,11 +89,19 @@ typedef struct {
 static SSLCertStatusArg sslCertStatusArg;
 # endif
 
+# if OPENSSL_VERSION_NUMBER >= 0x10101000L
+static FILE *keylog_fp = NULL;
+# endif
+
 /*
  * For HTTP client requests, use a data index to obtain server
  * information from an SSL_CTX.
  */
 static int ClientCtxDataIndex;
+
+/*
+ * Local functions defined in this file
+ */
 
 static char *FilenameToEnvVar(Tcl_DString *dsPtr, const char *filename)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
@@ -119,38 +114,21 @@ static Ns_ReturnCode BuildALPNWireFormat(Tcl_DString *dsPtr, const char *alpnStr
  */
 static int SSL_serverNameCB(SSL *ssl, int *al, void *arg);
 static int TLSPasswordCB(char *buf, int size, int rwflag, void *userdata);
-static int ALPNSelectCB(NS_TLS_SSL *UNUSED(ssl), const unsigned char **out, unsigned char *outlen,
-                        const unsigned char *clientProtos, unsigned int clientProtosLength, void *arg);
-
-# ifdef HAVE_OPENSSL_PRE_1_1
-static void SSL_infoCB(const SSL *ssl, int where, int ret);
+static int ALPNSelectCB(NS_TLS_SSL *UNUSED(ssl),
+                        const unsigned char **out, unsigned char *outlen,
+                        const unsigned char *in, unsigned int inlen,
+                        void *arg);
+# if OPENSSL_VERSION_NUMBER >= 0x10101000L
+static void KeylogCB(const SSL *ssl, const char *line);
 # endif
+
+static void SSL_infoCB(const SSL *ssl, int where, int ret);
 static int CertficateValidationCB(int preverify_ok, X509_STORE_CTX *ctx);
 
 static Ns_ReturnCode StoreInvalidCertificate(X509 *cert, int x509err, int currentDepth, NsServer *servPtr)
     NS_GNUC_NONNULL(4);
 static bool ValidationExcpetionExists(int x509err, NS_SOCKET sock, Ns_DList *validationExceptionsPtr, struct sockaddr *saPtr)
      NS_GNUC_NONNULL(3) NS_GNUC_NONNULL(4);
-
-#ifndef OPENSSL_HAVE_DH_AUTO
-static DH *SSL_dhCB(SSL *ssl, int isExport, int keyLength);
-#endif
-
-# ifndef OPENSSL_NO_OCSP
-static int SSL_cert_statusCB(SSL *ssl, void *arg);
-
-/*
- * Local functions defined in this file
- */
-static Ns_ReturnCode
-PartialTimeout(const Ns_Time *endTimePtr, Ns_Time *diffPtr, Ns_Time *defaultPartialTimeoutPtr,
-               Ns_Time **partialTimeoutPtrPtr)
-    NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2) NS_GNUC_NONNULL(3) NS_GNUC_NONNULL(4);
-
-static bool
-OCSP_ResponseIsValid(OCSP_RESPONSE *resp, OCSP_CERTID *id)
-    NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
-# endif
 
 static void DrainErrorStack(Ns_LogSeverity severity, const char *errorContext, unsigned long sslERRcode)
     NS_GNUC_NONNULL(2);
@@ -164,8 +142,18 @@ static void CertTableAdd(const NS_TLS_SSL_CTX *ctx, const char *cert)
 static NS_TLS_SSL_CTX *CertTableGetCtx(const char *cert)
     NS_GNUC_NONNULL(1);
 
+# ifdef HAVE_OPENSSL_OCSP
+static int SSL_cert_statusCB(SSL *ssl, void *arg);
 
-# ifndef OPENSSL_NO_OCSP
+static Ns_ReturnCode
+PartialTimeout(const Ns_Time *endTimePtr, Ns_Time *diffPtr, Ns_Time *defaultPartialTimeoutPtr,
+               Ns_Time **partialTimeoutPtrPtr)
+    NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2) NS_GNUC_NONNULL(3) NS_GNUC_NONNULL(4);
+
+static bool
+OCSP_ResponseIsValid(OCSP_RESPONSE *resp, OCSP_CERTID *id)
+    NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
+
 static int OCSP_FromCacheFile(Tcl_DString *dsPtr, OCSP_CERTID *id, OCSP_RESPONSE **resp)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2) NS_GNUC_NONNULL(3);
 
@@ -177,7 +165,7 @@ static int OCSP_computeResponse(SSL *ssl, const SSLCertStatusArg *srctx, OCSP_RE
 
 static OCSP_RESPONSE *OCSP_FromAIA(OCSP_REQUEST *req, const char *aiaURL, int req_timeout)
     NS_GNUC_NONNULL(1);
-#endif
+# endif /* HAVE_OPENSSL_OCSP */
 
 # if !defined(HAVE_OPENSSL_PRE_1_1) && !defined(LIBRESSL_VERSION_NUMBER)
 static void *NS_CRYPTO_malloc(size_t num, const char *UNUSED(file), int UNUSED(line)) NS_GNUC_MALLOC NS_ALLOC_SIZE1(1) NS_GNUC_RETURNS_NONNULL;
@@ -185,119 +173,12 @@ static void *NS_CRYPTO_realloc(void *addr, size_t num, const char *UNUSED(file),
 static void NS_CRYPTO_free(void *addr, const char *UNUSED(file), int UNUSED(line));
 # endif
 
-#ifndef OPENSSL_HAVE_DH_AUTO
-/*
- *----------------------------------------------------------------------
- *
- * Include pre-generated DH parameters
- *
- *----------------------------------------------------------------------
- */
-# ifndef HEADER_DH_H
-#  include <openssl/dh.h>
-# endif
-static DH *get_dh512(void);
-static DH *get_dh1024(void);
-
-# if  defined(HAVE_OPENSSL_PRE_1_1) || defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x20700000L
-/*
- *----------------------------------------------------------------------
- *
- * DH_set0_pqg --
- *
- *      Compatibility function for libressl < 2.7; DH_set0_pqg is used
- *      just by the Diffie-Hellman parameters in dhparams.h. Obsoleted
- *      by OPENSSL_HAVE_DH_AUTO.
- *
- * Results:
- *      Returns walways 1.
- *
- * Side effects:
- *      None.
- *
- *----------------------------------------------------------------------
- */
-static int
-DH_set0_pqg(DH *dh, BIGNUM *p, BIGNUM *q, BIGNUM *g)
-{
-    if ((dh->p == NULL && p == NULL) || (dh->g == NULL && g == NULL)) {
-        return 0;
-    }
-    if (p != NULL) {
-        BN_free(dh->p);
-        dh->p = p;
-    }
-    if (q != NULL) {
-        BN_free(dh->q);
-        dh->q = q;
-    }
-    if (g != NULL) {
-        BN_free(dh->g);
-        dh->g = g;
-    }
-    return 1;
-}
-# endif /* LIBRESSL_VERSION_NUMBER */
-
-#include "dhparams.h"
-
 /*
  *----------------------------------------------------------------------
  * Callback implementations.
  *----------------------------------------------------------------------
  */
 
-/*
- *----------------------------------------------------------------------
- *
- * SSL_dhCB --
- *
- *      OpenSSL callback used for ephemeral DH keys.
- *      Obsoleted by OPENSSL_HAVE_DH_AUTO.
- *
- * Results:
- *      Returns always 1.
- *
- * Side effects:
- *      None.
- *
- *----------------------------------------------------------------------
- */
-static DH *
-SSL_dhCB(SSL *ssl, int isExport, int keyLength) {
-    NsSSLConfig *cfgPtr;
-    DH          *key;
-    SSL_CTX     *ctx;
-
-    NS_NONNULL_ASSERT(ssl != NULL);
-
-    ctx = SSL_get_SSL_CTX(ssl);
-
-    Ns_Log(Debug, "SSL_dhCB: isExport %d keyLength %d", isExport, keyLength);
-    cfgPtr = (NsSSLConfig *)SSL_CTX_get_app_data(ctx);
-    assert(cfgPtr != NULL);
-
-    switch (keyLength) {
-    case 512:
-        key = cfgPtr->dhKey512;
-        break;
-
-    case 1024:
-        key = cfgPtr->dhKey1024;
-        break;
-
-    case 2048: NS_FALL_THROUGH; /* fall through */
-    default:
-        key = cfgPtr->dhKey2048;
-        break;
-    }
-    Ns_Log(Debug, "SSL_dhCB: returns %p\n", (void *)key);
-    return key;
-}
-#endif /* OPENSSL_HAVE_DH_AUTO */
-
-
-#ifdef HAVE_OPENSSL_PRE_1_1
 /*
  *----------------------------------------------------------------------
  *
@@ -318,16 +199,99 @@ SSL_dhCB(SSL *ssl, int isExport, int keyLength) {
  *----------------------------------------------------------------------
  */
 static void
-SSL_infoCB(const SSL *ssl, int where, int UNUSED(ret)) {
+SSL_infoCB(const SSL *ssl, int where, int ret) {
 
     NS_NONNULL_ASSERT(ssl != NULL);
 
+#ifdef HAVE_OPENSSL_PRE_1_1
     if ((where & SSL_CB_HANDSHAKE_DONE)) {
         ssl->s3->flags |= SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS;
     }
+#endif
+    if(where & SSL_CB_ALERT) {
+        const char *state = SSL_state_string_long(ssl);
+        const char *dir   = (where & SSL_CB_READ) ? "read" : "write";
+        Ns_Log(Debug, "[SSL_infoCB] TLS alert %s: type %s desc %s state=%s",
+               dir, SSL_alert_type_string(ret), SSL_alert_desc_string(ret),
+               state);
+    }
+    if((where & SSL_CB_HANDSHAKE_DONE) && ret == 1) {
+        const unsigned char *alpn = NULL;
+        unsigned int alpnlen = 0;
+        SSL_get0_alpn_selected(ssl, &alpn, &alpnlen);
+        Ns_Log(Debug, "[SSL_infoCB] handshake done; ALPN='%.*s'",
+                (int)alpnlen, alpn ? (const char *)alpn : "");
+    }
+}
+
+#ifdef LOG_LOCAL_CERT
+# include <openssl/x509v3.h>   // GENERAL_NAME, X509_get_ext_d2i, NID_subject_alt_name
+# include <openssl/safestack.h> // sk_GENERAL_NAME_num/value, pop_free
+
+static void LogLocalCert(SSL *ssl, const char *tag) {
+    const X509 *cert = SSL_get_certificate(ssl);
+    if (cert == NULL) {
+        Ns_Log(Notice,"%s no local cert", tag);
+
+    } else {
+        unsigned char   fp[EVP_MAX_MD_SIZE];
+        int             chain_len = -1;
+        unsigned int    sl;
+        char           *subj;
+        SSL_CTX        *sslCtx = SSL_get_SSL_CTX(ssl);
+        STACK_OF(X509) *chain = NULL;
+
+        subj = X509_NAME_oneline(X509_get_subject_name(cert), NULL, 0);
+
+        if (sslCtx != NULL && SSL_CTX_get0_chain_certs(sslCtx, &chain) == 1 && chain != NULL) {
+            chain_len = sk_X509_num(chain);
+        }
+
+        if (X509_digest(cert, EVP_sha256(), fp, &sl) == 1) {
+            char hex[EVP_MAX_MD_SIZE*2+1];
+
+            for (unsigned int i=0;i<sl;i++) {
+                sprintf(hex+2*i,"%02X",fp[i]);
+                hex[2*sl]=0;
+            }
+            Ns_Log(Notice, "%s leaf fp(SHA256)=%s subject=%s",
+                   tag, hex, X509_NAME_oneline(X509_get_subject_name(cert), NULL, 0));
+        }
+
+        Ns_Log(Notice, "%s client verify mode %d SSL_CTX %p chain length %d leaf subject=%s",
+               tag, SSL_get_verify_mode(ssl), (void*)sslCtx, chain_len, subj ? subj : "(null)");
+        OPENSSL_free(subj);
+
+        {
+            int n;
+            STACK_OF(GENERAL_NAME) *san = X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+
+            if (!san) {
+                Ns_Log(Notice, "%s no SAN extension", tag);
+                return;
+            }
+
+            n = sk_GENERAL_NAME_num(san);
+            for (int i = 0; i < n; i++) {
+                const GENERAL_NAME *gn = sk_GENERAL_NAME_value(san, i);
+                if (gn->type == GEN_DNS) {
+                    const unsigned char *s = ASN1_STRING_get0_data(gn->d.dNSName);
+                    int slen = ASN1_STRING_length(gn->d.dNSName);
+                    Ns_Log(Notice, "%s  SAN DNS:%.*s", tag, slen, (const char *)s);
+                } else if (gn->type == GEN_IPADD) {
+                    char buf[INET6_ADDRSTRLEN] = {0};
+                    if (gn->d.iPAddress->length == 4)
+                        inet_ntop(AF_INET,  gn->d.iPAddress->data,  buf, sizeof(buf));
+                    else if (gn->d.iPAddress->length == 16)
+                        inet_ntop(AF_INET6, gn->d.iPAddress->data,  buf, sizeof(buf));
+                    Ns_Log(Notice, "%s  SAN IP:%s", tag, buf);
+                }
+            }
+            sk_GENERAL_NAME_pop_free(san, GENERAL_NAME_free);
+        }
+    }
 }
 #endif
-
 /*
  *----------------------------------------------------------------------
  *
@@ -349,32 +313,42 @@ SSL_infoCB(const SSL *ssl, int where, int UNUSED(ret)) {
  * ServerNameCallback for SNI
  */
 static int
-SSL_serverNameCB(SSL *ssl, int *al, void *UNUSED(arg))
+SSL_serverNameCB(SSL *ssl, int *UNUSED(al), void *arg)
 {
     const char  *serverName;
     int          result = SSL_TLSEXT_ERR_NOACK;
 
     NS_NONNULL_ASSERT(ssl != NULL);
 
+#ifdef LOG_LOCAL_CERT
+    LogLocalCert(ssl, "serverNameCB");
+#endif
+
+    //Ns_Log(Notice, "SSL_serverNameCB, ssl %p dc %p", (void*)ssl, arg);
     serverName = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
 
     if (serverName != NULL) {
-        Ns_Sock  *sockPtr = (Ns_Sock*)SSL_get_app_data(ssl);
-        Driver   *drvPtr;
-        bool      doSNI;
+        NsTLSConfig *dc = arg;
+        Driver      *drvPtr;
+        bool         doSNI;
 
-        assert(sockPtr != NULL);
+        assert(dc != NULL);
 
-        drvPtr = (Driver *)(sockPtr->driver);
+        drvPtr = (Driver*)dc->driver;
         doSNI = ((drvPtr->opts & NS_DRIVER_SNI) != 0u);
 
+        //Ns_Log(Notice, "SSL_serverNameCB, ssl %p drvPtr %p", (void*)ssl, (void*)drvPtr);
+
         /*
-         * The default for *al is initialized by SSL_AD_UNRECOGNIZED_NAME = 112.
+         * The default for *al (alert value) is initialized by
+         * SSL_AD_UNRECOGNIZED_NAME = 112. This is the alert value
+         * OpenSSL should send the handshake is aborted.
+         *
          * Find info about these codes via:
          *    fgrep -r --include=*.h 112 /usr/local/src/openssl/ | fgrep AD
          */
-        Ns_Log(Debug, "SSL_serverNameCB got server name <%s> al %d doSNI %d",
-               serverName, (al != NULL ? *al : 0), doSNI);
+        Ns_Log(Debug, "SSL_serverNameCB got server name <%s> doSNI %d",
+               serverName, doSNI);
 
         /*
          * Perform lookup from host table only, when doSNI is true
@@ -382,8 +356,11 @@ SSL_serverNameCB(SSL *ssl, int *al, void *UNUSED(arg))
          */
         if (doSNI) {
             Tcl_DString     ds;
-            unsigned short  port = Ns_SockGetPort(sockPtr);
             NS_TLS_SSL_CTX *ctx;
+            void           *ex = dc->sni_idx >= 0 ? SSL_get_ex_data(ssl, dc->sni_idx) : NULL;
+            unsigned short  port = ex != NULL
+                ? (unsigned short)(uintptr_t)ex
+                : (unsigned short)(drvPtr->listenfd[0]);
 
             /*
              * The virtual host entries are specified canonically, via
@@ -393,7 +370,7 @@ SSL_serverNameCB(SSL *ssl, int *al, void *UNUSED(arg))
             Tcl_DStringInit(&ds);
             Ns_DStringPrintf(&ds, "%s:%hu", serverName, port);
 
-            ctx = NsDriverLookupHostCtx(&ds, serverName, sockPtr->driver);
+            ctx = NsDriverLookupHostCtx(&ds, serverName, dc->driver);
 
             Ns_Log(Debug, "SSL_serverNameCB lookup result of <%s> location %s port %hu -> ctx %p",
                    serverName, ds.string, port, (void*)ctx);
@@ -405,7 +382,7 @@ SSL_serverNameCB(SSL *ssl, int *al, void *UNUSED(arg))
              * servername was provided (SSL_TLSEXT_ERR_NOACK).
              */
             if (ctx != NULL) {
-                Ns_Log(Debug, "SSL_serverNameCB switches server context");
+                Ns_Log(Debug, "SSL_serverNameCB switches server context to %p", (void*)ctx);
                 SSL_set_SSL_CTX(ssl, ctx);
                 result = SSL_TLSEXT_ERR_OK;
             }
@@ -416,8 +393,7 @@ SSL_serverNameCB(SSL *ssl, int *al, void *UNUSED(arg))
     return result;
 }
 
-#ifndef OPENSSL_NO_OCSP
-
+#ifdef HAVE_OPENSSL_OCSP
 /*
  *----------------------------------------------------------------------
  *
@@ -878,7 +854,19 @@ OCSP_FromCacheFile(Tcl_DString *dsPtr, OCSP_CERTID *id, OCSP_RESPONSE **resp)
 
             } else {
 
+#if defined(__clang__)
+#elif defined(__GNUC__)
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wduplicated-branches"
+#endif
+
                 *resp = d2i_OCSP_RESPONSE_bio(derbio, NULL);
+
+#if defined(__clang__)
+#elif defined(__GNUC__)
+# pragma GCC diagnostic pop
+#endif
+
                 BIO_free(derbio);
 
                 if (*resp == NULL) {
@@ -1001,7 +989,16 @@ OCSP_computeResponse(SSL *ssl, const SSLCertStatusArg *srctx, OCSP_RESPONSE **re
             if (derbio == NULL) {
                 Ns_Log(Warning, "cert_status: Cannot write to OCSP response file: %s", fileName);
             } else {
+#if defined(__clang__) || defined(__GNUC__)
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wcast-qual"
+#endif
+
                 i2d_OCSP_RESPONSE_bio(derbio, *resp);
+
+#if defined(__clang__) || defined(__GNUC__)
+# pragma GCC diagnostic pop
+#endif
                 BIO_free(derbio);
             }
 
@@ -1174,7 +1171,7 @@ OCSP_FromAIA(OCSP_REQUEST *req, const char *aiaURL, int req_timeout)
     return rsp;
 }
 
-#endif /* Of OPENSSL_NO_OCSP */
+#endif /* HAVE_OPENSSL_OCSP */
 
 # if !defined(HAVE_OPENSSL_PRE_1_1) && !defined(LIBRESSL_VERSION_NUMBER)
 static void *NS_CRYPTO_malloc(size_t num, const char *UNUSED(file), int UNUSED(line))
@@ -1218,6 +1215,7 @@ NsInitOpenSSL(void)
     static int initialized = 0;
 
     if (!initialized) {
+        static char ns_client_info_tag[] = "NaviServer Client Info";
         /*
          * With the release of OpenSSL 1.1.0 the interface of
          * CRYPTO_set_mem_functions() changed. Before that, we could
@@ -1245,7 +1243,7 @@ NsInitOpenSSL(void)
 #  else
         OPENSSL_init_ssl(0, NULL);
 #  endif
-        ClientCtxDataIndex = SSL_CTX_get_ex_new_index(0, (char*)"NaviServer Client Info", NULL, NULL, NULL);
+        ClientCtxDataIndex = SSL_CTX_get_ex_new_index(0, ns_client_info_tag, NULL, NULL, NULL);
         initialized = 1;
         /*
          * We do not want to get this message when, e.g., the nsproxy
@@ -1499,14 +1497,10 @@ Ns_TLS_SSLConnect(Tcl_Interp *interp, NS_SOCKET sock, NS_TLS_SSL_CTX *ctx,
         int sslErr;
 
         if (sni_hostname != NULL) {
-# if HAVE_SSL_set_tlsext_host_name
             Ns_Log(Debug, "tls: setting SNI hostname '%s'", sni_hostname);
-            if (SSL_set_tlsext_host_name(ssl, sni_hostname) != 1) {
+            if (SSL_set_tlsext_host_name(ssl, ns_const2voidp(sni_hostname)) != 1) {
                 Ns_Log(Warning, "tls: setting SNI hostname '%s' failed, value ignored", sni_hostname);
             }
-# else
-            Ns_Log(Warning, "tls: SNI hostname '%s' is not supported by version of OpenSSL", sni_hostname);
-# endif
         }
         SSL_set_fd(ssl, sock);
         SSL_set_connect_state(ssl);
@@ -1644,7 +1638,7 @@ FilenameToEnvVar(Tcl_DString *dsPtr, const char *filename) {
  *                 (must be freed by caller via Tcl_DStringFree).
  *
  * Returns:
- *    NS_OK      if the helper returned a non-empty passphrase;
+ *    NS_OK      if the helper returned a nonempty passphrase;
  *    NS_ERROR   on evaluation failure or empty output.
  *
  * Side Effects:
@@ -1694,7 +1688,7 @@ ExecuteKeyScript(Tcl_DString *dsPtr, const char *scriptPath, const char *pemPath
  *      OpenSSL callback to obtain the passphrase for an encrypted
  *      private key.  The lookup proceeds in three stages:
  *
- *        1) If the server’s NsSSLConfig has a tlsKeyScript defined,
+ *        1) If the server’s NsTLSConfig has a tlsKeyScript defined,
  *           run that helper script (`ExecuteKeyScript`) with the PEM
  *           filename.  If it returns NS_OK, its output (in ds.string)
  *           is used as the passphrase.
@@ -1740,14 +1734,14 @@ TLSPasswordCB(char *buf, int size, int UNUSED(rwflag), void *userdata)
 
     {
         NS_TLS_SSL_CTX *ctxPtr = CertTableGetCtx(pemPath);
-        NsSSLConfig    *cfgPtr = SSL_CTX_get_app_data(ctxPtr);
+        NsTLSConfig    *dc = SSL_CTX_get_app_data(ctxPtr);
 
         /*
          * 1) Try to get secret from external helper script
          */
-        if (cfgPtr  != NULL && cfgPtr->tlsKeyScript != NULL) {
-            Ns_Log(Notice, "TLS key from script <%s>", cfgPtr->tlsKeyScript);
-            if (ExecuteKeyScript(&ds, cfgPtr->tlsKeyScript, pemPath) == NS_OK) {
+        if (dc  != NULL && dc->tlsKeyScript != NULL) {
+            Ns_Log(Notice, "TLS key from script <%s>", dc->tlsKeyScript);
+            if (ExecuteKeyScript(&ds, dc->tlsKeyScript, pemPath) == NS_OK) {
                 pwd = ds.string;
             }
         }
@@ -1828,36 +1822,62 @@ DrainErrorStack(Ns_LogSeverity severity, const char *errorContext, unsigned long
 /*
  *----------------------------------------------------------------------
  *
- * NsSSLConfigNew --
+ * NsTLSConfigNew --
  *
- *      Creates a new NsSSLConfig structure and sets standard
+ *      Creates a new NsTLSConfig structure and sets standard
  *      configuration parameters ("deferaccept", "nodelay", and "verify").
  *
  * Results:
- *      Pointer to a new NsSSLConfig.
+ *      Pointer to a new NsTLSConfig.
  *
  * Side effects:
  *      Allocating memory.
  *
  *----------------------------------------------------------------------
  */
-NsSSLConfig *
-NsSSLConfigNew(const char *section)
+NsTLSConfig *
+NsTLSConfigNew(const char *section)
 {
-    NsSSLConfig *cfgPtr;
+    NsTLSConfig *dc;
+    static char sni_info_tag[] = "SniCtx";
 
-    cfgPtr = ns_calloc(1, sizeof(NsSSLConfig));
-    cfgPtr->deferaccept  = Ns_ConfigBool(section, "deferaccept", NS_FALSE);
-    cfgPtr->nodelay      = Ns_ConfigBool(section, "nodelay", NS_TRUE);
-    cfgPtr->verify       = Ns_ConfigBool(section, "verify", 0);
-    cfgPtr->tlsKeyScript = Ns_ConfigGetValue(section, "tlskeyscript");
-    if (cfgPtr->tlsKeyScript != NULL) {
-        cfgPtr->tlsKeyScript = Ns_ConfigFilename(section, "tlskeyscript", 12,
-                                                 nsconf.binDir, /* directory to resolve against */
-                                                 ""             /* default no script */,
-                                                 NS_TRUE /*normalize*/, NS_FALSE /*updateCfg*/);
+    dc = ns_calloc(1, sizeof(NsTLSConfig));
+    dc->verify        = Ns_ConfigBool(section, "verify", 0);
+    dc->tlsKeylogFile = Ns_ConfigGetValue(section, "tlskeylogfile");
+    dc->tlsKeyScript  = Ns_ConfigGetValue(section, "tlskeyscript");
+    if (dc->tlsKeyScript != NULL) {
+        dc->tlsKeyScript = Ns_ConfigFilename(section, "tlskeyscript", 12,
+                                             nsconf.binDir, /* directory to resolve against */
+                                             ""             /* default no script */,
+                                             NS_TRUE /*normalize*/, NS_FALSE /*updateCfg*/);
     }
-    return cfgPtr;
+    dc->sni_idx = SSL_get_ex_new_index(0, sni_info_tag, NULL, NULL, NULL);
+
+    /*
+     * In case "vhostcertificates" was specified in the configuration file,
+     * and it is valid, activate NS_DRIVER_SNI.
+     */
+    dc->vhostcertificates = Ns_ConfigGetValue(section, "vhostcertificates");
+    if (dc->vhostcertificates != NULL && *dc->vhostcertificates != '\0') {
+        struct stat st;
+
+        if (stat(dc->vhostcertificates, &st) != 0) {
+            Ns_Log(Warning, "vhostcertificates directory '%s' does not exist",
+                   dc->vhostcertificates);
+            dc->vhostcertificates = NULL;
+        } else if (S_ISDIR(st.st_mode) == 0) {
+            Ns_Log(Warning, "value specified for vhostcertificates is not a directory: '%s'",
+                   dc->vhostcertificates);
+            dc->vhostcertificates = NULL;
+        } else {
+            Ns_Log(Notice, "vhostcertificates directory '%s' is valid, activating SNI",
+                   dc->vhostcertificates);
+        }
+    }
+    Ns_Log(Debug, "ssl: driver configuration %p created, size %ld",
+           (void*)dc, sizeof(NsTLSConfig));
+
+    return dc;
 }
 
 
@@ -1946,9 +1966,9 @@ BuildALPNWireFormat(Tcl_DString *dsPtr, const char *alpnStr)
  *                              protocol bytes within serverProtos.
  *      outlen                - On success, set to the length of the
  *                              chosen protocol.
- *      clientProtos          - Wire‐format list of protocols offered by
+ *      in                    - Wire‐format list of protocols offered by
  *                              the client (each prefixed by its length).
- *      clientProtosLength    - Total byte length of clientProtos.
+ *      inlen                 - Total byte length of in.
  *      arg                   - Pointer to the server’s wire‐format
  *                              protocols list; its length is stored
  *                              as an unsigned int immediately before
@@ -1964,20 +1984,90 @@ BuildALPNWireFormat(Tcl_DString *dsPtr, const char *alpnStr)
  *----------------------------------------------------------------------
  */
 static int
-ALPNSelectCB(NS_TLS_SSL *UNUSED(ssl), const unsigned char **out, unsigned char *outlen,
-             const unsigned char *clientProtos, unsigned int clientProtosLength, void *arg)
+ALPNSelectCB(NS_TLS_SSL *ssl,
+             const unsigned char **out, unsigned char *outlen,
+             const unsigned char *in, unsigned int inlen,
+             void *arg)
 {
     const unsigned char *serverProtos = arg;
-    unsigned int serverProtosLength = *(unsigned int *)((char *)arg - sizeof(unsigned int));
+    unsigned int serverProtosLength, i = 0;
+    int          rc;
+    unsigned char *tmp = NULL;
 
-    int rc = SSL_select_next_proto((unsigned char **)out, outlen,
-                                   serverProtos, serverProtosLength,
-                                   clientProtos, clientProtosLength);
+    /* avoid unaliged access */
+    memcpy(&serverProtosLength,
+           (const char *)arg - sizeof(serverProtosLength),
+           sizeof(serverProtosLength));
 
-    Ns_Log(Debug, "ALPNSelectCB returns %d", rc);
+    /*
+     * Loop through ALPN list offered by client
+     */
+    while (i < inlen) {
+        unsigned int len = in[i];
+
+        if (i + 1 + len > inlen) {
+            // Malformed ALPN list
+            return SSL_TLSEXT_ERR_NOACK;
+        }
+        if (len < 19) {
+            unsigned char buffer[20];
+            memcpy(buffer, &in[i + 1], len);
+            buffer[len] = '\0';
+            //Ns_Log(Notice, "ALPNSelectCB client offered '%s'", buffer);
+        }
+        i += 1 + len;
+    }
+
+    rc = SSL_select_next_proto(&tmp, outlen,
+                               serverProtos, serverProtosLength,
+                               in, inlen);
+    *out = (const unsigned char *)tmp;   /* adopt as read-only */
+    if (Ns_LogSeverityEnabled(Debug)) {
+        Tcl_DString ds;
+
+        Tcl_DStringInit(&ds);
+        Tcl_DStringAppend(&ds, (const char *)*out, *outlen);
+        (void)ssl;
+        /*Ns_Log(Notice, "ALPNSelectCB for ssl %p ctx %p returns %d <%s> ln %d",
+               (void*)ssl, (void*)SSL_get_SSL_CTX(ssl),
+               rc, ds.string, *outlen);*/
+        Tcl_DStringFree(&ds);
+    }
     return (rc == OPENSSL_NPN_NEGOTIATED) ? SSL_TLSEXT_ERR_OK : SSL_TLSEXT_ERR_NOACK;
 }
 
+# if OPENSSL_VERSION_NUMBER >= 0x10101000L
+static void KeylogCB(const SSL *ssl, const char *line)
+{
+    NsTLSConfig *dc;
+
+    NS_NONNULL_ASSERT(ssl != NULL);
+
+    dc = SSL_CTX_get_app_data(SSL_get_SSL_CTX(ssl));
+    assert(dc != NULL);
+
+    /*Ns_Log(Notice, "KeylogCB called with: %s", line);*/
+    if (!keylog_fp) {
+        const char *path;
+        if (dc->tlsKeylogFile != NULL && *dc->tlsKeylogFile != '\0') {
+            path = dc->tlsKeylogFile;
+        } else {
+            path = getenv("SSLKEYLOGFILE");
+            if (!path) {
+                path = "/tmp/sslkeylog.log";   /* fallback */
+            }
+        }
+        keylog_fp = fopen(path, "a");
+        if (!keylog_fp) {
+            perror("fopen(keylog)");
+            return;
+        }
+    }
+
+    fprintf(keylog_fp, "%s\n", line);
+    fflush(keylog_fp);
+}
+#endif
 
 /*
  *----------------------------------------------------------------------
@@ -2010,10 +2100,10 @@ Ns_TLS_CtxServerInit(const char *section, Tcl_Interp *interp,
 
     if (cert == NULL) {
         Ns_Log(Error, "nsssl: certificate parameter must be specified in the configuration file under %s", section);
-        result = NS_ERROR;
+        result = TCL_ERROR;
     } else {
         const char *ciphers, *ciphersuites, *protocols;
-        Ns_DList dl, *dlPtr = &dl;
+        Ns_DList    dl, *dlPtr = &dl;
 
         /*
          * Keep configuration values in an Ns_DList to protect against
@@ -2026,47 +2116,47 @@ Ns_TLS_CtxServerInit(const char *section, Tcl_Interp *interp,
         ciphersuites = Ns_DListSaveString(dlPtr, Ns_ConfigGetValue(section, "ciphersuites"));
         protocols    = Ns_DListSaveString(dlPtr, Ns_ConfigGetValue(section, "protocols"));
 
-        Ns_Log(Debug, "Ns_TLS_CtxServerInit calls Ns_TLS_CtxServerCreate with app data %p",
-               (void*) app_data);
+        Ns_Log(Notice, "Ns_TLS_CtxServerInit calls Ns_TLS_CtxServerCreate with app_data %p", (void*)app_data);
 
         result = Ns_TLS_CtxServerCreateCfg(interp, cert,
                                            NULL /*caFile*/, NULL /*caPath*/,
                                            Ns_ConfigBool(section, "verify", 0),
                                            ciphers, ciphersuites, protocols,
-                                           "http/1.1",
-                                           app_data,
+                                           (flags & NS_DRIVER_QUIC) != 0 ? "h3" : "http/1.1",
+                                           app_data, flags,
                                            ctxPtr);
+        Ns_Log(Notice, "Ns_TLS_CtxServerInit: Ns_TLS_CtxServerCreate with dc %p -> sslCtx %p",
+               (void*)app_data, (void*)(*ctxPtr));
+
         if (result == TCL_OK) {
-            NsSSLConfig *cfgPtr = app_data;
+            NsTLSConfig *dc = app_data;
+            /*
+             * The driver modules pass the dc via app_data. dc should
+             * only be NULL, when Ns_TLS_CtxServerInit is called over
+             * other paths (e.g., a listening context outside the
+             * driver modules).
+             */
 
-            if (cfgPtr == NULL) {
+            if (dc == NULL) {
                 /*
-                 * Get the app_data (cfgPtr) from the SSL_CTX.
-                 */
-                cfgPtr = SSL_CTX_get_app_data(*ctxPtr);
-
-            }
-            if (cfgPtr == NULL) {
-                /*
-                 * Create new app_data (= NsSSLConfig).
+                 * Create new app_data (= NsTLSConfig).
                  *
-                 * The app_data of SSL_CTX is cfgPtr (NsSSLConfig*),
+                 * The app_data of SSL_CTX is dc (NsTLSConfig*),
                  * while the app_data of an SSL connection is the
                  * sockPtr (Ns_Sock*).
                  */
-                cfgPtr = NsSSLConfigNew(section);
-                cfgPtr->ctx = *ctxPtr;
+                dc = NsTLSConfigNew(section);
+                dc->ctx = *ctxPtr;
+
                 Ns_Log(Debug, "Ns_TLS_CtxServerInit created new app data %p for cert <%s> ctx %p",
-                        (void*)cfgPtr, cert, (void*)(cfgPtr->ctx));
-                SSL_CTX_set_app_data(*ctxPtr, (void *)cfgPtr);
+                        (void*)dc, cert, (void*)(dc->ctx));
+                SSL_CTX_set_app_data(*ctxPtr, (void *)dc);
             }
 
             SSL_CTX_set_session_id_context(*ctxPtr, (const unsigned char *)&nsconf.pid, sizeof(pid_t));
             SSL_CTX_set_session_cache_mode(*ctxPtr, SSL_SESS_CACHE_SERVER);
 
-#ifdef HAVE_OPENSSL_PRE_1_1
             SSL_CTX_set_info_callback(*ctxPtr, SSL_infoCB);
-#endif
 
             SSL_CTX_set_options(*ctxPtr, SSL_OP_NO_SSLv2);
             SSL_CTX_set_options(*ctxPtr, SSL_OP_SINGLE_DH_USE);
@@ -2077,6 +2167,15 @@ Ns_TLS_CtxServerInit(const char *section, Tcl_Interp *interp,
              * Prefer server ciphers to secure against BEAST attack.
              */
             SSL_CTX_set_options(*ctxPtr, SSL_OP_CIPHER_SERVER_PREFERENCE);
+
+            /*
+             * SNI: server name indication
+             */
+            if ((flags & NS_DRIVER_SNI) != 0) {
+                SSL_CTX_set_tlsext_servername_callback(*ctxPtr, SSL_serverNameCB);
+                SSL_CTX_set_tlsext_servername_arg(dc->ctx, dc);
+            }
+
             /*
              * Disable compression to avoid CRIME attack.
              */
@@ -2092,7 +2191,7 @@ Ns_TLS_CtxServerInit(const char *section, Tcl_Interp *interp,
              *     SSL_MODE_ASYNC
              */
 
-#ifdef OPENSSL_HAVE_READ_BUFFER_LEN
+#ifdef HAVE_OPENSSL_READ_BUFFER_LEN
             /*
              * read_buffer_len is apparently just useful, when crypto
              * pipelining is set up. In general, the OpenSSL "dasync"
@@ -2103,25 +2202,15 @@ Ns_TLS_CtxServerInit(const char *section, Tcl_Interp *interp,
              *  SSL_CTX_set_default_read_buffer_len(*ctxPtr, 65000);
              */
 #endif
-
             /*
-             * Obsolete since 1.1.0 but also supported in 3.0
+             * Flags obsolete since 1.1.0 but also supported in 3.0
              */
             SSL_CTX_set_options(*ctxPtr, SSL_OP_SSLEAY_080_CLIENT_DH_BUG);
             SSL_CTX_set_options(*ctxPtr, SSL_OP_TLS_D5_BUG);
             SSL_CTX_set_options(*ctxPtr, SSL_OP_TLS_BLOCK_PADDING_BUG);
 
-            if ((flags & NS_DRIVER_SNI) != 0) {
-                SSL_CTX_set_tlsext_servername_callback(*ctxPtr, SSL_serverNameCB);
-                /* SSL_CTX_set_tlsext_servername_arg(cfgPtr->ctx, app_data); // not really needed */
-            }
-#ifdef OPENSSL_HAVE_DH_AUTO
+#ifdef HAVE_OPENSSL_DH_AUTO
             SSL_CTX_set_dh_auto(*ctxPtr, 1);
-#else
-            cfgPtr->dhKey512 = get_dh512();
-            cfgPtr->dhKey1024 = get_dh1024();
-            cfgPtr->dhKey2048 = get_dh2048();
-            SSL_CTX_set_tmp_dh_callback(*ctxPtr, SSL_dhCB);
 #endif
 
             {
@@ -2142,7 +2231,7 @@ Ns_TLS_CtxServerInit(const char *section, Tcl_Interp *interp,
                 rc = X509_STORE_load_locations(storePtr, cert, NULL);
                 Ns_Log(Debug, "nsssl:X509_STORE_load_locations %d", rc);
             }
-#ifndef OPENSSL_NO_OCSP
+#ifdef HAVE_OPENSSL_OCSP
             if (Ns_ConfigBool(section, "ocspstapling", NS_FALSE)) {
                 Ns_Log(Notice, "nsssl: activate OCSP stapling for %s", section);
 
@@ -2158,7 +2247,7 @@ Ns_TLS_CtxServerInit(const char *section, Tcl_Interp *interp,
             } else {
                 Ns_Log(Notice, "nsssl: OCSP stapling for %s not activated", section);
             }
-#endif
+#endif /* HAVE_OPENSSL_OCSP */
 
 #if OPENSSL_VERSION_NUMBER > 0x00908070 && !defined(HAVE_OPENSSL_3) && !defined(OPENSSL_NO_EC)
             /*
@@ -2175,8 +2264,8 @@ Ns_TLS_CtxServerInit(const char *section, Tcl_Interp *interp,
                     Ns_Log(Error, "nsssl: Couldn't obtain ecdh parameters");
                     return TCL_ERROR;
                 }
-                SSL_CTX_set_options(cfgPtr->ctx, SSL_OP_SINGLE_ECDH_USE);
-                if (SSL_CTX_set_tmp_ecdh(cfgPtr->ctx, ecdh) != 1) {
+                SSL_CTX_set_options(dc->ctx, SSL_OP_SINGLE_ECDH_USE);
+                if (SSL_CTX_set_tmp_ecdh(dc->ctx, ecdh) != 1) {
                     Ns_Log(Error, "nsssl: Couldn't set ecdh parameters");
                     return TCL_ERROR;
                 }
@@ -2214,14 +2303,14 @@ static void CertTableAdd(const NS_TLS_SSL_CTX *ctx, const char *cert)
     NS_NONNULL_ASSERT(cert != NULL);
 
     Ns_MasterLock();
-    hPtr = Tcl_CreateHashEntry(&certTable, (char *)ctx, &isNew);
+    hPtr = Tcl_CreateHashEntry(&certTable, (const char *)ctx, &isNew);
     if (isNew != 0) {
         /*
          * Keep a local copy of the certificate string in case the
          * passed-in value is volatile.
          */
         Tcl_SetHashValue(hPtr, ns_strdup(cert));
-        Ns_Log(Debug, "CertTableAdd: sslCtx %p cert '%s'", (void *)ctx, cert);
+        Ns_Log(Debug, "CertTableAdd: sslCtx %p cert '%s'", (const void *)ctx, cert);
     }
     Ns_MasterUnlock();
 }
@@ -2592,7 +2681,7 @@ Ns_TLS_CtxServerCreateCfg(Tcl_Interp *interp,
                           const char *cert, const char *caFile, const char *caPath,
                           bool verify, const char *ciphers, const char *ciphersuites,
                           const char *protocols, const char *alpn,
-                          void *app_data,
+                          void *app_data, unsigned int flags,
                           NS_TLS_SSL_CTX **ctxPtr)
 {
     NS_TLS_SSL_CTX   *ctx;
@@ -2602,14 +2691,34 @@ Ns_TLS_CtxServerCreateCfg(Tcl_Interp *interp,
     NS_NONNULL_ASSERT(ctxPtr != NULL);
 
     Ns_Log(Debug, "Ns_TLS_CtxServerCreate cert '%s' app_data %p", cert, (void*)app_data);
+    (void)flags;
 
 #ifdef HAVE_OPENSSL_PRE_1_1
     server_method = SSLv23_server_method();
+#elif defined(HAVE_OPENSSL_3_5)
+    if ((flags & NS_DRIVER_QUIC) != 0) {
+        server_method = OSSL_QUIC_server_method();
+    } else {
+        server_method = TLS_server_method();
+    }
 #else
     server_method = TLS_server_method();
 #endif
 
     ctx = SSL_CTX_new(server_method);
+
+#if defined(HAVE_OPENSSL_3_5)
+    if ((flags & NS_DRIVER_QUIC) != 0) {
+        uint64_t default_flags = 0, current_flags = 0;
+
+        SSL_CTX_get_domain_flags(ctx, &default_flags);
+        // default 0x00000012
+        SSL_CTX_set_domain_flags(ctx, SSL_DOMAIN_FLAG_THREAD_ASSISTED);
+        SSL_CTX_get_domain_flags(ctx, &current_flags);
+        Ns_Log(Notice, "SSL_CTX domain_flags for ctx %p default %.8lx set to %0" PRIx64,
+               (void*)ctx, (unsigned long)default_flags, current_flags);
+    }
+#endif
 
     *ctxPtr = ctx;
     if (ctx == NULL) {
@@ -2701,6 +2810,17 @@ Ns_TLS_CtxServerCreateCfg(Tcl_Interp *interp,
     }
 #endif
 
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+    if (app_data != NULL) {
+        NsTLSConfig *dc = app_data;
+
+        if (dc->tlsKeylogFile != NULL) {
+            Ns_Log(Notice, "KeylogCB registered (file name '%s')", dc->tlsKeylogFile);
+            SSL_CTX_set_keylog_callback(ctx, KeylogCB);
+        }
+    }
+#endif
+
     SSL_CTX_set_default_verify_paths(ctx);
     SSL_CTX_load_verify_locations(ctx, caFile, caPath);
     // SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT
@@ -2713,7 +2833,7 @@ Ns_TLS_CtxServerCreateCfg(Tcl_Interp *interp,
     }
 
     SSL_CTX_set_default_passwd_cb(ctx, TLSPasswordCB);
-    SSL_CTX_set_default_passwd_cb_userdata(ctx, (void *)cert);
+    SSL_CTX_set_default_passwd_cb_userdata(ctx, ns_const2voidp(cert));
 
     DrainErrorStack(Warning, "Ns_TLS_CtxServerCreate", ERR_get_error());
 
@@ -2736,7 +2856,8 @@ Ns_TLS_CtxServerCreateCfg(Tcl_Interp *interp,
                         cert, ERR_error_string(ERR_get_error(), NULL));
             goto fail;
         }
-#ifndef OPENSSL_HAVE_DH_AUTO
+        /*Ns_Log(Notice, "SSL_CTX_use_certificate_chain_file and SSL_CTX_use_PrivateKey_file into SSL_CTX %p", (void*)ctx);*/
+#ifndef HAVE_OPENSSL_DH_AUTO
         /*
          * Get DH parameters from .pem file
          */
@@ -2782,7 +2903,7 @@ Ns_TLS_CtxServerCreateCfg(Tcl_Interp *interp,
  *        interface.
  *      * ALPN can't be provided.
  *
- *      One consequence is, the internal NsSSLConfig data can't be
+ *      One consequence is, the internal NsTLSConfig data can't be
  *      provided over this interface, and the pass-phrase passing via
  *      external script can't be used.
  *
@@ -2804,7 +2925,7 @@ Ns_TLS_CtxServerCreate(Tcl_Interp *interp,
     return Ns_TLS_CtxServerCreateCfg(interp, cert, caFile, caPath,
                                      verify, ciphers, ciphersuites,
                                      protocols, "http/1.1",
-                                     NULL,
+                                     NULL, 0u,
                                      ctxPtr);
 }
 
@@ -3316,7 +3437,74 @@ NsTclCertCtlObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T objc, T
     return Ns_SubcmdObjv(subcmds, clientData, interp, objc, objv);
 }
 
+static void
+EnsureDriverLinkage(void)
+{
+    Ns_DList h3dl, h1dl;
+    size_t   i, j;
 
+    Ns_DListInit(&h3dl);
+    Ns_DListInit(&h1dl);
+    NsDriversOfType(&h3dl, "quic");
+    NsDriversOfType(&h1dl, "nsssl");
+
+    Ns_Log(Notice, "EnsureDriverLinkage h1 %ld h3 %ld", h1dl.size, h3dl.size);
+
+    for (i = 0; i < h3dl.size; i++) {
+        Driver      *h3drvPtr = h3dl.data[i];
+        const char  *section = h3drvPtr->path;
+
+        for (j = 0; j < h3dl.size; j++) {
+            Driver *h1drvPtr = h1dl.data[j];
+            if (STREQ(h3drvPtr->path, section)) {
+                Ns_Log(Notice, "EnsureDriverLinkage common section %s h1 driver %p %s"
+                       " has linked driver %p %s", section,
+                       (void*)h1drvPtr, h1drvPtr->moduleName,
+                       (void*)h3drvPtr, h3drvPtr->moduleName);
+                h1drvPtr->consumer = h3drvPtr;
+                h3drvPtr->provider = h1drvPtr;
+            }
+        }
+    }
+    Ns_DListFree(&h3dl);
+    Ns_DListFree(&h1dl);
+}
+
+void NsTlsAddOutputHeaders(Ns_Set *outputHeaders, const Ns_Sock *sockPtr)
+{
+    NsTLSConfig *dc = sockPtr->driver->arg;
+
+    NS_INIT_ONCE(EnsureDriverLinkage);
+
+    Ns_Log(Debug, "NsTlsAddOutputHeaders h1 driver %p %s linked to %p advertise %d"
+           " already set %d req %s",
+           (void*)sockPtr->driver, sockPtr->driver->threadName,
+           (void*)((Driver *)sockPtr->driver)->consumer,
+           dc->u.h1.h3advertise, (Ns_SetFind(outputHeaders, "alt-svc") > -1),
+           ((const Sock*)sockPtr)->reqPtr->request.line);
+    /*
+     * Add alt-svc header field, if
+     *  - the h3 module is activated and linked to this driver, and
+     *  - h3advertise is turned on, and
+     *  - alt-svc" is not already set
+     */
+    if (((Driver *)sockPtr->driver)->consumer != NULL
+        && dc->u.h1.h3advertise
+        && Ns_SetFind(outputHeaders, "alt-svc") == -1) {
+        Driver      *drvPtr = (Driver*)(sockPtr->driver);
+        Tcl_DString  ds;
+
+        Tcl_DStringInit(&ds);
+        Ns_DStringPrintf(&ds, "h3=\":%hu\"; ma=86400%s",
+                         drvPtr->port,
+                         dc->u.h1.h3persist ? "; persist=1" : "");
+        Ns_Log(Notice, "quic: added header field: alt-svc: %s", ds.string);
+        Ns_SetPutSz(outputHeaders,
+                    "alt-svc", 7,
+                    ds.string, ds.length);
+        Tcl_DStringFree(&ds);
+    }
+}
 
 #else
 
@@ -3331,9 +3519,9 @@ void NsInitOpenSSL(void)
  */
 
 int
-Ns_TLS_SSLConnect(Tcl_Interp *interp, NS_SOCKET UNUSED(sock), NS_TLS_SSL_CTX *UNUSED(ctx),
-                  const char *UNUSED(sni_hostname), const char **UNUSED(caFile), const char **UNUSED(caPath),
-                  const Ns_Time *UNUSED(timeoutPtr), NS_TLS_SSL **UNUSED(sslPtr))
+Ns_TLS_SSLConnect(Tcl_Interp *interp, NS_SOCKET sock, NS_TLS_SSL_CTX *ctx,
+                  const char *sni_hostname, const char *caFile, const char *caPath,
+                  const Ns_Time *timeoutPtr, NS_TLS_SSL **sslPtr)
 {
     Ns_TclPrintfResult(interp, "SSLCreate failed: no support for OpenSSL built in");
     return TCL_ERROR;
@@ -3370,7 +3558,7 @@ int
 Ns_TLS_CtxServerCreateCfg(Tcl_Interp *interp,
                           const char *UNUSED(cert), const char *UNUSED(caFile), const char *UNUSED(caPath),
                           bool UNUSED(verify), const char *UNUSED(ciphers), const char *UNUSED(ciphersuites),
-                          const char *UNUSED(protocols),
+                          const char *UNUSED(protocols), const char *UNUSED(alpn),
                           void *UNUSED(app_data),
                           NS_TLS_SSL_CTX **UNUSED(ctxPtr))
 {

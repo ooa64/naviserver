@@ -18,6 +18,15 @@
 
 #include "nsd.h"
 
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+#endif
+#include "rapidhash.h"
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic pop
+#endif
+
 #define COLOR_BUFFER_SIZE 255u
 #define TIME_BUFFER_SIZE 100u
 
@@ -32,6 +41,7 @@
 #define LOG_USEC_DIFF 0x10u
 #define LOG_THREAD    0x20u
 #define LOG_COLORIZE  0x40u
+#define LOG_RELATIVE  0x80u
 
 /*
  * The following struct represents a log entry header as stored in the
@@ -420,6 +430,9 @@ NsConfigLog(void)
     }
     if (Ns_ConfigBool(section, "logthread", NS_TRUE) == NS_TRUE) {
         flags |= LOG_THREAD;
+    }
+    if (Ns_ConfigBool(section, "logrelative", NS_FALSE) == NS_TRUE) {
+        flags |= LOG_RELATIVE;
     }
     if (Ns_ConfigBool(section, "logcolorize", NS_FALSE) == NS_TRUE) {
         flags |= LOG_COLORIZE;
@@ -1352,7 +1365,7 @@ static int
 LogCtlGrepObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *const* objv)
 {
     int          result = TCL_OK;
-    char        *string, *filename = (char *)logfileName;
+    const char  *string, *filename = logfileName;
     Ns_ObjvSpec  lopts[] = {
         {"-filename", Ns_ObjvString, &filename, NULL},
         {"--",        Ns_ObjvBreak,  NULL,      NULL},
@@ -2012,12 +2025,14 @@ LogClose(void *UNUSED(arg))
  */
 
 static Ns_ReturnCode
-LogToDString(const void *arg, Ns_LogSeverity severity, const Ns_Time *stamp,
-            const char *msg, size_t len)
+LogToDString(void *arg, Ns_LogSeverity severity, const Ns_Time *stamp,
+             const char *msg, size_t len)
 {
-    Tcl_DString *dsPtr  = (Tcl_DString *)arg;
-    LogCache   *cachePtr = GetCache();
-    char        buffer[COLOR_BUFFER_SIZE];
+    Tcl_DString   *dsPtr  = arg;
+    LogCache      *cachePtr = GetCache();
+    char           buffer[COLOR_BUFFER_SIZE];
+    static Ns_Time startTime = {0};
+    Ns_Time        usedTime;
 
     NS_NONNULL_ASSERT(arg != NULL);
     NS_NONNULL_ASSERT(stamp != NULL);
@@ -2030,6 +2045,15 @@ LogToDString(const void *arg, Ns_LogSeverity severity, const Ns_Time *stamp,
         return NS_OK;
     }
 
+    if ((flags & LOG_RELATIVE) != 0u) {
+        if (startTime.sec == 0) {
+            Ns_GetTime(&startTime);
+        }
+        Ns_DiffTime(stamp, &startTime, &usedTime);
+        stamp = &usedTime;
+        Ns_DStringPrintf(dsPtr, "[%ld]", stamp->sec);
+    }
+
     /*
      * In case colorization was configured, add the necessary escape
      * sequences.
@@ -2038,7 +2062,7 @@ LogToDString(const void *arg, Ns_LogSeverity severity, const Ns_Time *stamp,
         Ns_DStringPrintf(dsPtr, "%s%d;%dm", LOG_COLORSTART, prefixIntensity, prefixColor);
     }
 
-    if ((flags & LOG_SEC) != 0u) {
+    if ((flags & LOG_SEC) != 0u && ((flags & LOG_RELATIVE) == 0)) {
         const char *timeString;
         size_t      timeStringLength;
 
@@ -2142,23 +2166,24 @@ LogToDString(const void *arg, Ns_LogSeverity severity, const Ns_Time *stamp,
  *----------------------------------------------------------------------
  */
 static Ns_ReturnCode
-LogToFile(const void *arg, Ns_LogSeverity severity, const Ns_Time *stamp,
+LogToFile(void *arg, Ns_LogSeverity severity, const Ns_Time *stamp,
           const char *msg, size_t len)
 {
 #if defined(NS_THREAD_LOCAL)
     int        fd = PTR2INT(arg);
     static NS_THREAD_LOCAL size_t sameLineCount = 1u;
     static NS_THREAD_LOCAL size_t lastLen = 0u;
-    static NS_THREAD_LOCAL size_t lastHash = 0u;
+    static NS_THREAD_LOCAL uint64_t lastHash = 0u;
     static NS_THREAD_LOCAL Ns_LogSeverity lastSeverity = 0u;
-    size_t hash = 0u;
+    uint64_t hash = 0u;
 
     NS_NONNULL_ASSERT(arg != NULL);
     NS_NONNULL_ASSERT(stamp != NULL);
     NS_NONNULL_ASSERT(msg != NULL);
 
-    hash = NsTclHash(msg);
-    //fprintf(stderr, "LOG compute hash len %lu MSG <%s> hash %lu\n", len, msg, hash);
+    //hash = NsTclHash(msg);
+    hash = rapidhash(msg, len);
+    //fprintf(stderr, "LOG compute hash len %lu MSG <%s> hash %llu\n", len, msg, hash);
 
     if (hash == lastHash && lastLen == len && lastSeverity == severity) {
         /*
@@ -2245,7 +2270,7 @@ LogToFile(const void *arg, Ns_LogSeverity severity, const Ns_Time *stamp,
  */
 
 static Ns_ReturnCode
-LogToTcl(const void *arg, Ns_LogSeverity severity, const Ns_Time *stamp,
+LogToTcl(void *arg, Ns_LogSeverity severity, const Ns_Time *stamp,
          const char *msg, size_t len)
 {
     Ns_ReturnCode         status;
@@ -2529,6 +2554,7 @@ GetSeverityFromObj(Tcl_Interp *interp, Tcl_Obj *objPtr, void **addrPtrPtr)
 
     return result;
 }
+
 
 #ifdef NS_WITH_DEPRECATED
 /*

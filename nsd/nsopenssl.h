@@ -61,12 +61,16 @@
 # endif
 
 # if defined(OPENSSL_VERSION_MAJOR) && OPENSSL_VERSION_MAJOR >= 3
-#  define HAVE_OPENSSL_3 1
+#  define HAVE_OPENSSL_3
 #  if OPENSSL_VERSION_PREREQ(3,2)
-#   define HAVE_OPENSSL_3_2 1
+#   define HAVE_OPENSSL_3_2
 #  endif
 #  if OPENSSL_VERSION_PREREQ(3,5)
-#   define HAVE_OPENSSL_3_5 1
+#   define HAVE_OPENSSL_3_5
+#  endif
+#  if OPENSSL_VERSION_PREREQ(4,0)
+#   define HAVE_OPENSSL_4
+#   define HAVE_OPENSSL_4_0
 #  endif
 # endif
 
@@ -75,22 +79,71 @@
 #  define HAVE_OPENSSL_EC_PRIV2OCT
 # endif
 
+# if !defined(HAVE_OPENSSL_PRE_1_1)
+#  define HAVE_OPENSSL_DH_AUTO
+#  define HAVE_OPENSSL_READ_BUFFER_LEN
+# endif
+
+# if defined(HAVE_OPENSSL_3)
+#  define HAVE_OPENSSL_OCSP
+# endif
+
 # include <openssl/ssl.h>
 # include <openssl/err.h>
 
-typedef struct NsSSLConfig {
+typedef struct NsTLSConfig {
+    Ns_Driver  *driver; /* Default context for driver                   */
     SSL_CTX    *ctx;
-    Ns_Mutex    lock;
-    const char *tlsKeyScript;
+    uint64_t    iter;
     int         verify;
-    int         deferaccept;  /* Enable the TCP_DEFER_ACCEPT optimization. */
-    int         nodelay;      /* Enable the TCP_NODELAY optimization. */
-    DH         *dhKey512;     /* Fallback Diffie Hellman keys of length 512 */
-    DH         *dhKey1024;    /* Fallback Diffie Hellman keys of length 1024 */
-    DH         *dhKey2048;    /* Fallback Diffie Hellman keys of length 2048 */
-} NsSSLConfig;
+    const char *tlsKeyScript;
+    const char *tlsKeylogFile;
+    const char *vhostcertificates;
+    int         sni_idx;
+    union {
+        struct {
+            int    deferaccept;       /* Enable the TCP_DEFER_ACCEPT optimization.         */
+            int    nodelay;           /* Enable the TCP_NODELAY optimization.              */
+            bool   h3advertise;       /* add h3 advertise automatically when h3 is enabled */
+            bool   h3persist;         /* add persit flag to h3 advertise when activated    */
+        } h1;
+# if defined(HAVE_OPENSSL_4)
+        struct {
+            size_t     recvbufsize;  /* value for setting SO_RCVBUF */
+            size_t     nr_listeners; /* number of listener SSL* at the start of the pollset */
+            int        cc_idx;       /* slot to fetch ConnCtx an SSL*                */
+            int        sc_idx;       /* slot to fetch StreamCtx an SSL*              */
+            size_t     first_dead;   /* marker for consolidation of pollset          */
 
-NS_EXTERN NsSSLConfig *NsSSLConfigNew(const char *section)
+            /* --- TLS/QUIC waker (bypass limitation of SSL_Poll, not supporting trigger pipes --- */
+            Ns_Mutex   waker_lock;   /* protects waker_armed */
+            //bool       waker_armed;  /* edge-trigger gate */
+            struct sockaddr_storage waker_addr;
+            socklen_t   waker_addrlen;
+
+            SSL_POLL_ITEM *poll_items;    /* contiguous array, matches capacity */
+            Ns_DList       ssl_items;     /* parallel to poll_items[] */
+            Ns_DList       conns;
+            size_t         npoll;
+            size_t         poll_capacity;
+
+            struct timeval idle_timeout;  /* e.g., {1, 0} */
+            struct timeval drain_timeout; /* e.g., {0, 10*1000} -> 10ms */
+        } h3;
+# endif
+    } u;
+} NsTLSConfig;
+
+NS_EXTERN NsTLSConfig *NsTLSConfigNew(const char *section)
    NS_GNUC_NONNULL(1);
 
 #endif
+
+/*
+ * Local Variables:
+ * mode: c
+ * c-basic-offset: 4
+ * fill-column: 78
+ * indent-tabs-mode: nil
+ * End:
+ */

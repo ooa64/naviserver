@@ -92,18 +92,17 @@ static Ns_SockProc CloseLater;
 static NS_INLINE bool
 Retry(int errorCode)
 {
-    return (errorCode == NS_EAGAIN
-            || errorCode == NS_EINTR
 #if defined(__APPLE__)
-            /*
-             * Due to a possible kernel bug at least in OS X 10.10 "Yosemite",
-             * EPROTOTYPE can be returned while trying to write to a socket
-             * that is shutting down. If we retry the write, we should get
-             * the expected EPIPE instead.
-             */
-            || errorCode == EPROTOTYPE
+    /*
+     * At least in OS X 10.10 "Yosemite", EPROTOTYPE can be returned while
+     * trying to write to a socket that is shutting down. The error means that
+     * the socket type is not supported by the protocol. If we retry the
+     * write, we should get the expected EPIPE instead.
+     */
+    return NS_ERRNO_SHOULD_RETRY(errorCode) || (errorCode == EPROTOTYPE);
+#else
+    return NS_ERRNO_SHOULD_RETRY(errorCode);
 #endif
-            || errorCode == NS_EWOULDBLOCK);
 }
 
 bool NsSockRetryCode(int errorCode)
@@ -131,8 +130,7 @@ bool NsSockRetryCode(int errorCode)
 size_t
 Ns_SetVec(struct iovec *bufs, int i, const void *data, size_t len)
 {
-    bufs[i].iov_base = (void *) data;
-    bufs[i].iov_len = len;
+    ns_iov_set(&bufs[i], data, len);
 
     return len;
 }
@@ -643,7 +641,7 @@ Ns_SockSendBufs(Ns_Sock *sock, const struct iovec *bufs, int nbufs,
             ) {
             Ns_Log(Debug, "Ns_SockSendBufs partial write: want to send %" PRIdz
                    " bytes, sent %" PRIdz " timeoutPtr %p",
-                   toWrite, sent, (void*)timeoutPtr);
+                   toWrite, sent, (const void*)timeoutPtr);
         }
         if (sent == 0
             && Ns_SockTimedWait(sock->sock, (unsigned int)NS_SOCK_WRITE,
@@ -1019,7 +1017,7 @@ Ns_SockAccept(NS_SOCKET sock, struct sockaddr *saPtr, socklen_t *lenPtr)
 
     if (likely(sock != NS_INVALID_SOCKET)) {
         sock = SockSetup(sock);
-    } else if (sockerrno != 0 && sockerrno != NS_EAGAIN) {
+    } else if (sockerrno != 0 && !NS_ERRNO_SHOULD_RETRY(sockerrno)) {
         Ns_Log(Warning, "accept() fails, reason: %s", ns_sockstrerror(sockerrno));
     }
 
@@ -1118,16 +1116,6 @@ Ns_SockBind(const struct sockaddr *saPtr, bool reusePort)
             ns_sockclose(sock);
             sock = NS_INVALID_SOCKET;
         }
-
-        if (port == 0u && sock != NS_INVALID_SOCKET) {
-            /*
-             * Refetch the socket structure containing the potentially fresh port
-             */
-            socklen_t socklen = Ns_SockaddrGetSockLen((const struct sockaddr *)saPtr);
-
-            (void) getsockname(sock, (struct sockaddr *)saPtr, &socklen);
-        }
-
     }
 
     return sock;
@@ -1324,7 +1312,7 @@ Ns_SockTimedConnect2(const char *host, unsigned short port, const char *lhost,
                 break;
             }
         case NS_TIMEOUT:
-            errno = ETIMEDOUT;
+            errno = NS_ETIMEDOUT;
             break;
 
         case NS_ERROR:         NS_FALL_THROUGH; /* fall through */
@@ -2311,7 +2299,7 @@ SockSend(NS_SOCKET sock, const struct iovec *bufs, int nbufs, unsigned int flags
     struct msghdr msg;
 
     memset(&msg, 0, sizeof(msg));
-    msg.msg_iov = (struct iovec *)bufs;
+    msg.msg_iov = (struct iovec *)(uintptr_t)bufs; /* safe: sendmsg() does not modify iov */
     msg.msg_iovlen = (NS_MSG_IOVLEN_T)nbufs;
     numBytes = sendmsg(sock, &msg, (int)flags|MSG_NOSIGNAL|MSG_DONTWAIT);
     *errorCodePtr = (unsigned long)ns_sockerrno;
@@ -2876,8 +2864,8 @@ NsErrorCodeString(int errorCode)
 #if defined(ETIME) && (!defined(ELOOP) || (ETIME != ELOOP))
     case ETIME: return "ETIME";
 #endif
-#if defined(ETIMEDOUT) && (!defined(ENOSTR) || (ETIMEDOUT != ENOSTR))
-    case ETIMEDOUT: return "ETIMEDOUT";
+#if defined(NS_ETIMEDOUT) && (!defined(ENOSTR) || (NS_ETIMEDOUT != ENOSTR))
+    case NS_ETIMEDOUT: return "ETIMEDOUT";
 #endif
 #ifdef ETOOMANYREFS
     case ETOOMANYREFS: return "ETOOMANYREFS";

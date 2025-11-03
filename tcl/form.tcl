@@ -194,7 +194,7 @@ proc ns_getform {args}  {
             # Get the content via memory (indirectly via [ns_conn
             # content], the command [ns_conn form] does this)
             #
-            ns_log debug "ns_getfrom: get content from memory (files [ns_conn files])"
+            ns_log debug "ns_getform: get content from memory (files [ns_conn files])"
             foreach {file} [ns_conn files] {
                 set offs [ns_conn fileoffset $file]
                 set lens [ns_conn filelength $file]
@@ -225,7 +225,7 @@ proc ns_getform {args}  {
             #
             # Get the content via external spool file
             #
-            ns_log debug "ns_getfrom: get content from file"
+            ns_log debug "ns_getform: get content from file"
             try {
                 #
                 # We have to provide a fallback charset here,
@@ -387,7 +387,7 @@ proc ns_parseformfile {args} {
     if { [catch { set fp [open $file r] } errmsg] } {
         ns_log warning "ns_parseformfile could not open $file for reading"
     }
-    #file copy -force $file /tmp/up.load
+    #file copy -force $file /tmp/upload.raw
 
     #
     # Separate content-type and options
@@ -450,6 +450,13 @@ proc ns_parseformfile {args} {
     #
     # Everything below is just for content-type "multipart/form-data"
     #
+    ### BEGIN DB
+    #set content [read $fp]
+    #seek $fp 0
+    #ns_log notice "END_OF_CONTENT\n[string range $content end-200 end]"
+    #ns_log notice "CONTENT\n$content"
+    ### END DB
+
     fconfigure $fp -translation binary
     set boundary "--$b"
 
@@ -554,7 +561,7 @@ proc ns_parseformfile {args} {
                     }
                     # move beyond the leading newline
                     incr seekChar
-                    set end    [expr {$seekChar - [string length $boundary]}]
+                    set end    $seekChar
                     set length [expr {$end - $start - 2}]
                 }]
                 #ns_log notice "================== ns_fseekchars start $start end $end length $length // $t1"
@@ -594,6 +601,7 @@ proc ns_parseformfile {args} {
                 #ns_log notice "PARSE multipart fcopy $fp [fconfigure $fp -encoding]" \
                     "-> $tmp [fconfigure $tmp -encoding]"
 
+                #ns_log notice fcopy $fp $tmp -size $length
                 fcopy $fp $tmp -size $length
             }
 

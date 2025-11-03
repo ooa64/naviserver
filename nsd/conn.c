@@ -39,14 +39,11 @@ static int ConnNoArg(int opt, unsigned int required_flags, Conn *connPtr,
                      NsInterp *itPtr, TCL_SIZE_T objc, Tcl_Obj *const* objv)
     NS_GNUC_NONNULL(4) NS_GNUC_NONNULL(6);
 
-static char *DStringAppendConnFlags(Tcl_DString *dsPtr, unsigned int flags)
-    NS_GNUC_NONNULL(1);
-
 
 /*
  *----------------------------------------------------------------------
  *
- * DStringAppendConnFlags --
+ * NsDStringAppendConnFlags --
  *
  *      Decode a connection‐flags bitmask into a human‐readable string
  *      of flag names separated by '|' and append it to a Tcl_DString.
@@ -65,8 +62,8 @@ static char *DStringAppendConnFlags(Tcl_DString *dsPtr, unsigned int flags)
  *
  *----------------------------------------------------------------------
  */
-static char *
-DStringAppendConnFlags(Tcl_DString *dsPtr, unsigned int flags)
+char *
+NsDStringAppendConnFlags(Tcl_DString *dsPtr, unsigned int flags)
 {
     int    count = 0;
     size_t i;
@@ -387,7 +384,7 @@ Ns_ConnServer(const Ns_Conn *conn)
 Ns_Server *
 Ns_ConnServPtr(const Ns_Conn *conn)
 {
-    const Conn *connPtr = (Conn *)conn;
+    const Conn *connPtr = (const Conn *)conn;
 
     return (Ns_Server *)(connPtr->sockPtr
                          ? connPtr->sockPtr->servPtr
@@ -594,11 +591,10 @@ const char *
 Ns_ConnCurrentAddr(const Ns_Conn *conn)
 {
     const char *result;
-    const Conn *connPtr;
+    const Conn *connPtr = (const Conn *)conn;
 
     NS_NONNULL_ASSERT(conn != NULL);
 
-    connPtr = (Conn *)conn;
     if (connPtr->sockPtr != NULL) {
         result = Ns_SockGetAddr((Ns_Sock *)connPtr->sockPtr);
     } else {
@@ -938,7 +934,8 @@ Ns_ConnLocationAppend(Ns_Conn *conn, Tcl_DString *dest)
          * host header fields. Do not append an extra port (must be included
          * in "host" if necessary).
          */
-        const Tcl_HashEntry  *hPtr = Tcl_FindHashEntry((Tcl_HashTable *)&servPtr->hosts, host);
+        const Tcl_HashEntry *hPtr = Ns_TclFindHashEntryConst(&servPtr->hosts, host);
+
         if (hPtr != NULL) {
             location = Ns_HttpLocationString(dest, connPtr->drvPtr->protocol, host, 0u, 0u);
             Ns_Log(Debug, "Ns_ConnLocation: reverseproxymode location <%s>", location);
@@ -2238,7 +2235,7 @@ NsTclConnObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_
         }
 
         case CHostIdx: {
-            char       *defaultValue = (char *)NS_EMPTY_STRING;
+            const char *defaultValue = NS_EMPTY_STRING;
             Ns_ObjvSpec largs[] = {
                 {"?default", Ns_ObjvString, &defaultValue, NULL},
                 {NULL, NULL, NULL, NULL}
@@ -2636,7 +2633,7 @@ ConnNoArg(int opt, unsigned int required_flags, Conn *connPtr, NsInterp *itPtr, 
                  hPtr != NULL;
                  hPtr = Tcl_NextHashEntry(&search)
                  ) {
-                const char *key = Tcl_GetHashKey(&connPtr->files, hPtr);
+                const char *key = Ns_TclGetHashKeyString(&connPtr->files, hPtr);
                 Tcl_ListObjAppendElement(interp, listObj, Tcl_NewStringObj(key, TCL_INDEX_NONE));
             }
             Tcl_SetObjResult(interp, listObj);
@@ -2750,7 +2747,7 @@ ConnNoArg(int opt, unsigned int required_flags, Conn *connPtr, NsInterp *itPtr, 
 
         Tcl_DictObjPut(NULL, dictObj,
                        Tcl_NewStringObj("currentaddr", 11),
-                       Tcl_NewStringObj(currentAddr != NULL ? currentAddr : "na", -1));
+                       Tcl_NewStringObj(currentAddr != NULL ? currentAddr : "na", TCL_INDEX_NONE));
 
         if (currentAddr != NULL) {
             struct NS_SOCKADDR_STORAGE sa;
@@ -2761,7 +2758,7 @@ ConnNoArg(int opt, unsigned int required_flags, Conn *connPtr, NsInterp *itPtr, 
         }
 
         Tcl_DStringInit(&ds);
-        DStringAppendConnFlags(&ds, connPtr->flags);
+        NsDStringAppendConnFlags(&ds, connPtr->flags);
         Tcl_DictObjPut(NULL, dictObj,
                        Tcl_NewStringObj("flags", 5),
                        Tcl_NewStringObj(ds.string, ds.length));

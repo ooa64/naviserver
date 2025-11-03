@@ -65,13 +65,13 @@ RequestCleanupMembers(Ns_Request *request)
     if (request->line != NULL) {
         Ns_Log(Ns_LogRequestDebug, "end %s", request->line);
     }
-    ns_free((char *)request->line);
-    ns_free((char *)request->method);
-    ns_free((char *)request->protocol);
-    ns_free((char *)request->host);
+    ns_free_const(request->line);
+    ns_free_const(request->method);
+    ns_free_const(request->protocol);
+    ns_free_const(request->host);
     ns_free(request->query);
-    ns_free((char *)request->fragment);
-    ns_free((char *)request->serverRoot);
+    ns_free_const(request->fragment);
+    ns_free_const(request->serverRoot);
     FreeUrl(request);
 }
 
@@ -318,7 +318,7 @@ Ns_ParseRequest(Ns_Request *request, const char *line, size_t len)
     request->port = 0u;
 
     /*
-     * If the content of "url" starts with a sluash, this is an "origin-form"
+     * If the content of "url" starts with a slash, this is an "origin-form"
      *
      *    https://www.rfc-editor.org/rfc/rfc9112#name-origin-form
      *
@@ -377,7 +377,11 @@ Ns_ParseRequest(Ns_Request *request, const char *line, size_t len)
          */
         if (*p != '\0' && *p != '/') {
             bool  hostParsedOk;
-            char *h = p, *end, *hostName;
+            char *h = p, *end;
+            const char *hostName, *portString;
+            static char emptyPath[] = "/";
+
+            /*Ns_Log(Notice, "ParseRequest host:port <%s>", h);*/
 
             /*
              * Search for the next slash
@@ -387,20 +391,21 @@ Ns_ParseRequest(Ns_Request *request, const char *line, size_t len)
                 *p++ = '\0';
                 url = p;
             } else {
-                url = (char*)"";
+                url = &emptyPath[1];
             }
 
             /*
              * Parse actually host and port
              */
-            hostParsedOk = Ns_HttpParseHost2(h, NS_FALSE, &hostName, &p, &end);
+            hostParsedOk = Ns_HttpParseHost2(h, NS_FALSE, &hostName, &portString, &end);
             if (hostParsedOk) {
-                Ns_Log(Notice, "Parse host+porthostName <%s> p <%s> end <%s>", hostName, p, end);
-                if (p != NULL) {
+                Ns_Log(Ns_LogRequestDebug, "ParseRequest host:port <%s> host <%s> port <%s> end <%s>",
+                       h, hostName, portString, end);
+                if (portString != NULL) {
                     /*
                      * We know, the port string is terminated by a slash or NUL.
                      */
-                    request->port = (unsigned short)strtol(p, NULL, 10);
+                    request->port = (unsigned short)strtol(portString, NULL, 10);
                 }
                 request->host = ns_strdup(hostName);
             }
@@ -420,7 +425,7 @@ Ns_ParseRequest(Ns_Request *request, const char *line, size_t len)
 
             } else if (request->requestType == NS_REQUEST_TYPE_PROXY) {
                 if (*url == '\0') {
-                    url = (char*)"/";
+                    url = emptyPath;
                 } else {
                     errorMsg = "invalid proxy request";
                     if (request->protocol == NULL) {
@@ -442,7 +447,7 @@ Ns_ParseRequest(Ns_Request *request, const char *line, size_t len)
                 /*
                  * We need a URL in SetUrl(), without SetUrl, NsUrlSpecificGet() will crash
                  */
-                url = (char*)"/";
+                url = emptyPath;
 
             } else if (request->requestType == NS_REQUEST_TYPE_ASTERISK
                        && strcasecmp(request->method, "OPTIONS") != 0) {
@@ -477,11 +482,11 @@ Ns_ParseRequest(Ns_Request *request, const char *line, size_t len)
     Ns_Log(Warning, "Ns_ParseRequest <%s> cannot parse request line: %s", line, errorMsg);
 
     if (request->protocol != NULL) {
-        ns_free((char*)request->protocol);
+        ns_free_const(request->protocol);
         request->protocol = NULL;
     }
     if (request->host != NULL) {
-        ns_free((char*)request->host);
+        ns_free_const(request->host);
         request->host = NULL;
     }
 
@@ -587,11 +592,11 @@ FreeUrl(Ns_Request *request)
     NS_NONNULL_ASSERT(request != NULL);
 
     if (request->url != NULL) {
-        ns_free((char *)request->url);
+        ns_free_const(request->url);
         request->url = NULL;
     }
     if (request->urlv != NULL) {
-        ns_free((char *)request->urlv);
+        ns_free_const(request->urlv);
         request->urlv = NULL;
         request->urlc = 0;
     }

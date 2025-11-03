@@ -75,7 +75,7 @@
 #define NS_CONN_SENT_LAST_CHUNK       0x200u /* Marks that the last chunk was sent in chunked mode */
 #define NS_CONN_SENT_VIA_WRITER       0x400u /* Response data has been sent via writer thread */
 #define NS_CONN_SOCK_CORKED           0x800u /* Underlying socket is corked */
-#define NS_CONN_SOCK_WAITING          0x800u /* Connection pushed to waiting list */
+#define NS_CONN_SOCK_WAITING        0x01000u /* Connection pushed to waiting list */
 #define NS_CONN_ZIPACCEPTED         0x10000u /* The request accepts zip compression */
 #define NS_CONN_BROTLIACCEPTED      0x20000u /* The request accept brotli compression */
 #define NS_CONN_CONTINUE            0x40000u /* The request got "Expect: 100-continue" */
@@ -176,12 +176,14 @@ typedef enum {
 #define NS_DRIVER_UDP              0x08u /* UDP, can't use stream socket options */
 #define NS_DRIVER_CAN_USE_SENDFILE 0x10u /* Allow to send clear text via sendfile */
 #define NS_DRIVER_SNI              0x20u /* SNI - just used when NS_DRIVER_SSL is set as well */
+#define NS_DRIVER_QUIC             0x40u /* Use OSSL_QUIC_server_method */
 
 #define NS_DRIVER_VERSION_1        1    /* Obsolete. */
 #define NS_DRIVER_VERSION_2        2    /* IPv4 only */
 #define NS_DRIVER_VERSION_3        3    /* IPv4 and IPv6 */
 #define NS_DRIVER_VERSION_4        4    /* Client support, current version */
 #define NS_DRIVER_VERSION_5        5    /* Library info, current connection info */
+#define NS_DRIVER_VERSION_6        6    /* driverThreadProc, headersEncodeProc */
 
 /*
  * The following are valid Tcl interp traces types.
@@ -258,6 +260,7 @@ typedef struct Ns_Task          Ns_Task;
 typedef struct Ns_EventQueue    Ns_EventQueue;
 typedef struct Ns_Event         Ns_Event;
 typedef struct Ns_Server        Ns_Server;
+typedef struct Ns_Set           Ns_Set;
 
 #define NS_CACHE_MAX_TRANSACTION_DEPTH 16
 
@@ -359,6 +362,13 @@ typedef int           (Ns_IndexKeyCmpProc) (const void *key, const void *elemPtr
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
 typedef bool (Ns_UrlSpaceContextFilterEvalProc) (void *contextSpec, void *context);
 
+typedef bool (Ns_HeadersEncodeProc)(
+    struct Ns_Conn     *conn,
+    const Ns_Set       *merged,     /* merged, sanitized headers to encode */
+    void               *out_obj,    /* backend-defined sink */
+    size_t             *out_len     /* optional: item count or bytes written */
+) NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2) NS_GNUC_NONNULL(3);
+
 /*
  * Generic function pointer type, can be used for recasting between different
  * function types.
@@ -412,7 +422,7 @@ typedef struct Ns_SetField {
 
 #define NS_SET_OPTION_NOCASE 0x01
 
-typedef struct Ns_Set {
+struct Ns_Set {
     const char  *name;
     size_t       size;
     size_t       maxSize;
@@ -421,7 +431,7 @@ typedef struct Ns_Set {
 #endif
     Ns_SetField *fields;
     unsigned int flags;
-} Ns_Set;
+};
 
 /*
  * The request structure.
@@ -456,14 +466,14 @@ typedef struct Ns_Request {
  * Typedef for URL components
  */
 typedef struct Ns_URL {
-    char *protocol;
-    char *userinfo;
-    char *host;
-    char *port;
-    char *path;
-    char *tail;
-    char *query;
-    char *fragment;
+    const char *protocol;
+    const char *userinfo;
+    const char *host;
+    const char *port;
+    const char *path;
+    const char *tail;
+    const char *query;
+    const char *fragment;
 } Ns_URL;
 
 /*
@@ -711,6 +721,8 @@ typedef struct Ns_DriverInitData {
     unsigned short           defaultPort;      /* Default port */
     Ns_DriverConnInfoProc   *connInfoProc;     /* NS_DRIVER_VERSION_5: Obtain information about a connection */
     const char              *libraryVersion;   /* NS_DRIVER_VERSION_5: Version of the used library */
+    Ns_ThreadProc           *driverThreadProc; /* NS_DRIVER_VERSION_6: event loop */
+    Ns_HeadersEncodeProc    *headersEncodeProc;/* NS_DRIVER_VERSION_6: encode headers from Ns_Set */
 } Ns_DriverInitData;
 
 
@@ -749,6 +761,10 @@ typedef struct Ns_CtxSHA1 {
 typedef void (Ns_ArgProc)
     (Tcl_DString *dsPtr, const void *arg);
 
+typedef void (Ns_WalkProc)
+    (Tcl_DString *dsPtr, void *arg)
+    NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
+
 typedef Ns_ReturnCode (Ns_OpProc)
     (const void *arg, Ns_Conn *conn)
     NS_GNUC_NONNULL(2);
@@ -760,7 +776,7 @@ typedef Ns_ReturnCode (Ns_FilterProc)
     (const void *arg, Ns_Conn *conn, Ns_FilterType why);
 
 typedef Ns_ReturnCode (Ns_LogFilter)
-    (const void *arg, Ns_LogSeverity severity, const Ns_Time *stamp, const char *msg, size_t len)
+    (void *arg, Ns_LogSeverity severity, const Ns_Time *stamp, const char *msg, size_t len)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(3) NS_GNUC_NONNULL(4);
 
 typedef Ns_ReturnCode (Ns_UrlToFileProc)
@@ -828,7 +844,7 @@ Ns_AuthorizeRequest(Ns_Conn *conn, const char **authorityPtr)
 //    NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
 
 NS_EXTERN Ns_ReturnCode
-Ns_AuthorizeUser(Ns_Server *server, const char *user, const char *passwd,
+Ns_AuthorizeUser(const Ns_Server *server, const char *user, const char *passwd,
                  const char ** authorityPtr)
 NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2)  NS_GNUC_NONNULL(4);
 
@@ -1089,11 +1105,11 @@ Ns_InflateInit(Ns_CompressStream *cStream)
     NS_GNUC_NONNULL(1);
 
 NS_EXTERN Ns_ReturnCode
-Ns_InflateBufferInit(Ns_CompressStream *cStream, const char *buffer, size_t inSize)
+Ns_InflateBufferInit(Ns_CompressStream *cStream, const void *inBuf, size_t inSize)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
 
 NS_EXTERN int
-Ns_InflateBuffer(Ns_CompressStream *cStream, const char *buffer, size_t outSize, size_t *nrBytes)
+Ns_InflateBuffer(Ns_CompressStream *cStream, void *outBuf, size_t outSize, size_t *nrBytes)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2) NS_GNUC_NONNULL(4);
 
 NS_EXTERN Ns_ReturnCode
@@ -1385,6 +1401,11 @@ NS_EXTERN bool
 Ns_CompleteHeaders(Ns_Conn *conn, size_t dataLength, unsigned int flags, Tcl_DString *dsPtr)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(4);
 
+NS_EXTERN bool
+Ns_FinalizeResponseHeaders(Ns_Conn *conn, size_t bodyLength, unsigned int flags,
+                           void *out_obj, size_t *out_len)
+    NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(4);
+
 /*
  * cookies.c:
  */
@@ -1568,20 +1589,20 @@ Ns_ExitEventQueue(Ns_EventQueue *queue)
 
 NS_EXTERN pid_t
 Ns_ExecProcess(const char *exec, const char *dir, int fdin, int fdout,
-               char *args, const Ns_Set *env)
+               const char *args, const Ns_Set *env)
     NS_GNUC_NONNULL(1);
 
 NS_EXTERN pid_t
-Ns_ExecProc(const char *exec, char **argv)
+Ns_ExecProc(const char *exec, const char *const *argv)
     NS_GNUC_NONNULL(1);
 
 NS_EXTERN pid_t
 Ns_ExecArgblk(const char *exec, const char *dir, int fdin, int fdout,
-              char *args, const Ns_Set *env)
+              const char *args, const Ns_Set *env)
     NS_GNUC_NONNULL(1);
 
 NS_EXTERN pid_t
-Ns_ExecArgv(const char *exec, const char *dir, int fdin, int fdout, char **argv, const Ns_Set *env)
+Ns_ExecArgv(const char *exec, const char *dir, int fdin, int fdout, const char *const *argv, const Ns_Set *env)
     NS_GNUC_NONNULL(1);
 
 #ifdef NS_WITH_DEPRECATED
@@ -1847,7 +1868,7 @@ Ns_TaskRun(Ns_Task *task)
     NS_GNUC_NONNULL(1);
 
 NS_EXTERN void
-Ns_TaskCallback(Ns_Task *task, Ns_SockState when, const Ns_Time *timeoutPtr)
+Ns_TaskCallback(Ns_Task *task, Ns_SockState when, Ns_Time *timeoutPtr)
     NS_GNUC_NONNULL(1);
 
 NS_EXTERN void
@@ -1921,7 +1942,7 @@ Ns_TclSetAddrObj(Tcl_Obj *objPtr, const char *type, void *addr)
      NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2) NS_GNUC_NONNULL(3);
 
 NS_EXTERN int
-Ns_TclGetOpaqueFromObj(const Tcl_Obj *objPtr, const char *type, void **addrPtrPtr)
+Ns_TclGetOpaqueFromObj(Tcl_Obj *objPtr, const char *type, void **addrPtrPtr)
      NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2) NS_GNUC_NONNULL(3);
 
 NS_EXTERN void
@@ -2143,7 +2164,7 @@ Ns_RollFileFmt(Tcl_Obj *fileObj, const char *rollfmt, TCL_SIZE_T maxbackup)
     NS_GNUC_NONNULL(1);
 
 NS_EXTERN Ns_ReturnCode
-Ns_RollFileCondFmt(Ns_LogCallbackProc openProc, Ns_LogCallbackProc closeProc, void *arg,
+Ns_RollFileCondFmt(Ns_LogCallbackProc openProc, Ns_LogCallbackProc closeProc, const void *arg,
                    const char *filename, const char *rollfmt, TCL_SIZE_T maxbackup)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2) NS_GNUC_NONNULL(4) NS_GNUC_NONNULL(5);
 
@@ -3038,7 +3059,7 @@ Ns_SockSendFileBufs(Ns_Sock *sock, const Ns_FileVec *bufs, int nbufs, unsigned i
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
 
 NS_EXTERN bool
-Ns_SockCork(const Ns_Sock *sock, bool cork)
+Ns_SockCork(Ns_Sock *sock, bool cork)
     NS_GNUC_NONNULL(1);
 
 /*
@@ -3256,17 +3277,21 @@ Ns_SockGetConfiguredSockAddr(Ns_Sock *sock)
  * sockaddr.c:
  */
 
-NS_EXTERN void
-Ns_SockaddrMaskBits(const struct sockaddr *mask, unsigned int nrBits)
+NS_EXTERN bool
+Ns_SockaddrMaskBits(struct sockaddr *mask, unsigned int nrBits)
     NS_GNUC_NONNULL(1);
 
-NS_EXTERN void
+NS_EXTERN bool
 Ns_SockaddrMask(const struct sockaddr *addr, const struct sockaddr *mask, struct sockaddr *maskedAddr)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2) NS_GNUC_NONNULL(3);
 
 NS_EXTERN bool
 Ns_SockaddrSameIP(const struct sockaddr *addr1, const struct sockaddr *addr2)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2) NS_GNUC_PURE;
+
+NS_EXTERN bool
+Ns_SockaddrSetLoopback(struct sockaddr *saPtr)
+    NS_GNUC_NONNULL(1);
 
 NS_EXTERN int
 ns_inet_pton(struct sockaddr *saPtr, const char *addr)
@@ -3561,7 +3586,8 @@ Ns_TclRegisterDeferred(Tcl_Interp *interp, Ns_TclDeferProc *proc, void *arg)
  * tclhttp.c
  */
 NS_EXTERN bool
-Ns_HttpParseHost2(char *hostString, bool strict, char **hostStart, char **portStart, char **end)
+Ns_HttpParseHost2(char *hostString, bool strict,
+                  const char **hostStart, const char **portStart, char **end)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(4) NS_GNUC_NONNULL(5);
 
 #ifdef NS_WITH_DEPRECATED
@@ -3641,7 +3667,7 @@ Ns_CtxSHAFinal(Ns_CtxSHA1 *ctx, unsigned char digest[20])
 
 NS_EXTERN char *
 Ns_HexString(const unsigned char *octets, char *outputBuffer, TCL_SIZE_T size, bool isUpper)
-    NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
+    NS_GNUC_NONNULL(1,2);
 
 /*
  * tclrequest.c:
@@ -3819,7 +3845,7 @@ NS_EXTERN int
 Ns_UrlSpecificAlloc(void);
 
 NS_EXTERN void
-Ns_UrlSpecificWalk(int id, const char *server, Ns_ArgProc func, Tcl_DString *dsPtr)
+Ns_UrlSpecificWalk(int id, const char *server, Ns_WalkProc func, Tcl_DString *dsPtr)
     NS_GNUC_NONNULL(2) NS_GNUC_NONNULL(3) NS_GNUC_NONNULL(4);
 
 NS_EXTERN void
@@ -3834,7 +3860,7 @@ Ns_UrlSpecificSet2(const char *server, const char *key, const char *url, int id,
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2) NS_GNUC_NONNULL(3) NS_GNUC_NONNULL(5);
 
 NS_EXTERN void *
-Ns_UrlSpecificGet(const Ns_Server *server, const char *key,
+Ns_UrlSpecificGet(Ns_Server *server, const char *key,
                   const char *url, int id, unsigned int flags, Ns_UrlSpaceOp op,
                   Ns_UrlSpaceMatchInfo *matchInfoPtr,
                   Ns_UrlSpaceContextFilterEvalProc proc, void *context)
@@ -3966,8 +3992,8 @@ Ns_TLS_CtxServerCreateCfg(Tcl_Interp *interp,
                           const char *cert, const char *caFile, const char *caPath,
                           bool verify, const char *ciphers, const char *ciphersuites,
                           const char *protocols, const char *alpn, void *app_data,
-                          NS_TLS_SSL_CTX **ctxPtr)
-    NS_GNUC_NONNULL(9) NS_GNUC_NONNULL(11);
+                          unsigned int flags, NS_TLS_SSL_CTX **ctxPtr)
+    NS_GNUC_NONNULL(9) NS_GNUC_NONNULL(12);
 
 NS_EXTERN int
 Ns_TLS_CtxServerCreate(Tcl_Interp *interp,

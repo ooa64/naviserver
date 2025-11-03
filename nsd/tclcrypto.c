@@ -113,6 +113,10 @@ static void ListMDfunc(const EVP_MD *m, const char *from, const char *to, void *
 static BIO *PEMOpenReadSteam(const char *fnOrData)
     NS_GNUC_NONNULL(1);
 
+static char *uuid_format(unsigned char *b, char *dst) NS_GNUC_NONNULL(1,2) NS_GNUC_PURE;
+static const char *uuid_v4(char *dst) NS_GNUC_NONNULL(1);
+static const char *uuid_v7(char *dst) NS_GNUC_NONNULL(1);
+
 static TCL_OBJCMDPROC_T CryptoHmacAddObjCmd;
 static TCL_OBJCMDPROC_T CryptoHmacFreeObjCmd;
 static TCL_OBJCMDPROC_T CryptoHmacGetObjCmd;
@@ -328,7 +332,7 @@ static bool AEAD_Set_tag(EVP_CIPHER_CTX *ctx,
 
     params[0] = OSSL_PARAM_construct_octet_string(
                     OSSL_CIPHER_PARAM_AEAD_TAG,
-                    (void *)tag, taglen);
+                    ns_const2voidp(tag), taglen);
     params[1] = OSSL_PARAM_construct_end();
     return EVP_CIPHER_CTX_set_params(ctx, params) > 0;
 }
@@ -582,7 +586,7 @@ PEMOpenReadSteam(const char *fnOrData)
  */
 
 static EVP_PKEY *
-GetPkeyFromPem(Tcl_Interp *interp, char *pemFileName, const char *passPhrase, bool private)
+GetPkeyFromPem(Tcl_Interp *interp, const char *pemFileName, const char *passPhrase, bool private)
 {
     BIO        *bio;
     EVP_PKEY   *result;
@@ -593,13 +597,14 @@ GetPkeyFromPem(Tcl_Interp *interp, char *pemFileName, const char *passPhrase, bo
         result = NULL;
     } else {
         if (private) {
-            result = PEM_read_bio_PrivateKey(bio, NULL, NULL, (char*)passPhrase);
+            result = PEM_read_bio_PrivateKey(bio, NULL, NULL, ns_const2voidp(passPhrase));
         } else {
-            result = PEM_read_bio_PUBKEY(bio, NULL, NULL, (char*)passPhrase);
+            result = PEM_read_bio_PUBKEY(bio, NULL, NULL, ns_const2voidp(passPhrase));
         }
         BIO_free(bio);
         if (result == NULL) {
-            Ns_TclPrintfResult(interp, "pem file contains no %s key", (private ? "private" : "public"));
+            Ns_TclPrintfResult(interp, "pem file contains no %s key",
+                               (private ? "private" : "public"));
         }
     }
     return result;
@@ -607,7 +612,7 @@ GetPkeyFromPem(Tcl_Interp *interp, char *pemFileName, const char *passPhrase, bo
 
 # ifndef OPENSSL_NO_EC
 static EC_KEY *
-GetEckeyFromPem(Tcl_Interp *interp, char *pemFileName, const char *passPhrase, bool private)
+GetEckeyFromPem(Tcl_Interp *interp, const char *pemFileName, const char *passPhrase, bool private)
 {
     BIO        *bio;
     EC_KEY     *result;
@@ -618,9 +623,9 @@ GetEckeyFromPem(Tcl_Interp *interp, char *pemFileName, const char *passPhrase, b
         result = NULL;
     } else {
         if (private) {
-            result = PEM_read_bio_ECPrivateKey(bio, NULL, NULL, (char*)passPhrase);
+            result = PEM_read_bio_ECPrivateKey(bio, NULL, NULL, ns_const2voidp(passPhrase));
         } else {
-            result = PEM_read_bio_EC_PUBKEY(bio, NULL, NULL, (char*)passPhrase);
+            result = PEM_read_bio_EC_PUBKEY(bio, NULL, NULL, ns_const2voidp(passPhrase));
         }
         BIO_free(bio);
         if (result == NULL) {
@@ -658,7 +663,7 @@ static int
 CryptoHmacNewObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *const* objv)
 {
     int         result, isBinary = 0;
-    char       *digestName = (char *)"sha256";
+    const char *digestName = "sha256";
     Tcl_Obj    *keyObj;
     Ns_ObjvSpec opts[] = {
         {"-binary", Ns_ObjvBool, &isBinary, INT2PTR(NS_TRUE)},
@@ -884,7 +889,7 @@ CryptoHmacStringObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SI
 {
     int                result, isBinary = 0, encodingInt = -1;
     Tcl_Obj           *keyObj, *messageObj;
-    char              *digestName = (char *)"sha256";
+    const char        *digestName = "sha256";
 
     Ns_ObjvSpec    lopts[] = {
         {"-binary",   Ns_ObjvBool,     &isBinary,    INT2PTR(NS_TRUE)},
@@ -1013,7 +1018,7 @@ static int
 CryptoMdNewObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *const* objv)
 {
     int           result;
-    char         *digestName = (char *)"sha256";
+    const char   *digestName = "sha256";
     Ns_ObjvSpec   args[] = {
         {"digest",  Ns_ObjvString, &digestName, NULL},
         {NULL, NULL, NULL, NULL}
@@ -1226,8 +1231,8 @@ CryptoMdStringObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE
 {
     int                result, isBinary = 0, encodingInt = -1;
     Tcl_Obj           *messageObj, *signatureObj = NULL, *resultObj = NULL;
-    char              *digestName = (char *)"sha256",
-                      *passPhrase = (char *)NS_EMPTY_STRING,
+    const char        *digestName = "sha256",
+                      *passPhrase = NS_EMPTY_STRING,
                       *signKeyFile = NULL,
                       *verifyKeyFile = NULL;
 
@@ -1264,7 +1269,7 @@ CryptoMdStringObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE
         Ns_BinaryEncoding encoding = (encodingInt == -1 ? RESULT_ENCODING_HEX : (Ns_BinaryEncoding)encodingInt);
         const EVP_MD *md;
         EVP_PKEY     *pkey = NULL;
-        char         *keyFile = NULL;
+        const char   *keyFile = NULL;
 
         /*
          * Compute Message Digest or sign or validate signature via OpenSSL.
@@ -1469,8 +1474,8 @@ CryptoMdVapidSignObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_S
 {
     int                result, isBinary = 0, encodingInt = -1;
     Tcl_Obj           *messageObj;
-    char              *digestName = (char *)"sha256", *pemFile = NULL,
-                      *passPhrase = (char *)NS_EMPTY_STRING;
+    const char        *digestName = "sha256", *pemFile = NULL,
+                      *passPhrase = NS_EMPTY_STRING;
     Ns_ObjvSpec lopts[] = {
         {"-binary",     Ns_ObjvBool,        &isBinary,    INT2PTR(NS_TRUE)},
         {"-digest",     Ns_ObjvString,      &digestName,  NULL},
@@ -1621,7 +1626,7 @@ CryptoMdHkdfObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T
 {
     int                result, isBinary = 0, outLength = 0, encodingInt = -1;
     Tcl_Obj           *saltObj = NULL, *secretObj = NULL, *infoObj = NULL;
-    char              *digestName = (char *)"sha256";
+    const char        *digestName = "sha256";
     Ns_ObjvSpec lopts[] = {
         {"-binary",   Ns_ObjvBool,           &isBinary,  INT2PTR(NS_TRUE)},
         {"-digest",   Ns_ObjvString,         &digestName, NULL},
@@ -1923,9 +1928,11 @@ NsTclCryptoScryptObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_S
         EVP_KDF_free(kdf);
 
         *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_PASSWORD,
-                                                 (void*)secretString, (size_t)secretLength);
+                                                 ns_const2voidp(secretString),
+                                                 (size_t)secretLength);
         *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT,
-                                                 (void*)saltString, (size_t)saltLength);
+                                                 ns_const2voidp(saltString),
+                                                 (size_t)saltLength);
         *p++ = OSSL_PARAM_construct_uint64(OSSL_KDF_PARAM_SCRYPT_N, &nValueSSL);
         *p++ = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_SCRYPT_R, &rValueSSL);
         *p++ = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_SCRYPT_P, &pValueSSL);
@@ -2080,25 +2087,29 @@ NsTclCryptoArgon2ObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_S
         }
         //NsHexPrint("saltString", saltString, (size_t)saltLength, 32, NS_FALSE);
         *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT,
-                                                 (void*)saltString, (size_t)saltLength);
+                                                 ns_const2voidp(saltString),
+                                                 (size_t)saltLength);
 
         if (secretObj != NULL) {
             secretString = Ns_GetBinaryString(secretObj, isBinary == 1, &secretLength, &secretDs);
             //NsHexPrint("secretString", secretString, (size_t)secretLength, 32, NS_FALSE);
             *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SECRET,
-                                                     (void*)secretString, (size_t)secretLength);
+                                                     ns_const2voidp(secretString),
+                                                     (size_t)secretLength);
         }
         if (adObj != NULL) {
             adString = Ns_GetBinaryString(adObj,     isBinary == 1, &adLength,     &adDs);
             //NsHexPrint("adString", adString, (size_t)adLength, 32, NS_FALSE);
             *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_ARGON2_AD,
-                                                     (void*)adString, (size_t)adLength);
+                                                     ns_const2voidp(adString),
+                                                     (size_t)adLength);
         }
         if (passObj != NULL) {
             passString = Ns_GetBinaryString(passObj, isBinary == 1, &passLength,   &passDs);
             //NsHexPrint("passString", passString, (size_t)passLength, 32, NS_FALSE);
             *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_PASSWORD,
-                                                     (void*)passString, (size_t)passLength);
+                                                     ns_const2voidp(passString),
+                                                     (size_t)passLength);
         }
 
         /*fprintf(stderr, "variant %s pass (%d) secret (%d) salt (%d) threads %d iter %d lanes %d memcost %d\n",
@@ -2198,7 +2209,7 @@ NsTclCryptoPbkdf2hmacObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, T
 {
     int                result, isBinary = 0, encodingInt = -1, iter = 4096, dkLength = -1;
     Tcl_Obj           *saltObj = NULL, *secretObj = NULL;
-    char              *digestName = (char *)"sha256";
+    const char        *digestName = "sha256";
     Ns_ObjvSpec opts[] = {
         {"-binary",     Ns_ObjvBool,    &isBinary,   INT2PTR(NS_TRUE)},
         {"-digest",     Ns_ObjvString,  &digestName, NULL},
@@ -2343,8 +2354,8 @@ static int
 CryptoEckeyPrivObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *const* objv)
 {
     int                result, encodingInt = -1;
-    char              *pemFile = NULL,
-                      *passPhrase = (char *)NS_EMPTY_STRING;
+    const char        *pemFile = NULL,
+                      *passPhrase = NS_EMPTY_STRING;
 
     Ns_ObjvSpec lopts[] = {
         {"-encoding",   Ns_ObjvIndex,   &encodingInt,binaryencodings},
@@ -2448,8 +2459,8 @@ static int
 CryptoEckeyPubObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *const* objv)
 {
     int                result, encodingInt = -1;
-    char              *pemFile = NULL,
-                      *passPhrase = (char *)NS_EMPTY_STRING;
+    const char        *pemFile = NULL,
+                      *passPhrase = NS_EMPTY_STRING;
     Ns_ObjvSpec lopts[] = {
         {"-encoding",   Ns_ObjvIndex,   &encodingInt,binaryencodings},
         {"-passphrase", Ns_ObjvString,  &passPhrase, NULL},
@@ -2622,7 +2633,7 @@ static int
 CryptoEckeyGenerateObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *const* objv)
 {
     int                result, nid;
-    char              *curvenameString = (char *)"prime256v1", *pemFileName = NULL;
+    const char        *curvenameString = "prime256v1", *pemFileName = NULL;
     Ns_ObjvSpec lopts[] = {
         {"-name",     Ns_ObjvString, &curvenameString, NULL},
         {"-pem",      Ns_ObjvString, &pemFileName, NULL},
@@ -2699,8 +2710,8 @@ static int
 CryptoEckeySharedsecretObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *const* objv)
 {
     int                result, isBinary = 0, encodingInt = -1;
-    char              *pemFileName = NULL,
-                      *passPhrase = (char *)NS_EMPTY_STRING;
+    const char        *pemFileName = NULL,
+                      *passPhrase = NS_EMPTY_STRING;
     Tcl_Obj           *pubkeyObj = NULL;
     EC_KEY            *eckey = NULL;
 
@@ -2975,13 +2986,13 @@ CryptoAeadStringGetArguments(
     const unsigned char **keyStringPtr,   TCL_SIZE_T *keyLengthPtr,
     const unsigned char **ivStringPtr,    TCL_SIZE_T *ivLengthPtr,
     const unsigned char **aadStringPtr,   TCL_SIZE_T *aadLengthPtr,
-    char                **tagStringPtr,   TCL_SIZE_T *tagLengthPtr,
+    const char          **tagStringPtr,   TCL_SIZE_T *tagLengthPtr,
     const unsigned char **inputStringPtr, TCL_SIZE_T *inputLengthPtr,
     const EVP_CIPHER    **cipherPtr, Ns_BinaryEncoding *encodingPtr, EVP_CIPHER_CTX **ctxPtr
 ) {
     Tcl_Obj      *ivObj = NULL, *keyObj = NULL, *aadObj = NULL, *tagObj = NULL, *inputObj;
     int           result, isBinary = 0, encodingInt = -1;
-    char         *cipherName = (char *)"aes-128-gcm";
+    const char   *cipherName = "aes-128-gcm";
 
     Ns_ObjvSpec lopts_encrypt[] = {
         {"-binary",   Ns_ObjvBool,           &isBinary,   INT2PTR(NS_TRUE)},
@@ -3048,7 +3059,7 @@ CryptoAeadStringGetArguments(
             const char *objType = tagObj->typePtr != NULL ? tagObj->typePtr->name : "NONE";
             TCL_SIZE_T  objLength = tagObj->length;
 
-            *tagStringPtr = (char *)Ns_GetBinaryString(tagObj, 1 /*isBinary == 1*/, tagLengthPtr, tagDsPtr);
+            *tagStringPtr = (const char *)Ns_GetBinaryString(tagObj, 1 /*isBinary == 1*/, tagLengthPtr, tagDsPtr);
             if (*tagLengthPtr != 16) {
                 Ns_Log(Error, "aead: invalid tag length %ld (isBinary %d, objType %s, objLength %ld)\n",
                        (long)*tagLengthPtr, isBinary, objType, (long)objLength);
@@ -3105,7 +3116,7 @@ CryptoAeadStringObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SI
     Ns_BinaryEncoding    encoding = RESULT_ENCODING_HEX;
     EVP_CIPHER_CTX      *ctx;
     const unsigned char *inputString = NULL, *ivString = NULL, *aadString = NULL, *keyString = NULL;
-    char                *tagString = NULL;
+    const char          *tagString = NULL;
     TCL_SIZE_T           inputLength, keyLength, ivLength, aadLength, tagLength;
 
     /*
@@ -3255,7 +3266,7 @@ CryptoAeadStringObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SI
                 Ns_TclPrintfResult(interp, "could not set additional authenticated data (AAD)");
                 result = TCL_ERROR;
 
-            } else if (!AEAD_Set_tag(ctx, (unsigned char*)tagString, (size_t)tagLength)) {
+            } else if (!AEAD_Set_tag(ctx, (const unsigned char *)tagString, (size_t)tagLength)) {
                 Ns_TclPrintfResult(interp,
                                    "could not set authentication tag");
                 result = TCL_ERROR;
@@ -3413,6 +3424,252 @@ NsTclCryptoRandomBytesObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, 
     return result;
 }
 
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * uuid_format --
+ *
+ *      Convert 16 raw bytes into the canonical RFC 4122 UUID string
+ *      form (8-4-4-4-12 hex digits, lowercase, with hyphens). The
+ *      caller must provide a destination buffer of at least 37 bytes
+ *      to hold the 36-character UUID plus the trailing NUL.
+ *
+ * Results:
+ *      None. The formatted UUID string is written into 'dst'.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static inline char *
+uuid_format(unsigned char *b, char *dst)
+{
+    /*
+     * Format into canonical string 8-4-4-4-12
+     */
+    Ns_HexString(&b[0],  &dst[0],  4, NS_FALSE);  /* bytes 0..3   -> dst[0..7]   */
+    dst[8]  = '-';
+
+    Ns_HexString(&b[4],  &dst[9],  2, NS_FALSE);  /* bytes 4..5   -> dst[9..12]  */
+    dst[13] = '-';
+
+    Ns_HexString(&b[6],  &dst[14], 2, NS_FALSE);  /* bytes 6..7   -> dst[14..17] */
+    dst[18] = '-';
+
+    Ns_HexString(&b[8],  &dst[19], 2, NS_FALSE);  /* bytes 8..9   -> dst[19..22] */
+    dst[23] = '-';
+
+    Ns_HexString(&b[10], &dst[24], 6, NS_FALSE);  /* bytes 10..15 -> dst[24..35] */
+    dst[36] = '\0';
+
+    return dst;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * uuid_v4 --
+ *
+ *      Generate a Version 4 (random) RFC 4122 UUID string.  The
+ *      function fills a 16-byte buffer with cryptographically strong
+ *      random bytes via RAND_bytes() and Sets the UUID version and
+ *      variant bits:
+ *         * byte[6] high nibble -> 0b0100 (version 4)
+ *         * byte[8] high bits   -> 0b10   (RFC 4122 variant)
+ *
+ *      Finally, it formats the result into canonical text using
+ *      uuid_format().
+ *
+ * Results:
+ *      Returns TCL_OK on success (UUID written into 'dst'),
+ *      or TCL_ERROR if RAND_bytes() failed and no valid UUID was produced.
+ *
+ * Side effects:
+ *      None.
+ *
+ *----------------------------------------------------------------------
+ */
+static inline const char *
+uuid_v4(char *dst)
+{
+    unsigned char b[16];
+
+    if (RAND_bytes(b, sizeof(b)) != 1) {
+        return NULL;
+    }
+
+    /*
+     * RFC 4122 version 4:
+     * - Set the 4 most significant bits of byte 6 (index 6) to 0100 (0x4).
+     * - Set the 2 most significant bits of byte 8 (index 8) to 10.
+     *
+     * Bytes are 0..15.
+     */
+    b[6] = (unsigned char)((b[6] & 0x0F) | 0x40); /* version 4 */
+    b[8] = (unsigned char)((b[8] & 0x3F) | 0x80); /* variant RFC4122 */
+
+    return uuid_format(b, dst);
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * uuid_v7 --
+ *
+ *      Summary: Generate a Version 7 (time-ordered) UUID per RFC 9562 and
+ *      write its canonical textual form ("8-4-4-4-12") into 'dst'.
+ *
+ * Parameters:
+ *      dst - Pointer to a character buffer that will receive the textual
+ *            UUID; must not be NULL and must hold at least 37 bytes
+ *            (36 printable characters plus terminating NUL).
+ *
+ * Returns:
+ *      TCL_OK on success (a valid UUIDv7 string is written to 'dst' and NUL-terminated).
+ *      TCL_ERROR on failure when RAND_bytes() reports an error; in this case the function
+ *        does not guarantee a valid UUID in 'dst'.
+ *
+ * Side effects:
+ *      None. The function calls Ns_GetTime(), Ns_TimeToMilliseconds(),
+ *      RAND_bytes(), memcpy(), and uuid_format(); writes into 'dst'.
+ *
+ *----------------------------------------------------------------------
+ */
+static inline const char *
+uuid_v7(char *dst)
+{
+    unsigned char   out[16];
+    unsigned char   rnd[10];
+    time_t          ms;
+    unsigned long   b0, b1, b2;
+    Ns_Time         now;
+
+    /*
+     * We need 10 random bytes:
+     *  - parts of them go into the rand_a / rand_b fields.
+     */
+    if (RAND_bytes(rnd, sizeof(rnd)) != 1) {
+        return NULL;
+    }
+
+    /*
+     * We'll compose the 16 output bytes:
+     *
+     * Bytes 0..5  : timestamp ms (big-endian 48-bit)
+     * Byte  6     : high nibble = version(0x7), low nibble = top 4 bits of random
+     * Byte  7     : next 8 random bits
+     * Byte  8     : variant '10' in the top bits, then next 6 random bits
+     * Byte  9..15 : remaining random bytes
+     */
+
+    Ns_GetTime(&now);
+    ms = Ns_TimeToMilliseconds(&now);
+
+    /* timestamp big-endian into out[0..5] */
+    out[0] = (unsigned char)((ms >> 40) & 0xFF);
+    out[1] = (unsigned char)((ms >> 32) & 0xFF);
+    out[2] = (unsigned char)((ms >> 24) & 0xFF);
+    out[3] = (unsigned char)((ms >> 16) & 0xFF);
+    out[4] = (unsigned char)((ms >>  8) & 0xFF);
+    out[5] = (unsigned char)( ms        & 0xFF);
+
+    /*
+     * Pull first 3 random bytes for the structured fields.
+     */
+    b0 = rnd[0];
+    b1 = rnd[1];
+    b2 = rnd[2];
+
+    /*
+     * Byte 6:
+     *   high nibble = version (0111 -> 0x7)
+     *   low  nibble = low 4 bits of b0
+     */
+    out[6] = (unsigned char)(0x70 | (b0 & 0x0F));
+
+    /*
+     * Byte 7:
+     *   full 8 bits from b1
+     */
+    out[7] = (unsigned char)b1;
+
+    /*
+     * Byte 8:
+     *   variant '10' in the two MSBs -> 0b10xxxxxx
+     *   keep lower 6 bits from b2
+     *
+     *   mask lower 6 bits: b2 & 0x3F
+     *   set top bits to 10: | 0x80
+     */
+    out[8] = (unsigned char)((b2 & 0x3F) | 0x80);
+
+    /*
+     * The rest (bytes 9..15) are just rnd[3]..rnd[9]
+     */
+    memcpy(&out[9], &rnd[3], 7);
+    return uuid_format(out, dst);
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * NsTclCryptoUUIDCmd --
+ *
+ *        Implements "ns_crypto::uuid". Returns UUID in version v4
+ *
+ *        Example: ns_crypto::randombytes 20
+ *
+ * Results:
+ *      Tcl Result Code.
+ *
+ * Side effects:
+ *      None
+ *
+ *----------------------------------------------------------------------
+ */
+int
+NsTclCryptoUUIDObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *const* objv)
+{
+    int                 result, versionInt = 4;
+    static Ns_ObjvTable uuidVersions[] = {
+        {"v4",        4u},
+        {"v7",        7u},
+        {NULL,        0u}
+    };
+    Ns_ObjvSpec lopts[] = {
+        {"-version",   Ns_ObjvIndex,   &versionInt, uuidVersions},
+        {NULL, NULL, NULL, NULL}
+    };
+
+    if (Ns_ParseObjv(lopts, NULL, interp, 1, objc, objv) != NS_OK) {
+        result = TCL_ERROR;
+
+    } else {
+        Tcl_DString ds;
+        const char* hexString;
+
+        Tcl_DStringInit(&ds);
+        Tcl_DStringSetLength(&ds, (TCL_SIZE_T)36);
+
+        if (versionInt == 4) {
+            hexString = uuid_v4(ds.string);
+        } else {
+            hexString = uuid_v7(ds.string);
+        }
+        if (hexString != NULL) {
+            Tcl_DStringResult(interp, &ds);
+            result = TCL_OK;
+        } else {
+            Ns_TclPrintfResult(interp, "UUID conversion failed");
+            result = TCL_ERROR;
+        }
+    }
+
+    return result;
+}
+
 # ifdef OPENSSL_NO_EC
 int
 NsTclCryptoEckeyObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T UNUSED(objc), Tcl_Obj *const* UNUSED(objv))
@@ -3456,6 +3713,13 @@ NsTclCryptoAeadEncryptObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, 
 
 int
 NsTclCryptoRandomBytesObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T UNUSED(objc), Tcl_Obj *const* UNUSED(objv))
+{
+    Ns_TclPrintfResult(interp, "Command requires support for OpenSSL built into NaviServer");
+    return TCL_ERROR;
+}
+
+int
+NsTclCryptoUUIDCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T UNUSED(objc), Tcl_Obj *const* UNUSED(objv))
 {
     Ns_TclPrintfResult(interp, "Command requires support for OpenSSL built into NaviServer");
     return TCL_ERROR;

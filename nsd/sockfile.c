@@ -68,7 +68,7 @@ Ns_SetFileVec(Ns_FileVec *bufs, int i,  int fd, const void *data,
     bufs[i].fd = fd;
     bufs[i].length = length;
     bufs[i].offset = offset;
-    bufs[i].buffer = (char *)data;
+    bufs[i].buffer = (const char *)data;
 
     return length;
 }
@@ -160,7 +160,7 @@ Ns_SockSendFileBufs(Ns_Sock *sock, const Ns_FileVec *bufs, int nbufs, unsigned i
             /*
              * Coalesce runs of memory buffers into fixed-sized iovec.
              */
-            (void) Ns_SetVec(sbufPtr, nsbufs++, (char*)bufs[i].buffer + offset, length);
+            (void) Ns_SetVec(sbufPtr, nsbufs++, bufs[i].buffer + offset, length);
         }
 
         if (   (fd == NS_INVALID_FD && (nsbufs == UIO_MAXIOV || i == nbufs-1))
@@ -227,7 +227,7 @@ Ns_SockSendFileBufs(Ns_Sock *sock, const Ns_FileVec *bufs, int nbufs, unsigned i
  *----------------------------------------------------------------------
  */
 bool
-Ns_SockCork(const Ns_Sock *sock, bool cork)
+Ns_SockCork(Ns_Sock *sock, bool cork)
 {
     bool success = NS_FALSE;
 #if defined(TCP_CORK) || defined(UDP_CORK)
@@ -316,6 +316,13 @@ Ns_SockCork(const Ns_Sock *sock, bool cork)
  *----------------------------------------------------------------------
  */
 
+/* Decide once at compile-time */
+#if defined(HAVE_LINUX_SENDFILE) || defined(HAVE_BSD_SENDFILE)
+# define NS_HAVE_NATIVE_SENDFILE 1
+#else
+# define NS_HAVE_NATIVE_SENDFILE 0
+#endif
+
 static ssize_t
 SendFile(Ns_Sock *sock, int fd, off_t offset, size_t length, unsigned int flags)
 {
@@ -333,36 +340,48 @@ SendFile(Ns_Sock *sock, int fd, off_t offset, size_t length, unsigned int flags)
      * channel. The sendfile emulation ns_sendfile() uses always the right
      * driver I/O.
      */
-    if ( (flags & NS_DRIVER_CAN_USE_SENDFILE) == 0u) {
+
+#if NS_HAVE_NATIVE_SENDFILE
+
+    if ((flags & NS_DRIVER_CAN_USE_SENDFILE) == 0u) {
         sent = ns_sendfile(sock, fd, offset, length);
+
     } else {
-#if defined(HAVE_LINUX_SENDFILE)
+# if defined(HAVE_LINUX_SENDFILE)
         sent = sendfile(sock->sock, fd, &offset, length);
         if (sent == -1) {
-            if (errno == EINTR || errno == NS_EAGAIN || errno == EWOULDBLOCK) {
+            if (errno == EINTR || NS_ERRNO_WOULDBLOCK(errno)) {
                 sent = 0;
             } else if (errno == EINVAL || errno == ENOSYS) {
                 sent = ns_sendfile(sock, fd, offset, length);
             }
         }
-#elif defined(HAVE_BSD_SENDFILE)
-        int rc, opt_flags = 0;
+# elif defined(HAVE_BSD_SENDFILE)
+        int   rc, opt_flags = 0;
         off_t sbytes = 0;
 
         rc = sendfile(fd, sock->sock, offset, length, NULL, &sbytes, opt_flags);
-        if (rc == 0 || errno == EINTR || errno == NS_EAGAIN || errno == EWOULDBLOCK) {
+        if (rc == 0 || errno == EINTR || NS_ERRNO_WOULDBLOCK(errno)) {
             sent = sbytes;
         } else if (errno == EOPNOTSUPP) {
             sent = ns_sendfile(sock, fd, offset, length);
         } else {
             sent = 0;
         }
-#else
-        sent = ns_sendfile(sock, fd, offset, length);
-#endif
+# endif
     }
 
-    return sent;
+#else  /* ! NS_HAVE_NATIVE_SENDFILE */
+    /*
+     * No native sendfile on this platform → always use fallback. The provided
+     * "flags" are ignored.
+     */
+    (void)flags;
+    sent = ns_sendfile(sock, fd, offset, length);
+
+#endif /* NS_HAVE_NATIVE_SENDFILE */
+
+  return sent;
 }
 
 

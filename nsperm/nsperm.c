@@ -113,7 +113,7 @@ static Ns_AuthorizeRequestProc AuthorizeRequestProc;
 static Ns_AuthorizeUserProc AuthorizeUserProc;
 
 static bool ValidateUserAddr(User *userPtr, const char *peer);
-static void WalkCallback(Tcl_DString *dsPtr, const void *arg);
+static void WalkCallback(Tcl_DString *dsPtr, void *arg);
 static Ns_ReturnCode CreateNonce(const char *privatekey, char **nonce, const char *uri);
 static Ns_ReturnCode CreateHeader(const PServer *psrvPtr, const Ns_Conn *conn, bool stale);
 /*static Ns_ReturnCode CheckNonce(const char *privatekey, char *nonce, char *uri, int timeout);*/
@@ -188,7 +188,7 @@ Ns_ModuleInit(const char *server, const char *UNUSED(module))
 
         psrvPtr = ns_malloc(sizeof(PServer));
         psrvPtr->server = server;
-        psrvPtr->servPtr = server != NULL ? Ns_GetServer(server) : NULL;
+        psrvPtr->servPtr = Ns_GetServer(server);
         Tcl_InitHashTable(&psrvPtr->users, TCL_STRING_KEYS);
         Tcl_InitHashTable(&psrvPtr->groups, TCL_STRING_KEYS);
         Ns_RWLockInit(&psrvPtr->lock);
@@ -222,7 +222,7 @@ Ns_ModuleInit(const char *server, const char *UNUSED(module))
 
 static int AddCmds(Tcl_Interp *interp, const void *arg)
 {
-    TCL_CREATEOBJCOMMAND(interp, "ns_perm", PermObjCmd, (ClientData)arg, NULL);
+    TCL_CREATEOBJCOMMAND(interp, "ns_perm", PermObjCmd, ns_const2voidp(arg), NULL);
     return TCL_OK;
 }
 
@@ -1727,9 +1727,9 @@ static int ListPermsObjCmd(ClientData data, Tcl_Interp *interp, TCL_SIZE_T objc,
     return result;
 }
 
-static void WalkCallback(Tcl_DString *dsPtr, const void *arg)
+static void WalkCallback(Tcl_DString *dsPtr, void *arg)
 {
-    Perm *permPtr = (Perm *)arg;
+    Perm *permPtr = arg;
     Tcl_HashSearch search;
     Tcl_HashEntry *hPtr;
 

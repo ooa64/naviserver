@@ -1544,7 +1544,7 @@ FreeSpecs(Ns_ObjvSpec *specPtr)
             specPtr++;
             continue;
         }
-        ns_free((char *)specPtr->key);
+        ns_free_const(specPtr->key);
         if (specPtr->arg != NULL) {
             Tcl_DecrRefCount((Tcl_Obj *) specPtr->arg);
         }
@@ -1846,23 +1846,32 @@ SetValue(Tcl_Interp *interp, const char *key, Tcl_Obj *valueObj)
 static void
 AppendRange(Tcl_DString *dsPtr, const Ns_ObjvValueRange *r)
 {
+    /* lower bound */
     if (r->minValue == LLONG_MIN) {
         Tcl_DStringAppend(dsPtr, "[MIN,", 5);
     } else {
         Ns_DStringPrintf(dsPtr, "[%" TCL_LL_MODIFIER "d,", r->minValue);
     }
 
-    if (r->maxValue == TCL_SIZE_MAX) {
-        Tcl_DStringAppend(dsPtr, "MAX]", 4);
+    /* upper bound */
+    {
+        const long long v     = r->maxValue;
+        const long long tsMax = (long long)TCL_SIZE_MAX;  /* Tcl 9: == LLONG_MAX */
+        bool isMax = false;
 
-    } else if (r->maxValue == LLONG_MAX) {
-        Tcl_DStringAppend(dsPtr, "MAX]", 4);
+        isMax = (v == tsMax);
+        if (!isMax && v == LLONG_MAX) {
+            isMax = true;
+        }
+        if (!isMax && v == (long long)INT_MAX) {
+            isMax = true;
+        }
 
-    } else if (r->maxValue == INT_MAX) {
-        Tcl_DStringAppend(dsPtr, "MAX]", 4);
-
-    } else {
-        Ns_DStringPrintf(dsPtr, "%" TCL_LL_MODIFIER "d]", r->maxValue);
+        if (isMax) {
+            Tcl_DStringAppend(dsPtr, "MAX]", 4);
+        } else {
+            Ns_DStringPrintf(dsPtr, "%" TCL_LL_MODIFIER "d]", (Tcl_WideInt)v);
+        }
     }
 }
 

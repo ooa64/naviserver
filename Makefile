@@ -16,27 +16,76 @@ HEADER_INC=header-5.0.inc
 NSBUILD=1
 include include/Makefile.global
 
-dirs    = nsthread nsd nssock nscgi nscp nslog nsperm nsdb nsdbtest nsssl revproxy
-
+# Subdirectories
+SUBDIRS_CORE := nsthread nsd
+SUBDIRS_MODS := nssock nscgi nscp nslog nsperm nsdb nsssl quic revproxy nsdbtest
 # Unix only modules
-ifneq (.exe,$(EXEEXT))
-   dirs += nsproxy
+ifeq (,$(findstring MINGW,$(uname)))
+   SUBDIRS_MODS += nsproxy
+endif
+SUBDIRS   := $(SUBDIRS_CORE) $(SUBDIRS_MODS)
+TESTDIRS  :=
+
+#
+# Use -j per default, obey user serial wish or -j setting
+#
+USER_SET_J   := $(filter -j%,$(MAKEFLAGS))
+ifeq ($(SERIAL),1)
+  # stay serial
+else ifeq ($(strip $(USER_SET_J)$(HAS_JOBSERVER)),)
+  # user did not pass -j -> turn it on by default
+  MAKEFLAGS += -j
+  ifneq ($(filter 3.%,$(MAKE_VERSION)),)
+    # GNU make 3.81 (macOS): pass a bare "-j" to sub-makes
+    SUBMAKE_J := -j
+  else
+    # GNU make >=4: numeric -j is enough; jobserver propagates automatically
+    MAKEFLAGS += -j
+  endif
 endif
 
-distfiles = $(dirs) doc tcl contrib include tests win win32 configure m4 \
+distfiles = $(SUBDIRS) doc tcl contrib include tests win win32 configure m4 \
 	Makefile autogen.sh install-sh missing aclocal.m4 configure.ac \
 	config.guess config.sub \
 	README.md NEWS sample-config.tcl.in simple-config.tcl openacs-config.tcl \
 	nsd-config.tcl index.adp license.terms naviserver.rdf naviserver.rdf.in \
 	version_include.man.in install-from-repository.tcl
 
-all:
-	@for i in $(dirs); do \
-		( cd $$i && $(MAKE) all ) || exit 1; \
-	done
-	@if [ -n "${PEM_FILE}" ]; then \
-		$(MAKE) $(PEM_FILE) ; \
-	fi
+# Top-level goals
+all:     $(SUBDIRS:%=all-%)
+clean:   $(SUBDIRS:%=clean-%)
+install: $(SUBDIRS:%=install-%)
+test:    $(TESTDIRS:%=test-%)
+
+# One recursive call per subdir/goal, delegate test to selected subdirs
+all-%:
+	@+$(MAKE) $(SUBMAKE_J) --no-print-directory -C $* all
+install-%:
+	@+$(MAKE) $(SUBMAKE_J) --no-print-directory -C $* install
+clean-%:
+	@+$(MAKE) $(SUBMAKE_J) --no-print-directory -C $* clean
+test-%:
+	+$(MAKE) $(SUBMAKE_J) -C $* test
+
+# Subdir dependencies
+all-nsd: | all-nsthread
+
+# modules depend on core
+$(SUBDIRS_MODS:%=all-%): | all-nsd
+
+# specific extras
+all-nsdbtest: | all-nsdb
+#quic: | all-nsssl
+
+# Make sure that install-notice is printed as last thing of a "make install"
+$(SUBDIRS:%=install-%): | $(SUBDIRS:%=all-%)
+install-notice: | $(SUBDIRS:%=install-%)
+
+ifneq ($(strip $(PEM_FILE)),)
+all: $(PEM_FILE)
+$(PEM_FILE):
+	$(MAKE) $@
+endif
 
 help:
 	@echo 'Commonly used make targets:'
@@ -58,7 +107,7 @@ help:
 	@echo '  make gdbtest TESTFLAGS="-verbose start -file cookies.test -match cookie-2.*"'
 	@echo
 
-install: install-dirs install-include install-tcl install-modules \
+install: all install-dirs install-include install-tcl install-modules \
 	install-config install-certificates install-doc install-examples install-notice
 
 HAVE_NSADMIN := $(shell id -u nsadmin 2> /dev/null)
@@ -121,7 +170,7 @@ install-certificates: $(PEM_FILE) ca-bundle.crt
 		$(INSTALL_DATA) $$i $(DESTDIR)$(NAVISERVER)/certificates/; \
 	done
 	@if [ -n "$(OPENSSL_LIBS)" ]; then \
-		($(OPENSSL) rehash $(DESTDIR)$(NAVISERVER)/certificates 2>/dev/null || true) ; \
+		$(OPENSSL) rehash $(DESTDIR)$(NAVISERVER)/certificates ; \
 	fi
 	$(INSTALL_DATA) ca-bundle.crt $(DESTDIR)$(NAVISERVER)/
 
@@ -189,6 +238,7 @@ build-doc:
 		       nsperm \
 		       nssock \
 		       nsssl \
+		       quic \
 		       revproxy \
 		       doc/src/manual \
 		       doc/src/naviserver \
@@ -234,27 +284,16 @@ build-doc:
 ifeq ($(shell id -u),0)
 NS_TEST_CFG	= -u nsadmin -c -d -t $(srcdir)/tests/test.nscfg
 else
-ifneq (.exe,$(EXEEXT))
 NS_TEST_CFG	= -c -d -t $(srcdir)/tests/test.nscfg
-else
-NS_TEST_CFG	= -c -t $(srcdir)/tests/test.nscfg
-endif
 endif
 
 
 NS_TEST_ALL	= $(srcdir)/tests/all.tcl $(TESTFLAGS)
-ifneq (.exe,$(EXEEXT))
 NS_LD_LIBRARY_PATH	= \
    LD_LIBRARY_PATH="$(srcdir)/nsd:$(srcdir)/nsthread:$(srcdir)/nsdb:$(srcdir)/nsproxy:$$LD_LIBRARY_PATH" \
    DYLD_LIBRARY_PATH="$(srcdir)/nsd:$(srcdir)/nsthread:$(srcdir)/nsdb:$(srcdir)/nsproxy:$$DYLD_LIBRARY_PATH"
-else
-NS_LD_LIBRARY_PATH	= \
-   PATH="$(srcdir)/nsd:$(srcdir)/nsthread:$(srcdir)/nsdb:$(srcdir)/nsproxy:$$PATH"
-endif
 
-EXTRA_TEST_DIRS =
 ifneq ($(OPENSSL_LIBS),)
-  #EXTRA_TEST_DIRS += nsssl
   TEST_CERTIFICATES = tests/testserver/certificates
   PEM_FILE          = $(TEST_CERTIFICATES)/server.pem
   PEM_PRIVATE       = $(TEST_CERTIFICATES)/myprivate.pem
@@ -287,9 +326,6 @@ test: all $(EXTRA_TEST_REQ)
 	    $(CHOWN) -R nsadmin $(srcdir)/tests ; \
 	fi;
 	$(NS_LD_LIBRARY_PATH) ./nsd/nsd $(NS_TEST_CFG) $(NS_TEST_ALL)
-	@for i in $(EXTRA_TEST_DIRS); do \
-		( cd $$i && $(MAKE) test ) || exit 1; \
-	done
 
 runtest: all
 	$(NS_LD_LIBRARY_PATH) ./nsd/nsd $(NS_TEST_CFG)
@@ -321,9 +357,10 @@ CPPCHECK_SYS_INCLUDES=-I/usr/include
 #CPPCHECK_SYS_INCLUDES=-I`xcrun --show-sdk-path`/usr/include
 
 cppcheck:
-	$(CPPCHECK) --verbose --inconclusive -j4 --enable=all --checkers-report=cppcheck.txt --check-level=exhaustive \
-		nscp/*.c nscgi/*.c nsd/*.c nsdb/*.c nsproxy/*.c nssock/*.c nsperm/*.c nsssl/*.c \
-		-I./include $(CPPCHECK_SYS_INCLUDES) -D__x86_64__ -DNDEBUG $(DEFS)
+	$(CPPCHECK) --verbose --inconclusive -j4 --enable=all --check-level=exhaustive \
+		--output-file=cppcheck-output.txt --checkers-report=cppcheck.txt  \
+		nscp/*.c nscgi/*.c nsd/*.c nsdb/*.c nsproxy/*.c nssock/*.c nsperm/*.c nsssl/*.c quic/*.c \
+		-I./include  -I./nsssl -I./quic $(CPPCHECK_SYS_INCLUDES) -D__x86_64__ -DNDEBUG $(DEFS)
 
 CLANG_TIDY_CHECKS=
 #CLANG_TIDY_CHECKS=-checks=-*,performance-*,portability-*,cert-*,modernize-*
@@ -335,13 +372,8 @@ clang-tidy:
 		-I./include -I/usr/include $(DEFS)
 
 checkexports: all
-	@for i in $(dirs); do \
+	@for i in $(SUBDIRS); do \
 		nm -p $$i/*${LIBEXT} | awk '$$2 ~ /[TDB]/ { print $$3 }' | sort -n | uniq | grep -v '^[Nn]s\|^TclX\|^_'; \
-	done
-
-clean:
-	@for i in $(dirs); do \
-		(cd $$i && $(MAKE) clean) || exit 1; \
 	done
 
 clean-bak: clean
@@ -354,11 +386,11 @@ distclean: clean
 		$(PEM_FILE) $(PEM_PRIVATE) $(PEM_PUBLIC)
 
 config.guess:
-	wget -O config.guess 'https://git.savannah.gnu.org/gitweb/?p=config.git;a=blob_plain;f=config.guess;hb=HEAD'
+	curl -s -fS -k -L -o config.guess 'https://git.savannah.gnu.org/gitweb/?p=config.git;a=blob_plain;f=config.guess;hb=HEAD'
 config.sub:
-	wget -O config.sub 'https://git.savannah.gnu.org/gitweb/?p=config.git;a=blob_plain;f=config.sub;hb=HEAD'
+	curl -s -fS -k -L -o config.sub 'https://git.savannah.gnu.org/gitweb/?p=config.git;a=blob_plain;f=config.sub;hb=HEAD'
 ca-bundle.crt:
-	wget -O ca-bundle.crt 'https://raw.githubusercontent.com/bagder/ca-bundle/refs/heads/master/ca-bundle.crt'
+	curl -s -fS -k -L -o ca-bundle.crt 'https://raw.githubusercontent.com/bagder/ca-bundle/refs/heads/master/ca-bundle.crt'
 
 dist: config.guess config.sub clean
 	$(RM) naviserver-$(NS_PATCH_LEVEL)
@@ -380,7 +412,7 @@ dist: config.guess config.sub clean
 	tar czf naviserver-$(NS_PATCH_LEVEL).tar.gz --exclude='*/.*' --no-xattrs --disable-copyfile --exclude="._*" naviserver-$(NS_PATCH_LEVEL)
 	$(RM) naviserver-$(NS_PATCH_LEVEL)
 
-
 .PHONY: all install clean distclean \
 	install-dirs install-include install-tcl install-modules \
-	install-config install-certificates install-doc install-examples install-notice
+	install-config install-certificates install-doc install-examples install-notice \
+	all-% install-% clean-% test-%

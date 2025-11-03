@@ -12,7 +12,12 @@
 #ifndef NSD_H
 #define NSD_H
 
-#include "ns.h"
+/*
+ * Developer note:
+ * Use the in-tree ns.h to ensure prototype consistency during builds.
+ * Installed modules should include <ns.h> from the installation prefix.
+ */
+#include "../include/ns.h"
 
 #if defined(HAVE_XLOCALE_H)
 # include <xlocale.h>
@@ -20,6 +25,7 @@
 #include "locale.h"
 
 #define NS_TCLHTTP_CALLBACK_AS_STRING 1
+#define USE_ENCODE_HEADERS 1
 
 /*
  * Constants
@@ -29,6 +35,15 @@
 #define NS_CONFIG_THREADS              "ns/threads"
 
 NS_EXTERN const char *NS_EMPTY_STRING;
+
+/*
+ * Driver thread states.
+ */
+#define NS_DRIVER_THREAD_STARTED        0x01u
+#define NS_DRIVER_THREAD_READY          0x02u
+#define NS_DRIVER_THREAD_STOPPED        0x04u
+#define NS_DRIVER_THREAD_SHUTDOWN       0x08u
+#define NS_DRIVER_THREAD_FAILED         0x10u
 
 /*
  * Various ADP option bits.
@@ -259,7 +274,7 @@ typedef struct AdpFrame {
     time_t             mtime;
     off_t              size;
     Tcl_Obj          *ident;
-    Tcl_Obj          **objv;
+    Tcl_Obj    *const*objv;
     char              *savecwd;
     const char        *file;
     Tcl_DString        cwdbuf;
@@ -282,7 +297,7 @@ typedef struct AdpFrame {
 typedef struct AdpCode {
     int         nblocks;
     int         nscripts;
-    int        *len;
+    TCL_SIZE_T *len;
     int        *line;
     Tcl_DString text;
 } AdpCode;
@@ -297,6 +312,7 @@ typedef struct Ns_DList {
     size_t   size;
     size_t   avail;
     void    *static_data[30];
+    Ns_FreeProc *freeProc;
 } Ns_DList;
 
 /*
@@ -438,13 +454,17 @@ typedef struct Driver {
     Ns_DriverConnInfoProc   *connInfoProc; /* Driver specific info about connection. */
     Ns_DriverRequestProc    *requestProc;
     Ns_DriverCloseProc      *closeProc;
-    Ns_DriverClientInitProc *clientInitProc; /* Optional - initialization of client connections */
+    Ns_DriverClientInitProc *clientInitProc;   /* Optional - initialization of client connections */
+    Ns_ThreadProc           *driverThreadProc; /* Optional - use alternate driver thread proc */
+    Ns_HeadersEncodeProc    *headersEncodeProc;/* Optional - use alternate header encode proc */
 
     ssize_t                              locationLength;
     const char *path;                   /* Path in the configuration namespace */
     const char *defserver;              /* default server, might be NULL */
     Tcl_HashTable hosts;                /* Virtual hosts mapping to server */
     const struct ServerMap *defMapPtr;  /* Default for virtual host entry */
+    struct Driver *consumer;            /* Who consumes my config/state (optional) */
+    struct Driver *provider;            /* Where to get config/state from (optional) */
     Ns_Time closewait;                  /* Graceful close timeout */
     Ns_Time keepwait;                   /* Keepalive timeout */
     size_t keepmaxdownloadsize;         /* When set, allow keepalive only for download requests up to this size */
@@ -841,6 +861,7 @@ typedef struct NsServer {
         bool modsince;
         bool stealthmode;
         bool noticedetail;
+        bool h3enabled;
         const char *serverdir;  /* Root for "logdir" and "pagedir" */
         const char *logDir;
         Ns_RWLock rwlock;
@@ -1054,13 +1075,13 @@ typedef struct NsServer {
     Tcl_HashTable hosts;
 } NsServer;
 
-typedef Ns_ReturnCode (*NsHashValueProc)(void *hashValue, void *ctx);
-typedef Ns_ReturnCode (*NsHashKeyValueProc)(void *hashKey, void *hashValue, void *ctx);
+typedef Ns_ReturnCode (*NsHashValueProc)(void *hashValue, const void *ctx);
+typedef Ns_ReturnCode (*NsHashKeyValueProc)(const void *hashKey, void *hashValue, const void *ctx);
 
-NS_EXTERN Ns_ReturnCode NsForeachHashValue(Tcl_HashTable *tablePtr, NsHashValueProc fn, void *ctx)
+NS_EXTERN Ns_ReturnCode NsForeachHashValue(Tcl_HashTable *tablePtr, NsHashValueProc fn, const void *ctx)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
 
-NS_EXTERN Ns_ReturnCode NsForeachHashKeyValue(Tcl_HashTable *tablePtr, NsHashKeyValueProc fn, void *ctx)
+NS_EXTERN Ns_ReturnCode NsForeachHashKeyValue(Tcl_HashTable *tablePtr, NsHashKeyValueProc fn, const void *ctx)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
 
 /*
@@ -1242,7 +1263,7 @@ typedef struct {
 /*
  * Callback for the Http chunked-encoding parse state machine
  */
-typedef int (NsHttpParseProc)(NsHttpTask*, char**, size_t*);
+typedef int (NsHttpParseProc)(NsHttpTask*, const char**, size_t*);
 
 typedef struct _NsHttpChunk {
     size_t             length;           /* Length of the chunk */
@@ -1377,6 +1398,7 @@ NS_EXTERN TCL_OBJCMDPROC_T
     NsTclCryptoPbkdf2hmacObjCmd,
     NsTclCryptoRandomBytesObjCmd,
     NsTclCryptoScryptObjCmd,
+    NsTclCryptoUUIDObjCmd,
     NsTclDeleteCookieObjCmd,
     NsTclDriverObjCmd,
     NsTclEncodingForCharsetObjCmd,
@@ -1732,6 +1754,9 @@ NS_EXTERN void NsConnTimeStatsUpdate(Ns_Conn *conn)
 NS_EXTERN Ns_ReturnCode NsConnRequire(Tcl_Interp *interp, unsigned int flags, Ns_Conn **connPtr, int *tclResultPtr)
     NS_GNUC_NONNULL(1);
 
+NS_EXTERN char *NsDStringAppendConnFlags(Tcl_DString *dsPtr, unsigned int flags)
+    NS_GNUC_NONNULL(1);
+
 /*
  * connchan.c
  */
@@ -1748,20 +1773,21 @@ NS_EXTERN int NsConnChanWrite(Tcl_Interp *interp, const char *connChanName, cons
 /*
  * dlist.c
  */
-NS_EXTERN void Ns_DListInit(Ns_DList *dlPtr)
-    NS_GNUC_NONNULL(1);
-
-NS_EXTERN void Ns_DListAppend(Ns_DList *dlPtr, void *element)
-    NS_GNUC_NONNULL(1);
-
-NS_EXTERN void Ns_DListFree(Ns_DList *dlPtr)
-    NS_GNUC_NONNULL(1);
-
-NS_EXTERN char * Ns_DListSaveString(Ns_DList *dlPtr, const char *string)
-    NS_GNUC_NONNULL(1);
-
-NS_EXTERN void Ns_DListFreeElements(Ns_DList *dlPtr)
-    NS_GNUC_NONNULL(1);
+NS_EXTERN bool Ns_DListAddUnique(Ns_DList *dlPtr, void *element) NS_GNUC_NONNULL(1);
+NS_EXTERN bool Ns_DListDelete(Ns_DList *dlPtr, void *element) NS_GNUC_NONNULL(1);
+NS_EXTERN char * Ns_DListSaveString(Ns_DList *dlPtr, const char *string) NS_GNUC_NONNULL(1);
+NS_EXTERN size_t Ns_DListCapacity(const Ns_DList *dlPtr)  NS_GNUC_PURE NS_GNUC_NONNULL(1);
+NS_EXTERN void Ns_DListAppend(Ns_DList *dlPtr, void *element) NS_GNUC_NONNULL(1);
+NS_EXTERN void Ns_DListFree(Ns_DList *dlPtr) NS_GNUC_NONNULL(1);
+NS_EXTERN void Ns_DListFreeElements(Ns_DList *dlPtr) NS_GNUC_NONNULL(1);
+NS_EXTERN void Ns_DListFreeRange(Ns_DList *dlPtr, size_t from, size_t to_excl, bool clear) NS_GNUC_NONNULL(1);
+NS_EXTERN void Ns_DListInit(Ns_DList *dlPtr) NS_GNUC_NONNULL(1);
+NS_EXTERN void Ns_DListReset(Ns_DList *dlPtr) NS_GNUC_NONNULL(1);
+NS_EXTERN void Ns_DListSetCapacity(Ns_DList *dlPtr, size_t new_cap)  NS_GNUC_NONNULL(1);
+NS_EXTERN void Ns_DListSetFreeProc(Ns_DList *dlPtr, Ns_FreeProc freeProc)  NS_GNUC_NONNULL(1);
+NS_EXTERN void Ns_DListSetLength(Ns_DList *dlPtr, size_t new_size) NS_GNUC_NONNULL(1);
+NS_EXTERN size_t Ns_SetSplitDList(const Ns_Set *set, char sep, Ns_DList *out)
+    NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(3);
 
 /*
  * dns.c
@@ -1775,8 +1801,20 @@ NS_EXTERN bool NsHostnameIsNumericIP(const char *hostname) NS_GNUC_PURE
 NS_EXTERN void NsAddNslogEntry(Sock *sockPtr, int statusCode, Ns_Conn *connPtr, const char *headers)
     NS_GNUC_NONNULL(1);
 
-NS_EXTERN NS_TLS_SSL_CTX *NsDriverLookupHostCtx(Tcl_DString *hostDs, const char *hostName, const Ns_Driver *drvPtr)
+NS_EXTERN Ns_ReturnCode NsDispatchRequest(Sock *sockPtr)
+    NS_GNUC_NONNULL(1);
+
+NS_EXTERN TCL_SIZE_T NsDriverBindAddresses(Driver *drvPtr)
+    NS_GNUC_NONNULL(1);
+
+NS_EXTERN Ns_Driver *NsDriverFromConfigSection(const char *section)
+    NS_GNUC_NONNULL(1);
+
+NS_EXTERN NS_TLS_SSL_CTX *NsDriverLookupHostCtx(Tcl_DString *hostDs, const char *hostName, Ns_Driver *drvPtr)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(3);
+
+NS_EXTERN size_t NsDriversOfType(Ns_DList *dlPtr, const char *type)
+    NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
 
 NS_EXTERN void NsDriverMapVirtualServers(void);
 
@@ -1805,7 +1843,16 @@ NS_EXTERN int NSDriverSockNew(Tcl_Interp *interp, NS_SOCKET sock,
 NS_EXTERN Request *NsGetRequest(Sock *sockPtr, const Ns_Time *nowPtr)
     NS_GNUC_NONNULL(1);
 
+NS_EXTERN int NsSockAccept(Ns_Driver *drvPtr, NS_SOCKET sock, Ns_Sock **sockPtrPtr, const Ns_Time *nowPtr, void *arg)
+    NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(3) NS_GNUC_NONNULL(4);
+
+NS_EXTERN Request *NsSockEnsureRequest(Sock *sockPtr)
+    NS_GNUC_NONNULL(1);
+
 NS_EXTERN void NsSockClose(Sock *sockPtr, int keep)
+    NS_GNUC_NONNULL(1);
+
+NS_EXTERN void NsDriverStartSpoolers(Driver *drvPtr)
     NS_GNUC_NONNULL(1);
 
 NS_EXTERN void NsStopDrivers(void);
@@ -1932,7 +1979,7 @@ NS_EXTERN void NsUpdateProgress(Ns_Sock *sock) NS_GNUC_NONNULL(1);
 NS_EXTERN Ns_Set *NsHeaderSetGet(size_t size);
 
 NS_EXTERN Ns_ReturnCode NsQueueConn(Sock *sockPtr, const Ns_Time *nowPtr)
-    NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
+    NS_GNUC_NONNULL(1);
 
 NS_EXTERN void NsEnsureRunningConnectionThreads(const NsServer *servPtr, ConnPool *poolPtr)
     NS_GNUC_NONNULL(1);
@@ -2066,7 +2113,7 @@ NS_EXTERN void NsFreeConnInterp(Conn *connPtr)           NS_GNUC_NONNULL(1);
 NS_EXTERN void NsIdleCallback(NsServer *servPtr)         NS_GNUC_NONNULL(1);
 NS_EXTERN void NsTclInitServer(const char *server)       NS_GNUC_NONNULL(1);
 NS_EXTERN Tcl_Interp *NsTclCreateInterp(void)            NS_GNUC_RETURNS_NONNULL;
-NS_EXTERN Tcl_Interp *NsTclAllocateInterp(NsServer *servPtr) NS_GNUC_RETURNS_NONNULL;
+NS_EXTERN Tcl_Interp *NsTclAllocateInterp(const NsServer *servPtr) NS_GNUC_RETURNS_NONNULL;
 NS_EXTERN void NsTclRunAtClose(NsInterp *itPtr)          NS_GNUC_NONNULL(1);
 
 /*
@@ -2147,6 +2194,9 @@ NS_EXTERN int NsTlsGetParameters(NsInterp *itPtr, bool tlsContext, int insecureI
                                  const char **caFilePtr, const char **caPathPtr)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(7) NS_GNUC_NONNULL(8);
 
+NS_EXTERN void NsTlsAddOutputHeaders(Ns_Set *outputHeaders, const Ns_Sock  *sockPtr)
+    NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
+
 /*
  * unix.c
  */
@@ -2187,7 +2237,7 @@ NS_EXTERN Ns_ReturnCode NsUrlToFile(Tcl_DString *dsPtr, NsServer *servPtr, const
 NS_EXTERN NsUrlSpaceContextSpec *NsUrlSpaceContextSpecNew(const char *field, const char *patternString)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
 
-NS_EXTERN const char *NsUrlSpaceContextSpecAppend(Tcl_DString *dsPtr, NsUrlSpaceContextSpec *spec)
+NS_EXTERN const char *NsUrlSpaceContextSpecAppend(Tcl_DString *dsPtr, const NsUrlSpaceContextSpec *spec)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
 
 NS_EXTERN NsUrlSpaceContextSpec *NsObjToUrlSpaceContextSpec(Tcl_Interp *interp, Tcl_Obj *ctxFilterObj)

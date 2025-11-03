@@ -554,7 +554,7 @@ NsTclCharsetsObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp,
              hPtr != NULL;
              hPtr = Tcl_NextHashEntry(&search)
              ) {
-            const char *key = Tcl_GetHashKey(&charsets, hPtr);
+            const char *key = Ns_TclGetHashKeyString(&charsets, hPtr);
             Tcl_ListObjAppendElement(interp, listObj, Tcl_NewStringObj(key, TCL_INDEX_NONE));
         }
         Tcl_SetObjResult(interp, listObj);
@@ -704,7 +704,7 @@ AddExtension(const char *ext, const char *name)
     NS_NONNULL_ASSERT(name != NULL);
 
     hPtr = Tcl_CreateHashEntry(&extensions, ext, &isNew);
-    Tcl_SetHashValue(hPtr, name);
+    Tcl_SetHashValue(hPtr, ns_const2voidp(name));
 }
 
 static void
@@ -725,7 +725,7 @@ AddCharset(const char *charset, const char *name)
      */
 
     hPtr = Tcl_CreateHashEntry(&charsets, charset, &isNew);
-    Tcl_SetHashValue(hPtr, name);
+    Tcl_SetHashValue(hPtr, ns_const2voidp(name));
 
     /*
      * Map in the reverse direction: encodings to charsets.

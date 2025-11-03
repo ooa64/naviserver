@@ -253,7 +253,8 @@ Ns_ModuleLoad(Tcl_Interp *interp, const char *server, const char *module, const 
 int
 NsTclModuleLoadObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *const* objv)
 {
-    char         *module, *file, *init = (char *)"Ns_ModuleInit";
+    char         *module, *file;
+    const char   *init = "Ns_ModuleInit";
     int           global = (int)NS_FALSE, result = TCL_OK;
     Ns_ObjvSpec   opts[] = {
         {"-global", Ns_ObjvBool,   &global, INT2PTR(NS_TRUE)},
@@ -325,7 +326,7 @@ NsInitStaticModules(const char *server)
             if ((*modPtr->proc)(server, modPtr->name) != NS_OK) {
                 Ns_Fatal("modload: %s: failed to initialize", modPtr->name);
             }
-            ns_free((char *)modPtr->name);
+            ns_free_const(modPtr->name);
             ns_free(modPtr);
             modPtr = nextPtr;
         }

@@ -316,6 +316,11 @@ static Err    Wait(Tcl_Interp *interp, Proxy *proxyPtr, const Ns_Time *timeoutPt
 static Err    Recv(Tcl_Interp *interp, Proxy *proxyPtr, int *resultPtr)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2) NS_GNUC_NONNULL(3);
 
+static void FormatActiveSnippet(char *dst, size_t dstCap,
+                                const char *script, size_t want,
+                                const char *dots, Tcl_DString *ds)
+    NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(3) NS_GNUC_NONNULL(5) NS_GNUC_NONNULL(6);
+
 static void   GetStats(const Proxy *proxyPtr)  NS_GNUC_NONNULL(1);
 
 static Err    CheckProxy(Tcl_Interp *interp, Proxy *proxyPtr) NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
@@ -451,6 +456,66 @@ Ns_ProxyTclInit(Tcl_Interp *interp)
     return TCL_OK;
 }
 
+/*
+ * FormatActiveSnippet --
+ *
+ *    Build a truncated snippet of a Tcl script for diagnostic or logging
+ *    purposes. The snippet is wrapped in braces and may include an ellipsis
+ *    marker when truncated.
+ *
+ * Arguments:
+ *    dst     - Output buffer for the final snippet string.
+ *    dstCap  - Capacity of the dst buffer in bytes.
+ *    script  - Input script string to take the snippet from.
+ *    want    - Maximum number of characters to copy from script before truncating.
+ *    dots    - String to append after the truncated snippet (e.g. "...").
+ *    ds      - Tcl_DString workspace used for building the intermediate result.
+ *
+ * Returns:
+ *    None.
+ *
+ * Side Effects:
+ *    - Resets and reuses the provided Tcl_DString.
+ *    - Copies the formatted snippet into dst (NUL-terminated), truncated if
+ *      necessary to fit dstCap.
+ *
+ * Example:
+ *    script = "set foo bar; do_something_long"
+ *    want   = 10
+ *    dots   = "..."
+ *
+ *    Result: "{set foo b...}"
+ */
+static void
+FormatActiveSnippet(char *dst, size_t dstCap,
+                    const char *script, size_t want,
+                    const char *dots, Tcl_DString *ds)
+{
+    size_t sc;
+
+    /* build in ds */
+    Tcl_DStringSetLength(ds, 0);
+    Tcl_DStringAppend(ds, "{", 1);
+
+    /* copy at most 'want' chars from script (don't over-read) */
+    sc = strnlen(script, want);
+    Tcl_DStringAppend(ds, script, (TCL_SIZE_T)sc);
+
+    Tcl_DStringAppend(ds, dots, TCL_INDEX_NONE);
+    Tcl_DStringAppend(ds, "}", 1);
+
+    /* copy into dst with truncation + NUL */
+    if (dstCap > 0) {
+        const char *src = Tcl_DStringValue(ds);
+        size_t      len = (size_t)Tcl_DStringLength(ds);
+        size_t      cp  = (len < dstCap - 1) ? len : (dstCap - 1);
+        if (cp != 0) {
+            memcpy(dst, src, cp);
+        }
+        dst[cp] = '\0';
+    }
+}
+
 
 /*
  *----------------------------------------------------------------------
@@ -476,8 +541,9 @@ Ns_ProxyMain(int argc, char *const*argv, Tcl_AppInitProc *init)
     Tcl_Interp  *interp;
     Worker        proc;
     int          result, max;
-    Tcl_DString  in, out;
-    const char  *script, *dots, *uarg = NULL, *user;
+    Tcl_DString  in, out, scratch;
+    const char  *script, *user;
+    char        *uarg = NULL;
     char        *group = NULL, *active;
     uint16       major, minor;
     size_t       activeSize;
@@ -598,6 +664,7 @@ Ns_ProxyMain(int argc, char *const*argv, Tcl_AppInitProc *init)
 
     Tcl_DStringInit(&in);
     Tcl_DStringInit(&out);
+    Tcl_DStringInit(&scratch);
 
     while (RecvBuf(&proc, NULL, &in) == NS_TRUE) {
         Req      req, *reqPtr = &req;
@@ -617,8 +684,11 @@ Ns_ProxyMain(int argc, char *const*argv, Tcl_AppInitProc *init)
             Export(NULL, TCL_OK, &out);
         } else {
             script = Tcl_DStringValue(&in) + sizeof(Req);
+
             if (active != NULL) {
-                int n = (int)len;
+                const char *dots;
+                size_t      want;
+                int         n = (int)len;
 
                 if (n < max) {
                     dots = NS_EMPTY_STRING;
@@ -626,10 +696,16 @@ Ns_ProxyMain(int argc, char *const*argv, Tcl_AppInitProc *init)
                     dots = " ...";
                     n = max;
                 }
-                snprintf(active, activeSize, "{%.*s%s}", n, script, dots);
+
+                /* want is the clamped number of script bytes to show */
+                want = (n < 0) ? 0u : (size_t)n;
+
+                FormatActiveSnippet(active, activeSize, script, want, dots, &scratch);
             }
+
             result = Tcl_EvalEx(interp, script, (TCL_SIZE_T)len, 0);
             Export(interp, result, &out);
+
             if (active != NULL) {
                 assert(max > 0);
                 memset(active, ' ', (size_t)max);
@@ -643,10 +719,11 @@ Ns_ProxyMain(int argc, char *const*argv, Tcl_AppInitProc *init)
     }
 
     if (uarg != NULL) {
-        ns_free((char *)uarg);
+        ns_free(uarg);
     }
     Tcl_DStringFree(&in);
     Tcl_DStringFree(&out);
+    Tcl_DStringFree(&scratch);
 
     return 0;
 }
@@ -900,13 +977,13 @@ int Ns_ProxyEval(Tcl_Interp *interp, PROXY handle, const char *script, const Ns_
 static Worker *
 ExecWorker(Tcl_Interp *interp, const Proxy *proxyPtr)
 {
-    Pool  *poolPtr;
-    char  *argv[5];
-    char   active[100];
-    Worker *workerPtr;
-    int    rpipe[2], wpipe[2];
-    size_t len;
-    pid_t  pid;
+    Pool       *poolPtr;
+    const char *argv[5];
+    char        active[100];
+    Worker     *workerPtr;
+    int         rpipe[2], wpipe[2];
+    size_t      len;
+    pid_t       pid;
 
     NS_NONNULL_ASSERT(interp != NULL);
     NS_NONNULL_ASSERT(proxyPtr != NULL);
@@ -941,8 +1018,8 @@ ExecWorker(Tcl_Interp *interp, const Proxy *proxyPtr)
     ns_close(rpipe[0]);
     ns_close(wpipe[1]);
 
-    ns_free(argv[0]);
-    ns_free(argv[1]);
+    ns_free_const(argv[0]);
+    ns_free_const(argv[1]);
 
     if (pid == NS_INVALID_PID) {
         Ns_TclPrintfResult(interp, "exec failed: %s", Tcl_PosixError(interp));
@@ -1316,10 +1393,8 @@ SendBuf(const Worker *workerPtr, const Ns_Time *timePtr, const Tcl_DString *dsPt
     }
 
     ulen = htonl((unsigned int)dsPtr->length);
-    iov[0].iov_base = (void *)&ulen;
-    iov[0].iov_len  = sizeof(ulen);
-    iov[1].iov_base = dsPtr->string;
-    iov[1].iov_len  = (size_t)dsPtr->length;
+    ns_iov_set(&iov[0], &ulen, sizeof(ulen));
+    ns_iov_set(&iov[1], dsPtr->string, (size_t)dsPtr->length);
 
     while ((iov[0].iov_len + iov[1].iov_len) > 0u) {
         do {
@@ -1327,9 +1402,10 @@ SendBuf(const Worker *workerPtr, const Ns_Time *timePtr, const Tcl_DString *dsPt
         } while (n == -1 && errno == NS_EINTR);
 
         if (n == -1) {
+            int  err = errno;
             long waitMs;
 
-            if ((errno != NS_EAGAIN) && (errno != NS_EWOULDBLOCK)) {
+            if (!NS_ERRNO_WOULDBLOCK(err)) {
                 success = NS_FALSE;
                 break;
 
@@ -1390,10 +1466,8 @@ RecvBuf(const Worker *workerPtr, const Ns_Time *timePtr, Tcl_DString *dsPtr)
     }
 
     avail = (size_t)dsPtr->spaceAvl - 1u;
-    iov[0].iov_base = (void *)&ulen;
-    iov[0].iov_len  = sizeof(ulen);
-    iov[1].iov_base = dsPtr->string;
-    iov[1].iov_len  = avail;
+    ns_iov_set(&iov[0], &ulen, sizeof(ulen));
+    ns_iov_set(&iov[1], dsPtr->string, avail);
 
     while (iov[0].iov_len > 0) {
         do {
@@ -1405,9 +1479,10 @@ RecvBuf(const Worker *workerPtr, const Ns_Time *timePtr, Tcl_DString *dsPtr)
             break;
 
         } else if (n < 0) {
-            long  waitMs;
+            int  err = errno;
+            long waitMs;
 
-            if (errno != NS_EAGAIN && errno != NS_EWOULDBLOCK) {
+            if (!NS_ERRNO_WOULDBLOCK(err)) {
                 success = NS_FALSE;
                 break;
 
@@ -1449,9 +1524,10 @@ RecvBuf(const Worker *workerPtr, const Ns_Time *timePtr, Tcl_DString *dsPtr)
                 break;
 
             } else if (n < 0) {
+                int  err = errno;
                 long waitMs;
 
-                if (errno != NS_EAGAIN && errno != NS_EWOULDBLOCK) {
+                if (!NS_ERRNO_WOULDBLOCK(err)) {
                     success = NS_FALSE;
                     break;
 
@@ -1521,14 +1597,21 @@ WaitFd(int fd, short events, long ms)
  *
  * UpdateIov --
  *
- *      Update the base and len in given iovec based on bytes
- *      already processed.
+ *      Adjust an array of two iovec structures after n bytes have been
+ *      consumed. The function advances the iov_base pointers and decreases
+ *      the iov_len fields accordingly, using ns_iov_set() for all updates.
+ *
+ *      If n consumes all data from the first vector, the remainder
+ *      is subtracted from the second. When n exceeds the total
+ *      length of both vectors, both entries are cleared.
  *
  * Results:
  *      None.
  *
  * Side effects:
- *      None.
+ *      Modifies the passed-in iovec structures to reflect the
+ *      remaining data to send. The resulting vectors may have
+ *      NULL bases and zero lengths when fully consumed.
  *
  *----------------------------------------------------------------------
  */
@@ -1536,19 +1619,26 @@ WaitFd(int fd, short events, long ms)
 static void
 UpdateIov(struct iovec *iov, size_t n)
 {
-    NS_NONNULL_ASSERT(iov != NULL);
+    const size_t l0 = iov[0].iov_len;
+    const size_t l1 = iov[1].iov_len;
 
-    if (n >= iov[0].iov_len) {
-        n -= iov[0].iov_len;
-        iov[0].iov_base = NULL;
-        iov[0].iov_len = 0;
-    } else {
-        iov[0].iov_len  -= n;
-        iov[0].iov_base = (char *)(iov[0].iov_base) + n;
-        n = 0;
+    /* If we've consumed everything (or more), zero both vectors. */
+    if (n >= l0 + l1) {
+        ns_iov_set(&iov[0], NULL, 0);
+        ns_iov_set(&iov[1], NULL, 0);
+        return;
     }
-    iov[1].iov_len  -= n;
-    iov[1].iov_base = (char *)(iov[1].iov_base) + n;
+
+    if (n >= l0) {
+        /* Consume all of iov[0] and the remainder from iov[1]. */
+        const size_t rem = n - l0;
+        ns_iov_set(&iov[0], NULL, 0);
+        ns_iov_set(&iov[1], (char *)iov[1].iov_base + rem, l1 - rem);
+    } else {
+        /* Consume part of iov[0]; iov[1] unchanged. */
+        ns_iov_set(&iov[0], (char *)iov[0].iov_base + n, l0 - n);
+        /* No change to iov[1]. */
+    }
 }
 
 
@@ -1847,7 +1937,7 @@ WorkersObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Ob
                            Tcl_NewStringObj(proxyPtr->state == Idle ? "idle"
                                             : proxyPtr->state == Busy ? "busy"
                                             : proxyPtr->state == Done ? "done"
-                                            : "unknown", -1));
+                                            : "unknown", TCL_INDEX_NONE));
 
             Tcl_DStringAppendElement(dsPtr, Tcl_GetString(elementObj));
             Tcl_DecrRefCount(elementObj);
@@ -2558,7 +2648,7 @@ SetOpt(const char *str, char const **optPtr)
     NS_NONNULL_ASSERT(str != NULL);
     NS_NONNULL_ASSERT(optPtr != NULL);
 
-    ns_free((char*)*optPtr);
+    ns_free_const(*optPtr);
     if (*str != '\0') {
         *optPtr = ns_strdup(str);
     } else {
@@ -3653,9 +3743,9 @@ FreePool(Pool *poolPtr)
 {
     NS_NONNULL_ASSERT(poolPtr != NULL);
 
-    ns_free((char *)poolPtr->exec);
-    ns_free((char *)poolPtr->init);
-    ns_free((char *)poolPtr->reinit);
+    ns_free_const(poolPtr->exec);
+    ns_free_const(poolPtr->init);
+    ns_free_const(poolPtr->reinit);
     if (poolPtr->env) {
         Ns_SetFree(poolPtr->env);
     }

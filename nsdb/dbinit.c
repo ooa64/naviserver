@@ -658,7 +658,7 @@ NsDbInitPools(void)
         if (poolPtr == NULL) {
             Tcl_DeleteHashEntry(hPtr);
         } else {
-            Tcl_SetHashValue(hPtr, poolPtr);
+            Tcl_SetHashValue(hPtr, ns_const2voidp(poolPtr));
         }
     }
     Ns_RegisterProcInfo((ns_funcptr_t)CheckPool, "nsdb:check", CheckArgProc);
@@ -1539,7 +1539,7 @@ IncrCount(const char *UNUSED(context), const Pool *poolPtr, int incr)
         Tcl_InitHashTable(tablePtr, TCL_ONE_WORD_KEYS);
         Ns_TlsSet(&tls, tablePtr);
     }
-    hPtr = Tcl_CreateHashEntry(tablePtr, (const char *) poolPtr, &isNew);
+    hPtr = Tcl_CreateHashEntry(tablePtr, ns_const2voidp(poolPtr), &isNew);
     if (isNew != 0) {
         prev = 0;
     } else {
@@ -1669,16 +1669,21 @@ Ns_DbListMinDurations(Tcl_Interp *interp, const char *server)
     pool = Ns_DbPoolList(server);
     if (pool != NULL) {
         for ( ; *pool != '\0'; pool += strlen(pool) + 1u) {
-            char          buffer[100];
-            const Pool   *poolPtr;
-            TCL_SIZE_T    len;
+            const Pool *poolPtr;
 
             poolPtr = GetPool(pool);
-            (void) Tcl_ListObjAppendElement(interp, resultObj, Tcl_NewStringObj(pool, TCL_INDEX_NONE));
-            len = (TCL_SIZE_T)snprintf(buffer, sizeof(buffer), NS_TIME_FMT,
-                                       (int64_t)poolPtr->minDuration.sec,
-                                       poolPtr->minDuration.usec);
-            (void) Tcl_ListObjAppendElement(interp, resultObj, Tcl_NewStringObj(buffer, len));
+            if (poolPtr != NULL) {
+                char        buffer[100];
+                TCL_SIZE_T len;
+
+                (void) Tcl_ListObjAppendElement(interp, resultObj, Tcl_NewStringObj(pool, TCL_INDEX_NONE));
+                len = (TCL_SIZE_T)snprintf(buffer, sizeof(buffer), NS_TIME_FMT,
+                                           (int64_t)poolPtr->minDuration.sec,
+                                           poolPtr->minDuration.usec);
+                (void) Tcl_ListObjAppendElement(interp, resultObj, Tcl_NewStringObj(buffer, len));
+            } else {
+                Ns_Log(Warning, "nsdb: can't obtain pool '%s'", pool);
+            }
         }
     }
     return resultObj;

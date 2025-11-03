@@ -43,10 +43,10 @@
 
 
 #if __GNUC_PREREQ(3,3)
-# define NS_GNUC_NONNULL(ARGS) __attribute__((__nonnull__(ARGS)))
+# define NS_GNUC_NONNULL(...) __attribute__((__nonnull__(__VA_ARGS__)))
 # define NS_GNUC_MAYALIAS __attribute__((__may_alias__))
 #else
-# define NS_GNUC_NONNULL(ARGS)
+# define NS_GNUC_NONNULL(...)
 # define NS_GNUC_MAYALIAS
 #endif
 
@@ -174,14 +174,20 @@
 # define NS_INLINE inline
 #endif
 
-#if defined(__cplusplus)
-# define NS_RESTRICT
-#else
-# ifdef _MSC_VER
-#  define NS_RESTRICT __restrict
-# else
-#  define NS_RESTRICT restrict
-# endif
+
+#ifndef NS_RESTRICT
+#  if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
+      /* C99 or newer */
+#    define NS_RESTRICT restrict
+#  elif defined(_MSC_VER)
+      /* MSVC */
+#    define NS_RESTRICT __restrict
+#  elif defined(__GNUC__) || defined(__clang__)
+      /* GNU/Clang extensions in older modes */
+#    define NS_RESTRICT __restrict__
+#  else
+#    define NS_RESTRICT
+#  endif
 #endif
 
 #if defined(__GNUC__) && !defined(__OpenBSD__)

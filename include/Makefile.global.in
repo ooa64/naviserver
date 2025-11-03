@@ -26,6 +26,20 @@ NS_PATCH_LEVEL   = @NS_PATCH_LEVEL@
 
 @SET_MAKE@
 
+# Toggle verbosity: make VERBOSE=1 shows full commands
+ifndef VERBOSE
+  Q := @
+  E := @echo
+else
+  Q :=
+  E := @true
+endif
+
+# Pattern rule: shows short progress, runs real compile
+%.o: %.c
+	$(E) "  $(CC)  $<"
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
 #
 # The following binaries are assumed to live in the /bin/ directory,
 # as specified by FHS 3.0 (Filesystem Hierarchy Standard).
@@ -76,15 +90,40 @@ LDRPATH         += @LDRPATH@
 CC               = $(PURIFY) @CC@
 CCLD             = @CCLD@
 
-# When compiling with sanitize: export ASAN_OPTIONS=halt_on_error=false:exitcode=0:print_stats=1:atexit=1
-#SANITIZE          = -fsanitize=address -fsanitize-recover=address
-#SANITIZE          =
-#CFLAGS_TIDY_GCC   =  -fipa-pure-const -Wsuggest-attribute=const -Wsuggest-attribute=pure -Wstringop-truncation 
-#CFLAGS_TIDY_GCC   =  -fipa-pure-const -Wsuggest-attribute=pure -Wstringop-truncation -Wflex-array-member-not-at-end -Warray-compare
+# Detect compiler kind (mutually exclusive) and avoid = overwrites
+CC_VERSION := $(shell $(CC) --version 2>/dev/null | head -1)
+IS_CLANG  := $(shell echo '$(CC_VERSION)' | grep -i -c clang)
+IS_GCC    := $(shell echo '$(CC_VERSION)' | grep -i -c gcc)
+GCC_VER   := $(shell $(CC) -dumpfullversion -dumpversion 2>/dev/null)
+GCC_MAJOR := $(word 1,$(subst ., ,$(GCC_VER)))
+lt = $(shell [ $(1) -lt $(2) ] && echo 1 || echo 0)
 
-CFLAGS_CONVERSION = -Wconversion -Wsign-conversion -Wsign-compare
-CFLAGS_DEFINITION = -Wwrite-strings -Wdeclaration-after-statement -Wendif-labels -Wshadow -Wmissing-prototypes -Wstrict-prototypes
-CFLAGS_TIDY       = -Wno-missing-braces -Wundef -Wunreachable-code -Wswitch-enum -Wpointer-arith -Wold-style-definition -Wmissing-format-attribute -Wformat-security $(CFLAGS_TIDY_GCC)
+
+# Defaults depend on compiler/version
+ifeq ($(IS_GCC),1)
+  # GCC <= 6: keep checks empty by default (user can override)
+  ifeq ($(call lt,$(GCC_MAJOR),6),1)
+    CFLAGS_CONVERSION ?=
+    CFLAGS_FORMAT     ?=
+    CFLAGS_DEFINITION ?=
+    CFLAGS_TIDY       ?=
+  else
+    # GCC >= 6:
+    # -Wcast-qual
+    CFLAGS_CONVERSION ?= -Wconversion -Wsign-conversion -Wbad-function-cast -Wcast-align
+    CFLAGS_FORMAT     ?= -Wmissing-format-attribute -Wformat-security -Wformat=2
+    CFLAGS_DEFINITION ?= -Wwrite-strings -Wdeclaration-after-statement -Wmissing-prototypes -Wmissing-declarations
+    CFLAGS_TIDY       ?= -Wno-missing-braces -Wundef -Wunreachable-code -Wswitch-enum -Wold-style-definition -Wnull-dereference -Wdouble-promotion -Wvla $(CFLAGS_FORMAT)
+  endif
+else
+  # Non-GCC (e.g., Clang): keep your normal defaults
+  CFLAGS_CONVERSION ?= -Wconversion -Wsign-conversion -Wbad-function-cast -Wcast-align
+  CFLAGS_FORMAT     ?= -Wmissing-format-attribute -Wformat-security -Wformat=2
+  CFLAGS_DEFINITION ?= -Wwrite-strings -Wdeclaration-after-statement -Wmissing-prototypes -Wmissing-declarations
+  CFLAGS_TIDY       ?= -Wno-missing-braces -Wundef -Wunreachable-code -Wswitch-enum -Wold-style-definition -Wdouble-promotion -Wvla $(CFLAGS_FORMAT)
+endif
+
+
 #CFLAGS_FORTIFY    = -D_FORTIFY_SOURCE=2 -fstack-protector $(SANITIZE)
 #CFLAGS_FORTIFY    = -fstack-protector $(SANITIZE) -fwrapv -ftrapv
 CFLAGS_WARNING   = @CFLAGS_WARNING@
@@ -99,7 +138,53 @@ CFLAGS_EXTRA     = @SHLIB_CFLAGS@ @TCL_EXTRA_CFLAGS@ -DSYSTEM_MALLOC -std=c99
 DEFS             = @DEFS@
 #CFLAGS_DEFAULT    = @CFLAGS_DEFAULT@
 
-CFLAGS          += $(CFLAGS_DEFAULT) $(CFLAGS_DEBUG) $(CFLAGS_OPTIMIZE) $(CFLAGS_WARNING) $(CFLAGS_EXTRA) $(CFLAGS_INCLUDE) $(PTHREAD_CFLAGS) @CPPFLAGS@ $(DEFS)
+# Detect compiler kind (mutually exclusive) and avoid = overwrites
+CC_VERSION := $(shell $(CC) --version 2>/dev/null | head -1)
+
+IS_CLANG  := $(shell echo '$(CC_VERSION)' | grep -i -c clang)
+IS_GCC    := $(shell echo '$(CC_VERSION)' | grep -i -c gcc)
+GCC_VER   := $(shell $(CC) -dumpfullversion -dumpversion 2>/dev/null)
+GCC_MAJOR := $(word 1,$(subst ., ,$(GCC_VER)))
+
+# Helper: add flag only if the compiler accepts it
+# Usage: $(call cc-supports,<flag>)
+cc-supports = $(shell \
+  printf 'int main(void){return 0;}\n' | \
+  $(CC) $(1) -Werror -x c - -c -o /dev/null >/dev/null 2>&1 && \
+  echo "$(1)")
+
+CFLAGS_COMPILER :=
+
+# GCC extras (probe each)
+ifeq ($(IS_GCC),1)
+  # Always safe (pre-checked)
+  CFLAGS_COMPILER += -Wlogical-op -Wclobbered -Wtrampolines
+
+  # Known supported from GCC 7 upwards
+  ifeq ($(call ge,$(GCC_MAJOR),7),1)
+    CFLAGS_COMPILER += \
+      -Wduplicated-cond -Wduplicated-branches -Wformat-overflow=2 \
+      -Wformat-truncation=2 -Wrestrict -Wimplicit-fallthrough=3
+  endif
+
+  # Probe uncertain ones
+  ifeq ($(call ge,$(GCC_MAJOR),8),1)
+    CFLAGS_COMPILER += $(call cc-supports,-Wstringop-truncation)
+  endif
+  ifeq ($(call ge,$(GCC_MAJOR),11),1)
+    CFLAGS_COMPILER += $(call cc-supports,-Wstringop-overread)
+  endif
+endif
+
+# Clang extras (probe each)
+ifeq ($(IS_CLANG),1)
+CFLAGS_COMPILER += \
+  $(call cc-supports,-Wshorten-64-to-32) \
+  $(call cc-supports,-Wcomma) \
+  $(call cc-supports,-Wnewline-eof)
+endif
+
+CFLAGS          += $(CFLAGS_DEFAULT) $(CFLAGS_DEBUG) $(CFLAGS_OPTIMIZE) $(CFLAGS_WARNING) $(CFLAGS_COMPILER) $(CFLAGS_EXTRA) $(CFLAGS_INCLUDE) $(PTHREAD_CFLAGS) @CPPFLAGS@ $(DEFS)
 LDFLAGS         += $(CFLAGS_OPTIMIZE) $(SANITIZE)
 LIBS		 = @LIBS@
 DL_LIBS		 =
@@ -198,17 +283,21 @@ ifneq (,$(findstring Darwin,$(uname)))
 endif
 
 #
-# FreeBSD (at least 12) needs the POSIX thread library
+# FreeBSD, OpenBSD and NetBSD need the POSIX thread library and the math
+# library to resolve functions such as lround()
+#
+# NetBSD needs -lpthread instead of -lthr, but also -lm.
 #
 ifneq (,$(findstring FreeBSD,$(uname)))
-    NSLIBS += -lthr
+    NSLIBS += -lthr -lm
 endif
 
-#
-# OpenBSD needs the POSIX thread library
-#
 ifneq (,$(findstring OpenBSD,$(uname)))
-    NSLIBS += -lpthread
+    NSLIBS += -lpthread -lm
+endif
+
+ifneq (,$(findstring NetBSD,$(uname)))
+    NSLIBS += -lpthread -lm
 endif
 
 #

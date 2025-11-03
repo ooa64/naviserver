@@ -32,8 +32,10 @@
 # endif
 #endif
 
-#ifdef USE_TCL_STUBS
-# error USE_TCL_STUBS should be undefined
+#ifdef __MINGW32__
+# ifdef USE_TCL_STUBS
+#  error USE_TCL_STUBS should be undefined
+# endif
 #endif
 
 /*
@@ -116,6 +118,25 @@
 # define likely(x) (x)
 #endif
 
+/* NS_ALIGNOF(T) -> alignment in bytes required for objects of type T */
+#if defined(__cplusplus)
+  /* C++11 and later */
+  #define NS_ALIGNOF(T) alignof(T)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+  /* C11 or newer in C mode */
+  #define NS_ALIGNOF(T) _Alignof(T)
+#elif defined(_MSC_VER)
+  /* Older MSVC C mode: use MSVC extension */
+  #define NS_ALIGNOF(T) __alignof(T)
+#elif defined(__GNUC__) || defined(__clang__)
+  /* GCC/Clang in non-C11 modes */
+  #define NS_ALIGNOF(T) __alignof__(T)
+#else
+  /* Conservative fallback */
+  #define NS_ALIGNOF(T) (sizeof(void *))
+#endif
+
+
 /***************************************************************
  * Main Windows defines, including
  *
@@ -147,7 +168,7 @@
  * 0x0601  Windows 7
  * 0x0602  Windows 8
  * 0x0603  Windows 8.1
- * 0x0A00  Windows 10
+ * 0x0A00  Windows 10 and Windows 11
  */
 # ifndef _WIN32_WINNT
 #  define _WIN32_WINNT                0x0600
@@ -226,6 +247,38 @@ MSVC++ 12.0 _MSC_VER == 1800 (Visual Studio 2013)
 MSVC++ 14.0 _MSC_VER == 1900 (Visual Studio 2015 version 14.0)
 MSVC++ 14.1 _MSC_VER == 1910 (Visual Studio 2017 version 15.0)
 MSVC++ 14.2 _MSC_VER == 1920 (Visual Studio 2019 version 16.0)
+MSVC++ 14.10 _MSC_VER == 1910 (Visual Studio 2017 version 15.0)
+MSVC++ 14.11 _MSC_VER == 1911 (Visual Studio 2017 version 15.3 / 15.4)
+MSVC++ 14.12 _MSC_VER == 1912 (Visual Studio 2017 version 15.5)
+MSVC++ 14.13 _MSC_VER == 1913 (Visual Studio 2017 version 15.6)
+MSVC++ 14.14 _MSC_VER == 1914 (Visual Studio 2017 version 15.7)
+MSVC++ 14.15 _MSC_VER == 1915 (Visual Studio 2017 version 15.8)
+MSVC++ 14.16 _MSC_VER == 1916 (Visual Studio 2017 version 15.9)
+MSVC++ 14.20 _MSC_VER == 1920 (Visual Studio 2019 version 16.0)
+MSVC++ 14.21 _MSC_VER == 1921 (Visual Studio 2019 version 16.1)
+MSVC++ 14.22 _MSC_VER == 1922 (Visual Studio 2019 version 16.2)
+MSVC++ 14.23 _MSC_VER == 1923 (Visual Studio 2019 version 16.3)
+MSVC++ 14.24 _MSC_VER == 1924 (Visual Studio 2019 version 16.4)
+MSVC++ 14.25 _MSC_VER == 1925 (Visual Studio 2019 version 16.5)
+MSVC++ 14.26 _MSC_VER == 1926 (Visual Studio 2019 version 16.6)
+MSVC++ 14.27 _MSC_VER == 1927 (Visual Studio 2019 version 16.7)
+MSVC++ 14.28 _MSC_VER == 1928 (Visual Studio 2019 version 16.8 / 16.9)
+MSVC++ 14.29 _MSC_VER == 1929 (Visual Studio 2019 version 16.10 / 16.11)
+MSVC++ 14.30 _MSC_VER == 1930 (Visual Studio 2022 version 17.0)
+MSVC++ 14.31 _MSC_VER == 1931 (Visual Studio 2022 version 17.1)
+MSVC++ 14.32 _MSC_VER == 1932 (Visual Studio 2022 version 17.2)
+MSVC++ 14.33 _MSC_VER == 1933 (Visual Studio 2022 version 17.3)
+MSVC++ 14.34 _MSC_VER == 1934 (Visual Studio 2022 version 17.4)
+MSVC++ 14.35 _MSC_VER == 1935 (Visual Studio 2022 version 17.5)
+MSVC++ 14.36 _MSC_VER == 1936 (Visual Studio 2022 version 17.6)
+MSVC++ 14.37 _MSC_VER == 1937 (Visual Studio 2022 version 17.7)
+MSVC++ 14.38 _MSC_VER == 1938 (Visual Studio 2022 version 17.8)
+MSVC++ 14.39 _MSC_VER == 1939 (Visual Studio 2022 version 17.9)
+MSVC++ 14.40 _MSC_VER == 1940 (Visual Studio 2022 version 17.10)
+MSVC++ 14.41 _MSC_VER == 1941 (Visual Studio 2022 version 17.11)
+MSVC++ 14.42 _MSC_VER == 1942 (Visual Studio 2022 version 17.12)
+MSVC++ 14.43 _MSC_VER == 1943 (Visual Studio 2022 version 17.13)
+MSVC++ 14.44 _MSC_VER == 1944 (Visual Studio 2022 version 17.14)
 */
 
 /*
@@ -610,6 +663,34 @@ typedef int ns_sockerrno_t;
 #include <assert.h>
 #include <sys/stat.h>
 
+/* Fallback if the compiler doesn't support __has_builtin */
+#ifndef __has_builtin
+# define __has_builtin(x) 0
+#endif
+
+/*
+ * Define ns_bswap32 and use builtins if defined
+ */
+#if defined(_MSC_VER)
+# define ns_bswap32 _byteswap_ulong
+#elif __has_builtin(__builtin_bswap32)
+ /* Clang (and GCC >=10 via __has_builtin) */
+# define ns_bswap32 __builtin_bswap32
+#elif defined(__GNUC__) || defined(__clang__)
+ /* Older GCC/Clang: builtin exists even without __has_builtin */
+# define ns_bswap32 __builtin_bswap32
+#else
+/* Portable fallback */
+  static inline uint32_t ns_bswap32(uint32_t v) {
+    return ((v & 0x000000FFu) << 24) |
+           ((v & 0x0000FF00u) <<  8) |
+           ((v & 0x00FF0000u) >>  8) |
+           ((v & 0xFF000000u) >> 24);
+  }
+#endif
+
+#define NS_HAVE_PARSEHOST2_CONST 1
+
 #ifndef O_TEXT
 # define O_TEXT    (0)
 #endif
@@ -800,9 +881,10 @@ typedef int bool;
 # define NS_EAGAIN                   WSAEWOULDBLOCK
 # define NS_EINPROGRESS              WSAEINPROGRESS
 # define NS_EINTR                    WSAEINTR
-# ifndef ETIMEDOUT
-#  define ETIMEDOUT                  1
-# endif
+# define NS_ETIMEDOUT                WSAETIMEDOUT
+
+  /* Get last socket error */
+# define NS_SOCK_ERRNO()             WSAGetLastError()
 # ifndef P_tmpdir
 #  define P_tmpdir "c:/temp"
 # endif
@@ -811,7 +893,16 @@ typedef int bool;
 # define NS_EINPROGRESS              EINPROGRESS
 # define NS_EINTR                    EINTR
 # define NS_EAGAIN                   EAGAIN
+# define NS_ETIMEDOUT                ETIMEDOUT
+
+# define NS_SOCK_ERRNO()             (errno)
 #endif
+
+#define NS_ERRNO_WOULDBLOCK(e) \
+    ((e) == NS_EAGAIN || ((NS_EAGAIN != NS_EWOULDBLOCK) && (e) == NS_EWOULDBLOCK))
+
+#define NS_ERRNO_SHOULD_RETRY(e) \
+    ((e) == NS_EINTR || NS_ERRNO_WOULDBLOCK(e))
 
 #ifndef S_ISREG
 # define S_ISREG(m)                 ((m) & _S_IFREG)
@@ -899,6 +990,9 @@ typedef int bool;
 #endif
 #if !defined(PRIu64)
 # define PRIu64      "I64u"
+#endif
+#if !defined(PRIx64)
+# define PRIx64      "I64x"
 #endif
 
 #if !defined(SCNd64)
@@ -1163,6 +1257,7 @@ NS_EXTERN void ns_free(void *buf);
 NS_EXTERN void *ns_realloc(void *buf, size_t size) NS_ALLOC_SIZE1(2) NS_GNUC_WARN_UNUSED_RESULT;
 NS_EXTERN char *ns_strdup(const char *string) NS_GNUC_NONNULL(1) NS_GNUC_MALLOC NS_GNUC_WARN_UNUSED_RESULT;
 NS_EXTERN char *ns_strcopy(const char *string) NS_GNUC_MALLOC;
+NS_EXTERN void *ns_align_up(void *p, size_t a) NS_GNUC_NONNULL(1) NS_GNUC_PURE;
 NS_EXTERN char *ns_strncopy(const char *string, ssize_t size) NS_GNUC_MALLOC;
 NS_EXTERN int   ns_uint32toa(char *buffer, uint32_t n) NS_GNUC_NONNULL(1);
 NS_EXTERN int   ns_uint64toa(char *buffer, uint64_t n) NS_GNUC_NONNULL(1);
@@ -1171,6 +1266,104 @@ NS_EXTERN int   ns_uint64toa(char *buffer, uint64_t n) NS_GNUC_NONNULL(1);
 NS_EXTERN void *ns_memmem(const void *haystack, size_t haystackLength, const void *const needle, const size_t needleLength)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(3);
 #endif
+
+/*
+ *----------------------------------------------------------------------
+ * ns_free_const --
+ *
+ *      Wrapper around ns_free() which accepts a const-qualified pointer.
+ *      This helper explicitly discards the const qualifier before freeing,
+ *      which is occasionally needed when the ownership of a buffer is
+ *      logically transferred but its declaration was const.
+ *
+ *      The cast is wrapped in diagnostic pragmas to suppress compiler
+ *      warnings (-Wcast-qual) on GCC/Clang, as the operation is deliberate
+ *      and safe when the memory was originally obtained from ns_malloc()
+ *      or equivalent.
+ *
+ * Results:
+ *      None.
+ *
+ * Side effects:
+ *      Frees the provided memory block.
+ *
+ *----------------------------------------------------------------------
+ */
+static inline void ns_free_const(const void *p) {
+#if defined(__GNUC__) || defined(__clang__)
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wcast-qual"
+#endif
+    ns_free((void *)p);       /* dropping const is intentional here */
+#if defined(__GNUC__) || defined(__clang__)
+# pragma GCC diagnostic pop
+#endif
+}
+
+/*
+ *----------------------------------------------------------------------
+ * ns_iov_set --
+ *
+ *      Safely initialize an iovec structure with the specified base pointer
+ *      and length.  The pointer assignment is performed via memcpy to avoid
+ *      strict-aliasing and const-discard warnings when setting iov_base.
+ *      This approach is portable across compilers that treat iov_base as
+ *      a non-const void pointer.
+ *
+ * Results:
+ *      None.
+ *
+ * Side effects:
+ *      The provided iovec structure is modified in place.
+ *
+ *----------------------------------------------------------------------
+ */
+static inline void ns_iov_set(struct iovec *v, const void *base, size_t len) {
+    memcpy(&v->iov_base, &base, sizeof base); /* copy pointer value */
+    v->iov_len = len;
+}
+
+static inline void *ns_const2voidp(const void *p) {
+    void *q;
+    memcpy(&q, &p, sizeof q);   // copy pointer bits; avoids -Wcast-qual
+    return q;
+}
+
+/* Read-only wrapper: accept const table, feed Tcl a non-const lvalue. */
+static inline const Tcl_HashEntry *
+Ns_TclFindHashEntryConst(const Tcl_HashTable *t, const char *key)
+{
+    Tcl_HashTable *tw;
+    /* bit-copy the pointer; avoids a const-dropping cast and keeps -Wcast-qual happy */
+    memcpy(&tw, &t, sizeof tw);
+    return (const Tcl_HashEntry *)Tcl_FindHashEntry(tw, key);
+}
+
+/* one-word-key accessor that avoids Tcl_GetHashKey's (void*) cast */
+static inline const void *
+Ns_TclGetHashKeyValue(const Tcl_HashTable *tablePtr, const Tcl_HashEntry *e)
+{
+    /* Guard against complex key tables; keeps call sites honest. */
+    if (tablePtr->keyType == TCL_STRING_KEYS) {
+        return e->key.string;         /* const view */
+    }
+    if (tablePtr->keyType == TCL_ONE_WORD_KEYS) {
+        return (void *)e->key.oneWordValue; /* const view */
+    }
+    fprintf(stderr, "hash table %p has invalid keyType %d\n",(const void*)tablePtr, tablePtr->keyType);
+    assert(tablePtr->keyType == TCL_STRING_KEYS || tablePtr->keyType == TCL_ONE_WORD_KEYS);
+    (void)tablePtr;
+
+    return NULL;
+}
+
+static inline const char *
+Ns_TclGetHashKeyString(const Tcl_HashTable *tablePtr, const Tcl_HashEntry *e)
+{
+    assert(tablePtr->keyType == TCL_STRING_KEYS);
+    (void)tablePtr;
+    return e->key.string;
+}
 
 /*
  * mutex.c:
@@ -1235,7 +1428,7 @@ NS_EXTERN struct tm *ns_localtime(const time_t *timep)   NS_GNUC_NONNULL(1);
 NS_EXTERN struct tm *ns_localtime_r(const time_t *timer, struct tm *buf) NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
 NS_EXTERN struct tm *ns_gmtime(const time_t *timep)      NS_GNUC_NONNULL(1);
 NS_EXTERN char *ns_strtok(char *s1, const char *s2)      NS_GNUC_NONNULL(2);
-NS_EXTERN char *ns_inet_ntoa(const struct sockaddr *saPtr) NS_GNUC_RETURNS_NONNULL NS_GNUC_NONNULL(1);
+NS_EXTERN char *ns_inet_ntoa(struct sockaddr *saPtr) NS_GNUC_RETURNS_NONNULL NS_GNUC_NONNULL(1);
 
 /*
  * sema.c:
@@ -1285,7 +1478,7 @@ NS_EXTERN void Ns_GetTime(Ns_Time *timePtr) NS_GNUC_NONNULL(1);
 NS_EXTERN void Ns_AdjTime(Ns_Time *timePtr) NS_GNUC_NONNULL(1);
 NS_EXTERN void Ns_IncrTime(Ns_Time *timePtr, time_t sec, long usec)  NS_GNUC_NONNULL(1);
 NS_EXTERN Ns_Time *Ns_AbsoluteTime(Ns_Time *absPtr, Ns_Time *adjPtr)  NS_GNUC_NONNULL(1);
-NS_EXTERN Ns_Time *Ns_RelativeTime(Ns_Time *relTimePtr, Ns_Time *timePtr)  NS_GNUC_NONNULL(1);
+NS_EXTERN const Ns_Time *Ns_RelativeTime(Ns_Time *relTimePtr, const Ns_Time *timePtr)  NS_GNUC_NONNULL(1);
 NS_EXTERN long Ns_DiffTime(const Ns_Time *t1, const Ns_Time *t0, Ns_Time *resultPtr)
   NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2);
 NS_EXTERN time_t Ns_TimeToMilliseconds(const Ns_Time *timePtr)  NS_GNUC_NONNULL(1) NS_GNUC_PURE;

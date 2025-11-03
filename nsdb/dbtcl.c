@@ -269,8 +269,8 @@ CurrentHandles( Tcl_Interp *interp, Tcl_HashTable *tablePtr, Tcl_Obj *dictObj)
         Tcl_Obj     *keyv[2];
 
         keyv[0] = Tcl_NewStringObj(handlePtr->poolname, TCL_INDEX_NONE);
-        keyv[1] = Tcl_NewStringObj(Tcl_GetHashKey(tablePtr, hPtr), TCL_INDEX_NONE);
-        Tcl_DictObjPutKeyList(interp, dictObj, 2, keyv, Tcl_NewIntObj(NsDbGetActive(handlePtr)));
+        keyv[1] = Tcl_NewStringObj(Ns_TclGetHashKeyString(tablePtr, hPtr), TCL_INDEX_NONE);
+        Tcl_DictObjPutKeyList(interp, dictObj, 2, keyv, Tcl_NewIntObj(NsDbGetActive(handlePtr) ? 1 : 0));
         hPtr = Tcl_NextHashEntry(&search);
     }
 
@@ -1341,7 +1341,7 @@ QuoteValueObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T o
     Tcl_Obj    *valueObj;
     Ns_ObjvSpec args[] = {
         {"value",    Ns_ObjvObj,   &valueObj,  NULL},
-        {"?type",    Ns_ObjvIndex, &valueType, (void*)valueTypes},
+        {"?type",    Ns_ObjvIndex, &valueType, ns_const2voidp(valueTypes)},
         {NULL, NULL, NULL, NULL}
     };
 
@@ -1400,7 +1400,7 @@ QuoteListObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T ob
     Tcl_Obj    *listObj;
     Ns_ObjvSpec args[] = {
         {"list",  Ns_ObjvObj,   &listObj,   NULL},
-        {"?type", Ns_ObjvIndex, &valueType, (void*)valueTypes},
+        {"?type", Ns_ObjvIndex, &valueType, ns_const2voidp(valueTypes)},
         {NULL, NULL, NULL, NULL}
     };
 

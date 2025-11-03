@@ -71,6 +71,14 @@ static bool debugMode = NS_FALSE;
  *----------------------------------------------------------------------
  */
 
+#ifdef __APPLE__
+/* On macOS, avoid macro form of sigaddset etc. and use the real functions */
+/* Force function versions (avoid macro bit hacks that trigger -Wsign-conversion) */
+# ifdef sigaddset
+#  undef sigaddset
+# endif
+#endif
+
 void
 NsBlockSignal(int signal)
 {
@@ -447,10 +455,13 @@ ns_sock_set_blocking(NS_SOCKET sock, bool blocking)
     } else {
         result = fcntl(sock, F_SETFL, flags|O_NONBLOCK);
     }
+    if (result == -1) {
+        int err = NS_SOCK_ERRNO();
 
-    if (result == -1 && errno != NS_EAGAIN && errno != EWOULDBLOCK) {
-        Ns_Log(Notice, "ns_sock_set_blocking on sock %d blocking %d err %d <%s>",
-               sock, blocking, errno, ns_sockstrerror(errno));
+        if (!NS_ERRNO_WOULDBLOCK(err)) {
+            Ns_Log(Notice, "ns_sock_set_blocking on sock %d blocking %d err %d <%s>",
+                   sock, blocking, err, ns_sockstrerror(err));
+        }
     }
 #endif
 

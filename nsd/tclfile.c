@@ -239,7 +239,7 @@ int
 NsTclMkTempObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *const* objv)
 {
     int          result = TCL_OK, nocomplain = (int)NS_FALSE;
-    char        *templateString = (char *)NS_EMPTY_STRING;
+    const char  *templateString = NS_EMPTY_STRING;
     Ns_ObjvSpec opts[] = {
         {"-nocomplain", Ns_ObjvBool,  &nocomplain, INT2PTR(NS_TRUE)},
         {"--",          Ns_ObjvBreak, NULL, NULL},
@@ -313,7 +313,7 @@ int
 NsTclMkdTempObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *const* objv)
 {
     int          result = TCL_OK;
-    char        *templateString = (char *)NS_EMPTY_STRING;
+    const char  *templateString = NS_EMPTY_STRING;
     Ns_ObjvSpec  args[] = {
         {"?template", Ns_ObjvString, &templateString, NULL},
         {NULL, NULL, NULL, NULL}
@@ -651,7 +651,7 @@ NsTclFSeekCharsObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZ
                  */
                 p = ns_memmem(buffer, (size_t)bytesRead + movedSize, charString, searchLength);
                 if (p != NULL) {
-                    offset += (p - buffer);
+                    offset += (off_t)((p - buffer) - (ptrdiff_t)movedSize);
                     done = NS_TRUE;
                     break;
                 }
@@ -980,7 +980,7 @@ ChanListObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_O
          */
         for (hPtr = Tcl_FirstHashEntry(tabPtr, &search); hPtr != NULL;
              hPtr = Tcl_NextHashEntry(&search)) {
-            const char *key = Tcl_GetHashKey(tabPtr, hPtr);
+            const char *key = Ns_TclGetHashKeyString(tabPtr, hPtr);
             Tcl_ListObjAppendElement(interp, listObj, Tcl_NewStringObj(key, TCL_INDEX_NONE));
         }
         if (isShared != (int)NS_FALSE) {
@@ -1047,7 +1047,7 @@ ChanCleanupObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T objc, Tc
             } else {
                 (void) Tcl_UnregisterChannel(interp, regChan->chan);
             }
-            ns_free((char *)regChan->name);
+            ns_free_const(regChan->name);
             ns_free(regChan);
             Tcl_DeleteHashEntry(hPtr);
         }

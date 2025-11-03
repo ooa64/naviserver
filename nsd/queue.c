@@ -96,7 +96,7 @@ static void ServerListQueued(Tcl_DString *dsPtr, ConnPool *poolPtr)
 static int SetPoolAttribute(Tcl_Interp *interp, TCL_SIZE_T nargs, ConnPool *poolPtr, int *valuePtr, int value)
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(3) NS_GNUC_NONNULL(4);
 
-static Ns_ArgProc WalkCallback;
+static Ns_WalkProc WalkCallback;
 
 /*
  * Static variables defined in this file.
@@ -505,11 +505,15 @@ NsQueueConn(Sock *sockPtr, const Ns_Time *nowPtr)
     Conn          *connPtr = NULL;
     bool           create = NS_FALSE;
     int            queued = NS_OK;
+    Ns_Time        now;
 
     NS_NONNULL_ASSERT(sockPtr != NULL);
-    NS_NONNULL_ASSERT(nowPtr != NULL);
     assert(sockPtr->drvPtr != NULL);
 
+    if (nowPtr == NULL) {
+        Ns_GetTime(&now);
+        nowPtr = &now;
+    }
     sockPtr->drvPtr->stats.received++;
     servPtr = sockPtr->servPtr;
 
@@ -749,9 +753,9 @@ NsQueueConn(Sock *sockPtr, const Ns_Time *nowPtr)
  *----------------------------------------------------------------------
  */
 static void
-WalkCallback(Tcl_DString *dsPtr, const void *arg)
+WalkCallback(Tcl_DString *dsPtr, void *arg)
 {
-    const ConnPool *poolPtr = (ConnPool *)arg;
+    const ConnPool *poolPtr = arg;
     Tcl_DStringAppendElement(dsPtr, poolPtr->pool);
 }
 
@@ -1720,7 +1724,7 @@ NsTclServerObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T objc, Tc
                 Ns_RWLockWrLock(&servPtr->opts.rwlock);
                 Tcl_DStringAppend(dsPtr, servPtr->opts.realm, TCL_INDEX_NONE);
                 if (servPtr->opts.realm != NULL) {
-                    ns_free((void*)servPtr->opts.realm);
+                    ns_free_const(servPtr->opts.realm);
                     servPtr->opts.realm = ns_strdup(realm);
                 }
             }
@@ -2911,7 +2915,7 @@ ConnRun(Conn *connPtr)
         assert(connPtr->request.line == NULL);
     }
     if (connPtr->location != NULL) {
-        ns_free((char *)connPtr->location);
+        ns_free_const(connPtr->location);
         connPtr->location = NULL;
     }
 

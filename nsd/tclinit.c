@@ -71,7 +71,7 @@ static Ns_ObjvTable traceWhen[] = {
  * Static functions defined in this file.
  */
 
-static NsInterp *PopInterp(NsServer *servPtr, Tcl_Interp *interp)
+static NsInterp *PopInterp(const NsServer *servPtr, Tcl_Interp *interp)
     NS_GNUC_RETURNS_NONNULL;
 
 static void PushInterp(NsInterp *itPtr)
@@ -80,11 +80,11 @@ static void PushInterp(NsInterp *itPtr)
 static Tcl_HashEntry *GetCacheEntry(const NsServer *servPtr)
     NS_GNUC_RETURNS_NONNULL;
 
-static Tcl_Interp *CreateInterp(NsInterp **itPtrPtr, NsServer *servPtr)
+static Tcl_Interp *CreateInterp(NsInterp **itPtrPtr, const NsServer *servPtr)
     NS_GNUC_NONNULL(1)
     NS_GNUC_RETURNS_NONNULL;
 
-static NsInterp *NewInterpData(Tcl_Interp *interp, NsServer *servPtr)
+static NsInterp *NewInterpData(Tcl_Interp *interp, const NsServer *servPtr)
     NS_GNUC_NONNULL(1);
 
 static int UpdateInterp(NsInterp *itPtr)
@@ -284,7 +284,7 @@ ConfigServerTcl(const char *server)
                                            NS_TRUE, NS_FALSE);
         servPtr->tcl.initfile = Tcl_NewStringObj(initFileString, TCL_INDEX_NONE);
         Tcl_IncrRefCount(servPtr->tcl.initfile);
-        ns_free((char *)initFileString);
+        ns_free_const(initFileString);
 
         servPtr->tcl.modules = Tcl_NewObj();
         Tcl_IncrRefCount(servPtr->tcl.modules);
@@ -483,7 +483,7 @@ Ns_TclAllocateInterp(const char *server)
 }
 
 Tcl_Interp *
-NsTclAllocateInterp(NsServer *servPtr)
+NsTclAllocateInterp(const NsServer *servPtr)
 {
     const NsInterp *itPtr = PopInterp(servPtr, NULL);
 
@@ -1376,7 +1376,7 @@ ICtlSaveObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_O
         const char     *script = ns_strdup(Tcl_GetStringFromObj(scriptObj, &length));
 
         Ns_RWLockWrLock(&servPtr->tcl.lock);
-        ns_free((char *)servPtr->tcl.script);
+        ns_free_const(servPtr->tcl.script);
         servPtr->tcl.script = script;
         servPtr->tcl.length = length;
         if (++servPtr->tcl.epoch == 0) {
@@ -1944,7 +1944,7 @@ NsTclTraceProc(Tcl_Interp *interp, const void *arg)
  */
 
 static NsInterp *
-PopInterp(NsServer *servPtr, Tcl_Interp *interp)
+PopInterp(const NsServer *servPtr, Tcl_Interp *interp)
 {
     NsInterp      *itPtr;
     Tcl_HashEntry *hPtr;
@@ -1966,7 +1966,7 @@ PopInterp(NsServer *servPtr, Tcl_Interp *interp)
             interp = CreateInterp(&itPtr, servPtr);
         }
         if (servPtr != NULL) {
-            itPtr->servPtr = servPtr;
+            itPtr->servPtr = ns_const2voidp(servPtr);
             NsTclAddServerCmds(itPtr);
             RunTraces(itPtr, NS_TCL_TRACE_CREATE);
             if (UpdateInterp(itPtr) != TCL_OK) {
@@ -2072,7 +2072,7 @@ GetCacheEntry(const NsServer *servPtr)
         Tcl_InitHashTable(tablePtr, TCL_ONE_WORD_KEYS);
         Ns_TlsSet(&tls, tablePtr);
     }
-    return Tcl_CreateHashEntry(tablePtr, (char *) servPtr, &ignored);
+    return Tcl_CreateHashEntry(tablePtr, (const char *) servPtr, &ignored);
 }
 
 
@@ -2124,7 +2124,7 @@ NsTclCreateInterp(void) {
  *----------------------------------------------------------------------
  */
 static Tcl_Interp *
-CreateInterp(NsInterp **itPtrPtr, NsServer *servPtr)
+CreateInterp(NsInterp **itPtrPtr, const NsServer *servPtr)
 {
     NsInterp   *itPtr;
     Tcl_Interp *interp;
@@ -2229,7 +2229,7 @@ static bool InitializeInterpData(void) {
  */
 
 static NsInterp *
-NewInterpData(Tcl_Interp *interp, NsServer *servPtr)
+NewInterpData(Tcl_Interp *interp, const NsServer *servPtr)
 {
     NsInterp *itPtr;
 
@@ -2249,7 +2249,7 @@ NewInterpData(Tcl_Interp *interp, NsServer *servPtr)
     if (itPtr == NULL) {
         itPtr = ns_calloc(1u, sizeof(NsInterp));
         itPtr->interp = interp;
-        itPtr->servPtr = servPtr;
+        itPtr->servPtr = ns_const2voidp(servPtr);
         Tcl_InitHashTable(&itPtr->sets, TCL_STRING_KEYS);
         Tcl_InitHashTable(&itPtr->chans, TCL_STRING_KEYS);
         Tcl_InitHashTable(&itPtr->httpRequests, TCL_STRING_KEYS);
@@ -2349,7 +2349,7 @@ UpdateInterp(NsInterp *itPtr)
                    concurrentUpdates);
 
             itPtr->epoch = epoch;
-            ns_free((char *)script);
+            ns_free_const(script);
 
             Ns_MutexLock(&updateLock);
             concurrentUpdates--;
@@ -2560,7 +2560,7 @@ DeleteInterps(void *arg)
  *
  *----------------------------------------------------------------------
  */
-Ns_ReturnCode NsForeachHashValue(Tcl_HashTable *tablePtr, NsHashValueProc fn, void *ctx)
+Ns_ReturnCode NsForeachHashValue(Tcl_HashTable *tablePtr, NsHashValueProc fn, const void *ctx)
 {
     Ns_ReturnCode result = NS_OK;
     const Tcl_HashEntry *hPtr;
@@ -2602,7 +2602,7 @@ Ns_ReturnCode NsForeachHashValue(Tcl_HashTable *tablePtr, NsHashValueProc fn, vo
  *
  *----------------------------------------------------------------------
  */
-Ns_ReturnCode NsForeachHashKeyValue(Tcl_HashTable *tablePtr, NsHashKeyValueProc fn, void *ctx)
+Ns_ReturnCode NsForeachHashKeyValue(Tcl_HashTable *tablePtr, NsHashKeyValueProc fn, const void *ctx)
 {
     Ns_ReturnCode result = NS_OK;
     const Tcl_HashEntry *hPtr;
@@ -2610,7 +2610,7 @@ Ns_ReturnCode NsForeachHashKeyValue(Tcl_HashTable *tablePtr, NsHashKeyValueProc 
 
     hPtr = Tcl_FirstHashEntry(tablePtr, &search);
     while (hPtr != NULL) {
-        result = fn(Tcl_GetHashKey(tablePtr, hPtr), Tcl_GetHashValue(hPtr), ctx);
+        result = fn(Ns_TclGetHashKeyValue(tablePtr, hPtr), Tcl_GetHashValue(hPtr), ctx);
         if (result != NS_OK) {
             break;
         }

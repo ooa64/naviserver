@@ -65,6 +65,17 @@ static void PrebindCloseSockets(const char *proto, struct sockaddr *saPtr, struc
     NS_GNUC_NONNULL(1) NS_GNUC_NONNULL(2) NS_GNUC_NONNULL(3);
 #endif
 
+#ifdef LOGBIND
+static FILE *log_fp = NULL;
+
+static void log_bind(const char* proto, const char *addr, unsigned short port, const char*label) {
+    if (log_fp == NULL) {
+        log_fp = fopen("/tmp/binder.log", "a");
+    }
+    fprintf(log_fp, "DEBUG: prebind proto %s addr %s port %hu: %s\n",
+            proto, addr, port, label);
+}
+#endif
 
 #ifndef _WIN32
 
@@ -893,7 +904,8 @@ PrebindSockets(const char *spec)
 
     for (; line != NULL; line = next) {
         const char     *proto;
-        char           *addr, *p, *str = NULL, *end;
+        char           *p, *str = NULL, *end;
+        const char     *addr;
         unsigned short  port = 0u;
         long            reuses;
         struct Prebind *pPtr;
@@ -910,8 +922,8 @@ PrebindSockets(const char *spec)
         /*
          * Set default proto and addr.
          */
-        proto = "tcp";
-        addr = (char *)NS_IP_UNSPECIFIED;
+        proto = "*";
+        addr = NS_IP_UNSPECIFIED;
         reuses = 1;
 
         /*
@@ -935,8 +947,8 @@ PrebindSockets(const char *spec)
          *    0/icmp[/count]
          */
         {
-            char *portStr;
-            bool  hostParsedOk = Ns_HttpParseHost2(line, NS_TRUE, &addr, &portStr, &end);
+            const char *portStr;
+            bool        hostParsedOk = Ns_HttpParseHost2(line, NS_TRUE, &addr, &portStr, &end);
 
             if (hostParsedOk && line != end && addr != portStr ) {
                 long l;
@@ -946,34 +958,36 @@ PrebindSockets(const char *spec)
                 } else {
                     assert(addr != NULL);
                     l = strtol(addr, NULL, 10);
-                    addr = (char *)NS_IP_UNSPECIFIED;
+                    addr = NS_IP_UNSPECIFIED;
                 }
                 port = (l >= 0) ? (unsigned short)l : 0u;
 
+                line = end;
                 /*
                  * Parse protocol
                  */
-                if (*line != '/' && (str = strchr(line, INTCHAR('/'))) != NULL) {
-                    *str++ = '\0';
-                    proto = str;
+                if (*line == '/') {
+                    *line++ = '\0';
+                    proto = line;
                 }
             } else {
+                line = end;
                 Ns_Log(Debug, "prebind: line <%s> was not parsed ok, must be UNIX", line);
                 proto = "unix";
             }
-            /*
-             * Continue parsing after "addr:port|port"
-             */
-            line = end;
         }
 
         /*
          * TCP
          */
+#ifdef LOGBIND
+        log_bind(proto, addr, port, "try add entry");
+#endif
+
         Ns_Log(Notice, "prebind: try proto %s addr %s port %d reuses %ld",
                proto, addr, port, reuses);
 
-        if (STREQ(proto, "tcp") && port > 0) {
+        if ((STREQ(proto, "tcp") || *proto == '*') && port > 0) {
             if (Ns_GetSockAddr(saPtr, addr, port) != NS_OK) {
                 Ns_Log(Error, "prebind: tcp: invalid address: [%s]:%d", addr, port);
                 continue;
@@ -987,7 +1001,7 @@ PrebindSockets(const char *spec)
 
             Ns_LogSockaddr(Notice, "prebind adds", (const struct sockaddr *)saPtr);
 
-            pPtr = PrebindAlloc(proto, (size_t)reuses, saPtr);
+            pPtr = PrebindAlloc("tcp", (size_t)reuses, saPtr);
             if (pPtr == NULL) {
                 Tcl_DeleteHashEntry(hPtr);
                 status = NS_ERROR;
@@ -1000,7 +1014,7 @@ PrebindSockets(const char *spec)
         /*
          * UDP
          */
-        if (STREQ(proto, "udp") && port > 0) {
+        if ((STREQ(proto, "udp") || *proto == '*')  && port > 0) {
             if (Ns_GetSockAddr(saPtr, addr, port) != NS_OK) {
                 Ns_Log(Error, "prebind: udp: invalid address: [%s]:%d",
                        addr, port);
@@ -1012,7 +1026,7 @@ PrebindSockets(const char *spec)
                        addr, port);
                 continue;
             }
-            pPtr = PrebindAlloc(proto, (size_t)reuses, saPtr);
+            pPtr = PrebindAlloc("udp", (size_t)reuses, saPtr);
             if (pPtr == NULL) {
                 Tcl_DeleteHashEntry(hPtr);
                 status = NS_ERROR;
@@ -1147,20 +1161,16 @@ Ns_SockBinderListen(char type, const char *address, unsigned short port, int opt
     if (address == NULL) {
         address = NS_IP_UNSPECIFIED;
     }
+    strncpy(data, address, sizeof(data)-1);
 
     /*
      * Build and send message.
      */
-    iov[0].iov_base = (void*) &options;
-    iov[0].iov_len = sizeof(options);
-    iov[1].iov_base = (void*) &port;
-    iov[1].iov_len = sizeof(port);
-    iov[2].iov_base = (void*) &type;
-    iov[2].iov_len = sizeof(type);
-    iov[3].iov_base = (void*) data;
-    iov[3].iov_len = sizeof(data);
+    ns_iov_set(&iov[0], &options, sizeof(options));
+    ns_iov_set(&iov[1], &port,    sizeof(port));
+    ns_iov_set(&iov[2], &type,    sizeof(type));
+    ns_iov_set(&iov[3], &data,    sizeof(data));
 
-    strncpy(data, address, sizeof(data)-1);
     memset(&msg, 0, sizeof(msg));
     msg.msg_iov = iov;
     msg.msg_iovlen = 4;
@@ -1174,8 +1184,7 @@ Ns_SockBinderListen(char type, const char *address, unsigned short port, int opt
     /*
      * Receive reply.
      */
-    iov[0].iov_base = (void*) &err;
-    iov[0].iov_len = sizeof(int);
+    ns_iov_set(&iov[0], &err, sizeof(err));
     memset(&msg, 0, sizeof(msg));
     msg.msg_iov = iov;
     msg.msg_iovlen = 1;
@@ -1387,14 +1396,11 @@ Binder(void)
         /*
          * Receive a message with the following contents.
          */
-        iov[0].iov_base = (void*) &options;
-        iov[0].iov_len = sizeof(options);
-        iov[1].iov_base = (void*) &port;
-        iov[1].iov_len = sizeof(port);
-        iov[2].iov_base = (void*) &type;
-        iov[2].iov_len = sizeof(type);
-        iov[3].iov_base = (void*) address;
-        iov[3].iov_len = sizeof(address);
+        ns_iov_set(&iov[0], &options, sizeof(options));
+        ns_iov_set(&iov[1], &port,    sizeof(port));
+        ns_iov_set(&iov[2], &type,    sizeof(type));
+        ns_iov_set(&iov[3], &address, sizeof(address));
+
         memset(&msg, 0, sizeof(msg));
         msg.msg_iov = iov;
         msg.msg_iovlen = 4;
@@ -1440,8 +1446,7 @@ Binder(void)
             err = errno;
         }
 
-        iov[0].iov_base = (void*) &err;
-        iov[0].iov_len = sizeof(err);
+        ns_iov_set(&iov[0], &err, sizeof(err));
         memset(&msg, 0, sizeof(msg));
         msg.msg_iov = iov;
         msg.msg_iovlen = 1;

@@ -464,7 +464,7 @@ Ns_SetFree(Ns_Set *set)
         }
 #endif
         ns_free(set->fields);
-        ns_free((char *)set->name);
+        ns_free_const(set->name);
         ns_free(set);
     }
 }
@@ -1290,7 +1290,7 @@ void Ns_SetClearValues(Ns_Set *set, TCL_SIZE_T maxAlloc)
             const char *oldBuffer = set->data.string;
 
             set->data.string = ckalloc((size_t)maxAlloc);
-            ckfree((void*)oldBuffer);
+            ckfree(ns_const2voidp(oldBuffer));
             set->data.spaceAvl = maxAlloc;
         }
         memcpy(set->data.string, dsPtr->string, (size_t)dsPtr->length);
@@ -1415,50 +1415,57 @@ Ns_SetListFind(Ns_Set *const *sets, const char *name)
     return result;
 }
 
-
+
 /*
- *----------------------------------------------------------------------
+ * Ns_SetSplitDList --
  *
- * Ns_SetSplit --
+ *    Split the keys of a set into multiple sets grouped by a prefix,
+ *    and append these grouped sets to a destination DList.
  *
- *      Split a set into an array of new sets. This assumes that each
- *      key name in the fields of a set contains a separating
- *      character. The fields of the set are partitioned into new
- *      sets whose set names are the characters before the separator
- *      and whose field key names are the characters after the
- *      separator.
+ *    Each field name in the source set is checked for the presence of
+ *    the given separator character. If the separator is found, the part
+ *    before the separator is treated as the "group name" and the part
+ *    after the separator as the actual key. Fields without a separator
+ *    belong to a group with a NULL name.
  *
- * Results:
- *      A new set.
+ *    Example:
+ *        Input set with fields:
+ *            "db.user"  = "alice"
+ *            "db.pass"  = "secret"
+ *            "cache.ttl"= "60"
+ *            "orphan"   = "42"
  *
- * Side effects:
- *      Will allocate a new set and tuples.
+ *        With sep = '.', the result is a DList with:
+ *            Set "db"    -> { user=alice, pass=secret }
+ *            Set "cache" -> { ttl=60 }
+ *            Set NULL    -> { orphan=42 }
  *
- *----------------------------------------------------------------------
+ * Arguments:
+ *    set  - Source Ns_Set to split.
+ *    sep  - Separator character used to determine group names.
+ *    out  - Destination DList which will be appended with new or reused
+ *           Ns_Set objects containing the grouped fields.
+ *
+ * Returns:
+ *    Size of the Ns_DList.
+ *
+ * Side Effects:
+ *    - May create new Ns_Set objects and append them to the given DList.
+ *    - Temporarily modifies field names in the input set when searching
+ *      for the separator, but restores them afterwards.
+ *    - Copies all field values into the grouped sets.
  */
-
-Ns_Set **
-Ns_SetSplit(const Ns_Set *set, char sep)
+size_t
+Ns_SetSplitDList(const Ns_Set *set, char sep, Ns_DList *out)
 {
-    size_t        i;
-    Tcl_DString   ds;
-    const Ns_Set *end = NULL;
-
     NS_NONNULL_ASSERT(set != NULL);
+    NS_NONNULL_ASSERT(out != NULL);
 
-    Tcl_DStringInit(&ds);
-    Tcl_DStringAppend(&ds, (char *) &end, (TCL_SIZE_T)sizeof(Ns_Set *));
-
-    for (i = 0u; i < set->size; ++i) {
-        Ns_Set     *targetSet;
+    for (size_t i = 0; i < set->size; ++i) {
+        Ns_Set     *target = NULL;
         const char *name;
-        char       *key;
+        char       *key = strchr(set->fields[i].name, (int)sep);
 
-        /*
-         * Take the name of the new set from part of the key before the
-         * separator, or, if not found, use no name.
-         */
-        key = strchr(set->fields[i].name, (int)sep);
         if (key != NULL) {
             *key++ = '\0';
             name = set->fields[i].name;
@@ -1466,26 +1473,29 @@ Ns_SetSplit(const Ns_Set *set, char sep)
             key = set->fields[i].name;
             name = NULL;
         }
-        /*
-         * Find sets with the given name. If none found (most likely), create
-         * a new one, otherwise use put the keys to the found set.
-         */
-        targetSet = Ns_SetListFind((Ns_Set **) ds.string, name);
-        if (targetSet == NULL) {
-            Ns_Set        **sp;
 
-            targetSet = Ns_SetCreate(name);
-            targetSet->flags = set->flags;
-            sp = (Ns_Set **) (ds.string + ds.length - sizeof(Ns_Set *));
-            *sp = targetSet;
-            Tcl_DStringAppend(&ds, (char *) &end, (TCL_SIZE_T)sizeof(Ns_Set *));
+        /* Find existing set with same name */
+        for (size_t j = 0, len = out->size; j < len; ++j) {
+            Ns_Set *probe = out->data[j];
+            if ((name == NULL && probe->name == NULL)
+                || (name && probe->name && strcmp(name, probe->name) == 0)) {
+                target = probe;
+                break;
+            }
         }
-        (void)Ns_SetPut(targetSet, key, set->fields[i].value);
+
+        if (target == NULL) {
+            target = Ns_SetCreate(name);
+            target->flags = set->flags;
+            Ns_DListAppend(out, target);
+        }
+
+        (void)Ns_SetPut(target, key, set->fields[i].value);
         if (name != NULL) {
             *(key-1) = sep;
         }
     }
-    return (Ns_Set **) Ns_DStringExport(&ds);
+    return out->size;
 }
 
 
@@ -1679,7 +1689,7 @@ Ns_SetCopy(const Ns_Set *old)
 # endif
 #endif
         Ns_Log(Ns_LogNsSetDebug, "Ns_SetCopy %p '%s' to %p",
-               (void*)old, old->name, (void*)new);
+               (const void*)old, old->name, (const void*)new);
     }
 
     return new;
@@ -1783,7 +1793,7 @@ SetCopyElements(const char* msg, const Ns_Set *from, Ns_Set *const to)
 
 #ifdef NS_SET_DSTRING
     Ns_Log(Notice, "SetCopyElements %s %p '%s': %lu elements from %p to %p",
-           msg, (void*)from, from->name, from->size, (void*)from, (void*)to);
+           msg, (const void*)from, from->name, from->size, (const void*)from, (void*)to);
 
     to->size = 0u;
     for (i = 0u; i < from->size; i++) {
@@ -1919,17 +1929,17 @@ Ns_SetFormat(Tcl_DString *dsPtr, const Ns_Set *set, bool withName,
         Ns_DStringPrintf(dsPtr, "%s:\n", set->name);
     }
     for (i = 0u; i < set->size; ++i) {
-        Tcl_DStringAppend(dsPtr, leadString, -1);
+        Tcl_DStringAppend(dsPtr, leadString, TCL_INDEX_NONE);
         if (set->fields[i].name == NULL) {
             Tcl_DStringAppend(dsPtr, "(null)", 6);
         } else {
-            Tcl_DStringAppend(dsPtr, set->fields[i].name, -1);
+            Tcl_DStringAppend(dsPtr, set->fields[i].name, TCL_INDEX_NONE);
         }
-        Tcl_DStringAppend(dsPtr, separatorString, -1);
+        Tcl_DStringAppend(dsPtr, separatorString, TCL_INDEX_NONE);
         if (set->fields[i].value == NULL) {
             Tcl_DStringAppend(dsPtr, "(null)", 6);
         } else {
-            Tcl_DStringAppend(dsPtr, set->fields[i].value, -1);
+            Tcl_DStringAppend(dsPtr, set->fields[i].value, TCL_INDEX_NONE);
         }
         Tcl_DStringAppend(dsPtr, "\n", 1);
     }

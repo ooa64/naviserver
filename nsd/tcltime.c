@@ -18,17 +18,11 @@
  */
 
 #include "nsd.h"
-
-/*
- * math.h is only needed for round()
- *
- * But older Microsoft Windows compilers do not include round() in math.h!  So
- * for them, use the hack below:
- */
-#if defined(_MSC_VER) && _MSC_VER <= 1600
-static double round(double val) { return floor(val + 0.5); }
-#else
 #include <math.h>
+
+#if defined(_MSC_VER) && _MSC_VER < 1800
+# define round(x)   ((x) >= 0.0 ? floor((x) + 0.5) : ceil((x) - 0.5))
+# define lround(x)  ((long)round(x))
 #endif
 
 /*
@@ -556,12 +550,42 @@ NsTclSleepObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T o
  *----------------------------------------------------------------------
  */
 
+static bool valid_strftime_fmt(const char *s) {
+    while (*s) {
+        if (*s != '%') {
+            s++;
+            continue;
+        }
+        s++;
+        /* modifiers commonly supported: -, _, 0, ^, #, E, O */
+        while (*s == '-' || *s == '_' || *s == '0' ||
+               *s == '^' || *s == '#' || *s == 'E' || *s == 'O') {
+            s++;
+        }
+        if (*s == '\0') {
+            return false;        /* trailing '%' */
+        }
+        /* whitelist supported directives */
+        switch (*s) {
+            case 'Y': case 'm': case 'd': case 'H': case 'M': case 'S':
+            case 'y': case 'j': case 'U': case 'W': case 'V':
+            case 'a': case 'A': case 'b': case 'B': case 'c':
+            case 'x': case 'X': case 'Z': case 'z':
+            case '%':
+                s++; break;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
 int
 NsTclStrftimeObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *const* objv)
 {
     int               result = TCL_OK;
     long              sec = 0;
-    char             *fmt = (char *)"%c";
+    const char       *fmt = "%c";
     Ns_ObjvValueRange range = {0, LONG_MAX};
     Ns_ObjvSpec  args[] = {
         {"time", Ns_ObjvLong,   &sec, &range},
@@ -573,12 +597,23 @@ NsTclStrftimeObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_
         result = TCL_ERROR;
 
     } else {
-        char        buf[200];
+        char        buf[512];
         size_t      bufLength;
         time_t      t;
 
         t = sec;
+        fmt = valid_strftime_fmt(fmt) ? fmt : "%Y%m%d-%H%M%S";
+
+#if defined(__GNUC__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#endif
+
         bufLength = strftime(buf, sizeof(buf), fmt, ns_localtime(&t));
+
+#if defined(__GNUC__)
+#  pragma GCC diagnostic pop
+#endif
         if (unlikely(bufLength == 0u)) {
             Tcl_AppendStringsToObj(Tcl_GetObjResult(interp), "invalid time: ",
                                    Tcl_GetString(objv[1]), NS_SENTINEL);
@@ -716,7 +751,7 @@ DblValueToNstime( Ns_Time *timePtr, double dblValue)
          * Calculate with the positive value.
          */
         timePtr->sec = (long)(posValue);
-        timePtr->usec = (long)round((posValue - (double)timePtr->sec) * 1000000.0);
+        timePtr->usec = lround((posValue - (double)timePtr->sec) * 1000000.0);
 
         /*
          * Fill in the minus sign at the right place.
@@ -729,14 +764,16 @@ DblValueToNstime( Ns_Time *timePtr, double dblValue)
 
     } else {
         timePtr->sec = (long)(dblValue);
-        timePtr->usec = (long)round((dblValue - (double)timePtr->sec) * 1000000.0);
+        timePtr->usec = lround((dblValue - (double)timePtr->sec) * 1000000.0);
     }
     /* fprintf(stderr, "gen dbltime %f final sec %ld usec %.06ld float %.10f %.10f long %ld\n",
-       dblValue, timePtr->sec, timePtr->usec,
-       (dblValue - (double)timePtr->sec),
-       round((dblValue - (double)timePtr->sec) * 1000000.0),
-       (long)((dblValue - (double)timePtr->sec)));
-    */
+            dblValue, timePtr->sec, timePtr->usec,
+            (dblValue - (double)timePtr->sec),
+            ((dblValue - (double)timePtr->sec) * 1000000.0 >= 0.0)
+               ? floor((dblValue - (double)timePtr->sec) * 1000000.0 + 0.5)
+               : ceil((dblValue - (double)timePtr->sec) * 1000000.0 - 0.5),
+            (long)((dblValue - (double)timePtr->sec)));
+     */
 }
 
 
@@ -843,11 +880,14 @@ GetTimeFromString(Tcl_Interp *interp, const char *str, char separator, Ns_Time *
                             p ++;
                         }
                         if (isNegative) {
+                            long long tmp = llabs(tPtr->sec);
+                            double secAbs = (double)tmp;
+
                             /* fprintf(stderr, "GetTimeFromString neg value\n"
                                "GetTimeFromString multiplier %.10f sec %ld dblFraction %.12f\n",
                                multiplier, tPtr->sec, dblFraction);*/
-                            DblValueToNstime(tPtr, -1 *
-                                             multiplier * ((double)llabs(tPtr->sec) + dblFraction));
+                            DblValueToNstime(tPtr, -1 * multiplier * (secAbs + dblFraction));
+
                         } else {
                             DblValueToNstime(tPtr, multiplier * ((double)tPtr->sec + dblFraction));
                         }

@@ -31,7 +31,7 @@
  * CRLF (see e.g. RFC 2616 section 3.6.1). It has to fit the maximum
  * number of digits of a 64 byte number is 8, plus CRLF + NULL.
  */
-#define MAX_CHARS_CHUNK_HEADER 12
+#define MAX_CHARS_CHUNK_HEADER  ( (sizeof(size_t) * 2u) + 2u + 1u )
 
 
 /*
@@ -80,8 +80,7 @@ Ns_ConnWriteChars(Ns_Conn *conn, const char *buf, size_t toWrite, unsigned int f
 {
     struct iovec sbuf;
 
-    sbuf.iov_base = (void *) buf;
-    sbuf.iov_len  = toWrite;
+    ns_iov_set(&sbuf, buf, toWrite);
     return Ns_ConnWriteVChars(conn, &sbuf, 1, flags);
 }
 
@@ -176,7 +175,7 @@ Ns_ConnWriteVChars(Ns_Conn *conn, struct iovec *bufs, int nbufs, unsigned int fl
 static int
 CheckCompress(const Conn *connPtr, const struct iovec *bufs, int nbufs, unsigned int ioflags)
 {
-    const Ns_Conn  *conn = (Ns_Conn *) connPtr;
+    const Ns_Conn  *conn = (const Ns_Conn *)connPtr;
     const NsServer *servPtr;
     int             configuredCompressionLevel, compressionLevel = 0;
 
@@ -241,9 +240,7 @@ Ns_ConnWriteData(Ns_Conn *conn, const void *buf, size_t toWrite, unsigned int fl
 {
     struct iovec vbuf;
 
-    vbuf.iov_base = (void *) buf;
-    vbuf.iov_len  = toWrite;
-
+    ns_iov_set(&vbuf, buf, toWrite);
     return Ns_ConnWriteVData(conn, &vbuf, 1, flags);
 }
 
@@ -298,8 +295,21 @@ Ns_ConnWriteVData(Ns_Conn *conn, struct iovec *bufs, int nbufs, unsigned int fla
      */
 
     if (((conn->flags & NS_CONN_SENTHDRS) == 0u)) {
+        bool pushIOVec;
+
         conn->flags |= NS_CONN_SENTHDRS;
-        if (Ns_CompleteHeaders(conn, bodyLength, flags, &ds) == NS_TRUE) {
+#if defined(USE_ENCODE_HEADERS)
+        pushIOVec = Ns_FinalizeResponseHeaders(conn, bodyLength, flags, &ds, NULL);
+#else
+
+        /* Notice: Ns_CompleteHeaders flags 0040
+            Notice: Ns_CompleteHeaders connPtr->responseLength -1 conn->request.version 1.100000 connPtr->keep -1 no multipart 0
+        */
+
+        pushIOVec = Ns_CompleteHeaders(conn, bodyLength, flags, &ds);
+#endif
+
+        if (pushIOVec) {
             toWrite += Ns_SetVec(sbufPtr, sbufIdx++, ds.string, (size_t)ds.length);
             nsbufs++;
         }
@@ -308,7 +318,6 @@ Ns_ConnWriteVData(Ns_Conn *conn, struct iovec *bufs, int nbufs, unsigned int fla
     /*
      * Send body.
      */
-
     if ((conn->flags & NS_CONN_SKIPBODY) == 0u) {
 
         if ((conn->flags & NS_CONN_CHUNK) == 0u) {
@@ -617,9 +626,7 @@ Ns_ConnPuts(Ns_Conn *conn, const char *s)
     NS_NONNULL_ASSERT(conn != NULL);
     NS_NONNULL_ASSERT(s != NULL);
 
-    vbuf.iov_base = (void *) s;
-    vbuf.iov_len  = strlen(s);
-
+    ns_iov_set(&vbuf, s, strlen(s));
     return Ns_ConnWriteVData(conn, &vbuf, 1, NS_CONN_STREAM);
 }
 
@@ -683,8 +690,9 @@ Ns_ConnSend(Ns_Conn *conn, struct iovec *bufs, int nbufs)
         towrite += bufs[i].iov_len;
     }
 
-    if (towrite == 0u) {
+    if (nbufs == 0) {
         sent = 0;
+        Ns_Log(Debug, "Ns_ConnSend: nothing to queue");
 
     } else if (NsWriterQueue(conn, towrite, NULL, NULL, NS_INVALID_FD,
                              bufs, nbufs, NULL, 0, NS_FALSE) == NS_OK) {
@@ -845,10 +853,9 @@ Ns_ConnWrite(Ns_Conn *conn, const void *buf, size_t toWrite)
     int           result;
     struct iovec  vbuf;
 
-    vbuf.iov_base = (void *) buf;
-    vbuf.iov_len  = toWrite;
-
+    ns_iov_set(&vbuf, buf, toWrite);
     n = connPtr->nContentSent;
+
     status = Ns_ConnWriteVData(conn, &vbuf, 1, 0u);
     if (status == NS_OK) {
         result = (int)connPtr->nContentSent - (int)n;
@@ -867,9 +874,7 @@ Ns_WriteConn(Ns_Conn *conn, const char *buf, size_t toWrite)
 
     NS_NONNULL_ASSERT(conn != NULL);
 
-    vbuf.iov_base = (void *) buf;
-    vbuf.iov_len  = toWrite;
-
+    ns_iov_set(&vbuf, buf, toWrite);
     return Ns_ConnWriteVData(conn, &vbuf, 1, NS_CONN_STREAM);
 }
 
@@ -878,9 +883,7 @@ Ns_WriteCharConn(Ns_Conn *conn, const char *buf, size_t toWrite)
 {
     struct iovec sbuf;
 
-    sbuf.iov_base = (void *)buf;
-    sbuf.iov_len = toWrite;
-
+    ns_iov_set(&sbuf, buf, toWrite);
     return Ns_ConnWriteVChars(conn, &sbuf, 1, NS_CONN_STREAM);
 }
 #endif
@@ -1265,6 +1268,14 @@ Ns_CompleteHeaders(Ns_Conn *conn, size_t dataLength,
         if ((flags & NS_CONN_STREAM) != 0u) {
 
             conn->flags |= NS_CONN_STREAM;
+            Ns_Log(Debug, "Ns_CompleteHeaders connPtr->responseLength %ld conn->request.version %f"
+                   " connPtr->keep %d no multipart %d",
+                   connPtr->responseLength,
+                   conn->request.version ,
+                   connPtr->keep,
+                   HdrEq(connPtr->outputheaders, "content-type",
+                         "multipart/byteranges", 20 )
+                   );
 
             if ((connPtr->responseLength < 0)
                 && (conn->request.version > 1.0)
@@ -1294,6 +1305,7 @@ Ns_CompleteHeaders(Ns_Conn *conn, size_t dataLength,
 
         if ((conn->flags & NS_CONN_CHUNK) != 0u) {
             Ns_ConnSetHeadersSz(conn, "transfer-encoding", 17, "chunked", 7);
+            Ns_Log(Debug, "Ns_CompleteHeaders transfer-encodeing: chunked");
         }
         Ns_ConnConstructHeaders(conn, dsPtr);
         success = NS_TRUE;
@@ -1301,6 +1313,209 @@ Ns_CompleteHeaders(Ns_Conn *conn, size_t dataLength,
 
     return success;
 }
+
+#if defined(USE_ENCODE_HEADERS)
+static void
+HdrPlanFraming(Ns_Conn *conn, size_t bodyLength, unsigned int flags)
+{
+    Conn *connPtr = (Conn*)conn;
+
+    if ((flags & NS_CONN_STREAM) != 0u) {
+        conn->flags |= NS_CONN_STREAM;
+
+        Ns_Log(Debug, "HdrPlanFraming connPtr->responseLength %ld conn->request.version %f"
+               " connPtr->keep %d / %d no multipart %d",
+               connPtr->responseLength,
+               conn->request.version ,
+               connPtr->keep,CheckKeep(connPtr),
+               HdrEq(connPtr->outputheaders, "content-type",
+                     "multipart/byteranges", 20 )
+               );
+
+        if ((connPtr->responseLength < 0)
+         && (conn->request.version > 1.0)
+         && (connPtr->keep != 0)
+         && (HdrEq(connPtr->outputheaders, "content-type",
+                   "multipart/byteranges", 20) == NS_FALSE)) {
+            conn->flags |= NS_CONN_CHUNK;
+        }
+    } else if (connPtr->responseLength < 0) {
+        Ns_ConnSetLengthHeader(conn, bodyLength, NS_FALSE);
+    }
+
+    /* HTTP/1 keep-alive header (harmless for H3; it will be filtered out) */
+    connPtr->keep = (CheckKeep(connPtr) ? 1 : 0);
+    Ns_ConnSetHeadersSz(conn, "connection", 10,
+                        (connPtr->keep != 0) ? "keep-alive" : "close",
+                        (connPtr->keep != 0) ? 10 : 5);
+
+    if ((conn->flags & NS_CONN_CHUNK) != 0u) {
+        Ns_Log(Debug, "HdrPlanFraming transfer-encodeing: chunked");
+        Ns_ConnSetHeadersSz(conn, "transfer-encoding", 17, "chunked", 7);
+    }
+}
+
+static const Ns_Set *
+HdrMergeExtra(const Ns_Conn *conn)
+{
+    const Conn     *connPtr  = (const Conn*)conn;
+    const NsServer *servPtr  = connPtr->poolPtr->servPtr;
+    const Ns_Sock  *sockPtr  = Ns_ConnSockPtr(conn);
+    Ns_Set         *headers  = conn->outputheaders;
+    Tcl_DString     ds;
+
+    assert(headers != NULL);
+    assert(sockPtr != NULL);
+    assert(sockPtr->driver != NULL);
+
+    Tcl_DStringInit(&ds);
+    (void)Ns_HttpTime(&ds, NULL);
+    Ns_SetUpdateSz(headers,
+                   "date", 4,
+                   ds.string, ds.length);
+
+
+    if (!servPtr->opts.stealthmode) {
+        Tcl_DStringSetLength(&ds, 0);
+        Ns_DStringVarAppend(&ds, Ns_InfoServerName(), "/", Ns_InfoServerVersion(), NS_SENTINEL);
+        Ns_SetUpdateSz(headers,
+                       "server", 6,
+                       ds.string, ds.length);
+    }
+    Tcl_DStringFree(&ds);
+
+    /*
+     * Handle alt-svc only for HTTPS connections via HTTP/1
+     */
+    if (STREQ(sockPtr->driver->type, "nsssl")) {
+        NsTlsAddOutputHeaders(headers, sockPtr);
+    }
+
+    if (servPtr->opts.extraHeaders != NULL) {
+        Ns_SetIMerge(headers, servPtr->opts.extraHeaders);
+    }
+    if (sockPtr->driver->extraHeaders != NULL) {
+        Ns_SetIMerge(headers, sockPtr->driver->extraHeaders);
+    }
+    return headers;
+}
+
+static void
+HdrSanitizeValue(const char *value, Tcl_DString *out)
+{
+    const char *p = value, *lb;
+    while ((lb = strchr(p, '\n')) != NULL) {
+        Tcl_DStringAppend(out, p, (TCL_SIZE_T)(lb - p));
+        Tcl_DStringAppend(out, "\n\t", 2);
+        p = lb + 1;
+    }
+    Tcl_DStringAppend(out, p, TCL_INDEX_NONE);
+}
+
+/* Default implementation used by HTTP/1 driver */
+static bool
+h1_headersEncodeProc(Ns_Conn *conn,
+                      const Ns_Set *merged,
+                      void *out_obj,
+                      size_t *out_len)   /* optional: set to ds.length */
+{
+    Tcl_DString    *dsPtr = (Tcl_DString *)out_obj;
+    const Conn     *connPtr = (const Conn *)conn;
+    const NsServer *servPtr = connPtr->poolPtr->servPtr;
+
+    if (dsPtr == NULL) {
+        if (out_len != NULL) {
+            *out_len = 0u;
+        }
+        return NS_FALSE;
+    }
+
+    /* Status line */
+    Ns_DStringPrintf(dsPtr, "HTTP/%.1f %d %s\r\n",
+                     MIN(connPtr->request.version, 1.1),
+                     connPtr->responseStatus,
+                     NsHttpStatusPhrase(connPtr->responseStatus));
+
+    if (servPtr->opts.h3enabled) {
+        const Ns_Sock *sockPtr = Ns_ConnSockPtr(conn);
+        Driver        *drvPtr = (Driver*)(sockPtr->driver);
+        Ns_DStringPrintf(dsPtr, "alt-svc: h3=\":%hu\"; ma=86400; persist=1\r\n", drvPtr->port);
+        Ns_Log(Debug, "quic: added <Alt-Svc: h3=\":%hu\"; ma=86400; persist=1>", drvPtr->port);
+    }
+
+    /* Emit merged headers, sanitized */
+    if (merged != NULL) {
+        for (size_t i = 0u; i < Ns_SetSize(merged); ++i) {
+            const char *key   = Ns_SetKey(merged, i);
+            const char *value = Ns_SetValue(merged, i);
+            if (key != NULL && value != NULL) {
+                const char *lineBreak = strchr(value, INTCHAR('\n'));
+
+                if (lineBreak == NULL) {
+                    Ns_DStringVarAppend(dsPtr, key, ": ", value, "\r\n", NS_SENTINEL);
+                } else {
+                    Tcl_DString sanitize;
+                    /*
+                     * We have to sanititize the header field to avoid
+                     * an HTTP response splitting attack. After each
+                     * newline in the value, we insert a TAB character
+                     * (see Section 4.2 in RFC 2616)
+                     */
+                    Tcl_DStringInit(&sanitize);
+                    HdrSanitizeValue(value, &sanitize);
+                    Ns_DStringVarAppend(dsPtr, key, ": ",
+                                        Tcl_DStringValue(&sanitize), "\r\n", NS_SENTINEL);
+                    Tcl_DStringFree(&sanitize);
+                }
+            }
+        }
+    }
+
+    Ns_Log(Ns_LogRequestDebug, "response headers:\n%s", dsPtr->string);
+    Tcl_DStringAppend(dsPtr, "\r\n", 2);
+    return NS_TRUE;
+}
+
+/* Replacement for Ns_CompleteHeaders */
+bool
+Ns_FinalizeResponseHeaders(Ns_Conn *conn,
+                           size_t bodyLength,
+                           unsigned int flags,
+                           void *out_obj,          /* e.g., Tcl_DString* for HTTP/1; NsH3HeaderBlock* for H3 */
+                           size_t *out_len)        /* optional: bytes (HTTP/1) or nv count (H3) */
+{
+    Ns_HeadersEncodeProc *encodeProc;
+    const Ns_Set         *merged;
+
+    NS_NONNULL_ASSERT(conn != NULL);
+
+    if ((conn->flags & NS_CONN_SKIPHDRS) != 0u) {
+        if (conn->request.version < 1.0) {
+            ((Conn*)conn)->keep = 0;
+        }
+        if (out_len) *out_len = 0u;
+        return NS_FALSE;
+    } else {
+
+        /* Decide framing and hop-by-hop semantics for this protocol (here: HTTP/1 rules) */
+        HdrPlanFraming(conn, bodyLength, flags);
+
+        /* Merge server/driver extra headers into outputheaders (outputheaders keep precedence) */
+        merged = HdrMergeExtra(conn);
+
+        /* Dispatch to the active driver’s header encoder */
+        {
+            const Ns_Sock *sockPtr = Ns_ConnSockPtr(conn);
+            const Driver  *drvPtr  = (Driver*)sockPtr->driver;
+            encodeProc = (drvPtr->headersEncodeProc != NULL)
+                ? drvPtr->headersEncodeProc
+                : h1_headersEncodeProc;
+        }
+    }
+
+    return encodeProc(conn, merged, out_obj, out_len);
+}
+#endif
 
 
 /*
