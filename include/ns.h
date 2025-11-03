@@ -3128,11 +3128,11 @@ NS_EXTERN bool
 Ns_SockInErrorState(const Ns_Sock *sock) NS_GNUC_PURE
     NS_GNUC_NONNULL(1);
 
-unsigned short
+NS_EXTERN unsigned short
 Ns_SockGetPort(const Ns_Sock *sock)
     NS_GNUC_NONNULL(1);
 
-const char *
+NS_EXTERN const char *
 Ns_SockGetAddr(const Ns_Sock *sock)
     NS_GNUC_NONNULL(1);
 
