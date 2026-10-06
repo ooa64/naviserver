@@ -537,10 +537,13 @@ NsTclFTruncateObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, int objc
  *
  *----------------------------------------------------------------------
  */
+
+#define FSEEKCHARS_BUFFER_SIZE 32768
+
 int
-NsTclFSeekCharsObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, int objc, Tcl_Obj *const* objv)
+NsTclFSeekCharsObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *const* objv)
 {
-    static const int  bufferSize = 32768; //256;
+    static const int  bufferSize = FSEEKCHARS_BUFFER_SIZE;
     int               result = TCL_OK;
     Tcl_Channel       channel;
     char             *channelString, *charString;
@@ -570,7 +573,7 @@ NsTclFSeekCharsObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, int obj
 
         } else {
             int     fd = PTR2INT(channelData);
-            char    buffer[bufferSize];
+            char    buffer[FSEEKCHARS_BUFFER_SIZE];
             ssize_t bytesRead;
             off_t   offset = 0;
             bool    done = NS_FALSE;
