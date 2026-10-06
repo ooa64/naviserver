@@ -16,13 +16,32 @@
 #
 # 4. nmake -f Makefile.win32
 #
+# TCL - tcl install dir
+# TCLLIB - tcl library name at %TCL%\lib
+# OPENSSL - openssl install dir
+# INSTALLDIR - install path
+#
 
+!if "" == "$(TCL)"
 tcl_64 = C:\P\Tcl-64-8.6
 #tcl_64 = C:\P\ActiveTcl
 tcl_32 = C:\P\Tcl-32
+!else
+tcl_64 = $(TCL)
+tcl_32 = $(TCL)
+!endif
 
+!if "" == "$(TCLLIB)"
 tcllib_64 = tcl86t.lib
 tcllib_32 = tcl85.lib
+!else
+tcllib_64 = $(TCLLIB)
+tcllib_32 = $(TCLLIB)
+!endif
+
+!if "" == "$(TCLSH)"
+TCLSH = tclsh
+!endif
 
 !if "" == "$(TARGET_CPU)"
 TARGET_CPU = $(VSCMD_ARG_TGT_ARCH)
@@ -83,6 +102,8 @@ DEBUG=1
 
 PWD = $(MAKEDIR)
 PEM_FILE  = tests/testserver/etc/server.pem
+PEM_PRIVATE = tests/testserver/etc/myprivate.pem
+PEM_PUBLIC  = tests/testserver/etc/mypublic.pem
 SSLCONFIG = tests/testserver/etc/openssl.cnf
 
 # nmake command to exec for each module:
@@ -124,7 +145,7 @@ NMAKE = nmake /nologo TCLPATH="$(TCLPATH)" TCLLIB="$(TCLLIB)" LIB="$(LIB)" DEBUG
 # --atp@piskorski.com, 2014/10/10 17:25 EDT
 
 core_targets = _nsthread _nsd _nscgi _nscp _nsdb _nsdbtest _nssock _nslog _nsperm _nsssl _nsproxy
-module_targets = _nsoracle
+module_targets = _nsoracle _nszlib
 
 tgts_core_clean = $(core_targets:_=C)
 tgts_modl_clean = $(module_targets:_=C)
@@ -165,20 +186,42 @@ $(tgts_modl_clean):
 	pushd "..\$(@:C=)" & $(NMAKE) -f Makefile.win32 clean & popd )
 
 _nsversion:
-	tclsh win32-util/configure.tcl
+	$(TCLSH) win32-util/configure.tcl
 _install:
-	tclsh win32-util/install-nsd.tcl -i 1
+!if "" == "$(INSTALLDIR)"
+	$(TCLSH) win32-util/install-nsd.tcl -i 1 -m "$(module_targets:_=)"
+!else
+	$(TCLSH) win32-util/install-nsd.tcl -i 1 -t $(INSTALLDIR)\ -c 0 -m "$(module_targets:_=)"
+!endif
 
 _cert: $(PEM_FILE)
-$(PEM_FILE):
-	openssl req -new -config $(SSLCONFIG) -x509 -nodes -sha1 -days 365 -keyout $(PEM_FILE) -out $(PEM_FILE)
-	openssl dhparam 1024 >> $(PEM_FILE)
+$(PEM_FILE): $(PEM_PRIVATE)
+	openssl genrsa 2048 > host.key
+	openssl req -new -config $(SSLCONFIG) -x509 -nodes -sha1 -days 365 -key host.key > host.cert
+	cat host.cert host.key > server.pem
+	rm -rf host.cert host.key
+	openssl dhparam 1024 >> server.pem
+	mv server.pem $(PEM_FILE)
+
+$(PEM_PRIVATE):
+	openssl genrsa -out $(PEM_PRIVATE) 512
+	openssl rsa -in $(PEM_PRIVATE) -pubout > $(PEM_PUBLIC)
+
+
+# Appending to PATH can get lots of duplicate paths, causing the tests
+# to fail with this error:
+#   NMAKE : fatal error U1095: expanded command line [...] too long
+# So instead we smash the PATH explicitly here:
+_path:
+	PATH=$(PWD)\nsd;$(PWD)\nsthread;$(PWD)\nsdb;$(PWD)\nsproxy;$(TCLPATH)\bin;$(OPENSSL)\bin;C:\P\ps;C:\Windows\system32
 
 # Nmake has NO GOOD WAY to save the output of a shell command into a variable!
 # Thus we use a static output filename here, rather than e.g. embedding the current date/time.
 # Fortunately command output redirection works essentially the same way as in Unix.
-_test:
-	PATH=$(PWD)\nsd;$(PWD)\nsthread;$(PWD)\nsdb;$(PWD)\nsproxy;$(PATH) & $(PWD)\nsd\nsd.exe -c -t $(PWD)/tests/test.nscfg $(PWD)/tests/all.tcl 1>> test-win-out-0.txt 2>&1
+_test: _path
+	rem $(PWD)\nsd\nsd.exe -h
+	rem depends $(PWD)\nsd\nsd.exe
+	$(PWD)\nsd\nsd.exe -c -t $(PWD)/tests/test.nscfg $(PWD)/tests/all.tcl -notfile ns_proxy.test 1>> test-win-out-0.txt 2>&1
 
-_test_one:
-	PATH=$(PWD)\nsd;$(PWD)\nsthread;$(PWD)\nsdb;$(PWD)\nsproxy;$(PATH) & $(PWD)\nsd\nsd.exe -c -t $(PWD)/tests/test.nscfg $(PWD)/tests/all.tcl -verbose sp -file ns_thread.test
+_test_one: _path
+	$(PWD)\nsd\nsd.exe -c -t $(PWD)/tests/test.nscfg $(PWD)/tests/all.tcl -verbose sp -file ns_thread.test

@@ -105,7 +105,12 @@ proc copy_catch {from to} {
    # files.  Looks like the -force has no effect when recursively copying
    # whole directory trees:  --atp@piskorski.com, 2004/06/24 00:58 EDT
 
-   if { [catch { file copy -force -- "$from" "$to" } errmsg] } {
+   # FIXED: recursively copy/overwrite whole directory trees. ooa64@ua.fm
+   if { [file isdirectory "$from"] && [file isdirectory "$to"] } {
+       foreach f [glob -directory $from -nocomplain *] {
+           copy_catch $f [file join $to [file tail $from]]
+       }
+   } elseif { [catch { file copy -force -- "$from" "$to" } errmsg] } {
       if { [string match {*error copying*file already exists*} $errmsg] } {
          puts "Notice: Did NOT overwrite these files:\n  $errmsg"
       } else {

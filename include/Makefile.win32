@@ -158,10 +158,15 @@ HAVE_OPENSSL_EVP_H=1
 # - openssl-1.0.2q-x64_86-win64.zip, openssl-1.0.2q-x64_86-win64_LinkLibs.zip
 #   Use:  openssl_libs = ssleay32.lib libeay32.lib
 
+!if "" == "$(OPENSSL)"
 openssl_64 = C:\P\OpenSSL-Win64
 openssl_32 = C:\P\OpenSSL-Win32
 #openssl_64 = C:\P\openssl-indy_1.0.2q\64
 #openssl_32 = C:\P\openssl-indy_1.0.2q\32
+!else
+openssl_64 = $(OPENSSL)
+openssl_32 = $(OPENSSL)
+!endif
 
 # Make sure you also add e.g. C:\P\OpenSSL-Win64\bin to your system PATH,
 # so that NaviServer finds the libssl*.dll it needs when it runs.
@@ -269,7 +274,7 @@ LIBS	= $(LIBS) tcl84t.lib
 # Common compiler and linker options.
 #
 
-COPTS	= /W3 /nologo /c /EHsc /DEBUG
+COPTS	= /W3 /nologo /c /EHsc
 
 DEFS	= $(DEFS) /D "_WINDOWS" /D "TCL_THREADS=1" \
 		  /D "FD_SETSIZE=128" /D "_MBCS" \
@@ -338,7 +343,7 @@ PGMLIBS  = $(PGMLIBS) $(DLLLIB)
 
 !if "$(DEBUG)" == "1"
 COPTS	= $(COPTS) /MDd /Od /Zi /RTC1
-DEFS	= $(DEFS) /D "_DEBUG"
+DEFS	= $(DEFS) /DEBUG /D "_DEBUG"
 LOPTS	= $(LOPTS) /DEBUG
 !else
 COPTS	= $(COPTS) /MD /O2
