@@ -215,6 +215,10 @@ MSVC++ 14.2 _MSC_VER == 1920 (Visual Studio 2019 version 16.0)
 #   define HAVE_UINTPTR_T
 #  endif
 
+#  ifndef SSIZE_MAX
+#   define SSIZE_MAX PTRDIFF_MAX
+#  endif
+
 # else
 /*
  * MinGW
