@@ -175,12 +175,20 @@ test ns_config-6.2 {multiple values, return all} -body {
     ns_config -all ns/testconfig multiple
 } -result {on off}
 
-test ns_config-6.3 {multiple values, return bool} -body {
+test ns_config-6.3 {multiple values, return single bool} -body {
     ns_config -bool ns/testconfig multiple
+} -result {on}
+
+test ns_config-6.3.1 {multiple values, return bool} -body {
+    ns_config -all -bool ns/testconfig multiple
 } -returnCodes {error ok} -result {ns_config: -bool flag implies a single value, but got 2 values}
 
-test ns_config-6.4 {multiple values, return int} -body {
+test ns_config-6.4 {multiple values, return single int} -body {
     ns_config -int ns/testconfig multiple
+} -result {on}
+
+test ns_config-6.4.1 {multiple values, return int} -body {
+    ns_config -all -int ns/testconfig multiple
 } -returnCodes {error ok} -result {ns_config: -int flag implies a single value, but got 2 values}
 
 test ns_config-6.5 {single value, without -all} -body {

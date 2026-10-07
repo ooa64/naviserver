@@ -235,11 +235,11 @@ NsTclConfigObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T 
             /*
              * We got multiple values
              */
-            if (isBool != 0) {
+            if (all && isBool != 0) {
                 Ns_TclPrintfResult(interp, "ns_config: -bool flag implies a single value, but got %ld values", count);
                 status = TCL_ERROR;
 
-            } else if (isInt != 0) {
+            } else if (all && isInt != 0) {
                 Ns_TclPrintfResult(interp, "ns_config: -int flag implies a single value, but got %ld values", count);
                 status = TCL_ERROR;
 
