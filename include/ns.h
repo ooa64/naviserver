@@ -3275,11 +3275,11 @@ NS_EXTERN bool
 Ns_ErrorCodeGetErrno(unsigned long errorCode, int *errnoPtr)
     NS_GNUC_NONNULL(2);
 
-unsigned short
+NS_EXTERN unsigned short
 Ns_SockGetPort(const Ns_Sock *sock)
     NS_GNUC_NONNULL(1);
 
-const char *
+NS_EXTERN const char *
 Ns_SockGetAddr(const Ns_Sock *sock)
     NS_GNUC_NONNULL(1);
 
