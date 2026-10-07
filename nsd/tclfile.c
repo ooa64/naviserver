@@ -268,8 +268,16 @@ NsTclMkTempObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T 
             /*
              * Delete and close the file, that we do not need.
              */
+#ifdef _WIN32
+            /*
+             * In Windows, you cannot delete a file opened in this way before closing it.
+             */ 
+            (void) close(fd);
+            (void) unlink(buffer);
+#else
             (void) unlink(buffer);
             (void) close(fd);
+#endif
             if (nocomplain == (int)NS_FALSE) {
                 Tcl_DString ds;
 
