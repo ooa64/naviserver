@@ -236,19 +236,17 @@ NsTclConfigObjCmd(ClientData UNUSED(clientData), Tcl_Interp *interp, TCL_SIZE_T 
             /*
              * We got multiple values
              */
-            if (all) {
-                if (isBool != 0) {
-                    Ns_TclPrintfResult(interp, "ns_config: -bool flag implies a single value, but got %ld values", count);
-                    status = TCL_ERROR;
+            if (all && isBool != 0) {
+                Ns_TclPrintfResult(interp, "ns_config: -bool flag implies a single value, but got %ld values", count);
+                status = TCL_ERROR;
 
-                } else if (isInt != 0) {
-                    Ns_TclPrintfResult(interp, "ns_config: -int flag implies a single value, but got %ld values", count);
-                    status = TCL_ERROR;
+            } else if (all && isInt != 0) {
+                Ns_TclPrintfResult(interp, "ns_config: -int flag implies a single value, but got %ld values", count);
+                status = TCL_ERROR;
 
-                } else {
-                    ReturnAllValues(interp, all, dlPtr);
+            } else if (all) {
+                ReturnAllValues(interp, all, dlPtr);
 
-                } 
             } else {
                 Ns_Log(Warning, "ns_config: returns the first of %ld values (section '%s' key '%s')",
                        count, section, keyString);
