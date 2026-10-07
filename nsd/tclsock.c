@@ -1045,9 +1045,9 @@ AppendReadyFiles(Tcl_Interp *interp, Tcl_Obj *listObj,
 
 
 #ifdef _WIN32
-                if (sock >= FD_SETSIZE) {
-#else
                 if (0) {
+#else
+                if (sock >= FD_SETSIZE) {
 #endif
                     Ns_Log(Error, "sock returned from channel out of range: %ld",
                            (long)sock);
@@ -1182,9 +1182,9 @@ GetSet(Tcl_Interp *interp, const char *flist, int write, fd_set **setPtrPtr,
             assert(sock != NS_INVALID_SOCKET);
 
 #ifdef _WIN32
-            if (sock >= FD_SETSIZE) {
-#else
             if (0) {
+#else
+            if (sock >= FD_SETSIZE) {
 #endif
                 Ns_TclPrintfResult(interp,
                                    "sock returned from channel out of range: %ld",
