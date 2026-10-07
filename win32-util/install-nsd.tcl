@@ -157,14 +157,17 @@ proc install_naviserver_core {core_dir install_dir} {
    # while AOLserver used to put them into modules/tcl/:
    set cp_list {
       tcl                      {}
+      revproxy/revproxy-ns-connchan-procs.tcl tcl/
+      revproxy/revproxy-ns-http-procs.tcl     tcl/
+      revproxy/revproxy-procs.tcl             tcl/
+      ca-bundle.crt            {}
+      certificates/            {}
       contrib/examples         pages/
       win32/test/servers/test  servers/
       win32/test/nsd.tcl       servers/test/
-      ca-bundle.crt            {}
-      tests/testserver/certificates/server.pem certificates/
    }
-   foreach ff [list nsd-config.tcl simple-config.tcl openacs-config.tcl sample-config.tcl] {
-      lappend cp_list $ff {conf/}
+   foreach ff [list nsd-config.d openacs-config.d nsd-config.tcl simple-config.tcl openacs-config.tcl sample-config.tcl] {
+      lappend cp_list conf/$ff {conf/}
    }
    foreach ff [list index.adp install-from-repository.tcl tests] {
       lappend cp_list $ff {pages/}

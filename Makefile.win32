@@ -6,37 +6,36 @@
 #    automatically picks between Makefile.module (for Unix via Gnu
 #    make) and Makefile.win32 (for Window via nmake).
 #
-# 2. Update Update the 'tcl_64' and 'tcllib_64' variables below for
-#    your system.  See also these settings in "include/Makefile.win32":
-#    'HAVE_OPENSSL_EVP_H', 'openssl_64'.
-#
 # 3. Run appropriate Microsoft build setup script.  E.g. one of these:
 #    "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat"
 #    "%ProgramFiles%\Microsoft SDKs\Windows\v7.1\Bin\SetEnv.Cmd" /Debug /x64 /win7
 #
-# 4. nmake -f Makefile.win32
+# 4. Define environment variables
+#    TCLPATH - tcl install dir
+#    TCLLIB - tcl library name (tcl90.lib tclstub.lib)
+#    TCLSH - tcl shell (path\tclsh90.exe)
+#    ZLIBSRC - zlib sources (to compile zlib) or
+#    ZLIB - zlib install dir 
+#    OPENSSL - openssl install dir
+#    INSTALLDIR - install path
+#
+# 5. nmake -f Makefile.win32
 #
 
-tcl_64 = C:\P\Tcl-64-9.0.3
-tcl_32 = C:\P\Tcl-32
+!if "" == "$(TCLPATH)"
+TCLPATH = C:\P\Tcl-64
+!endif
 
-tcllib_64 = tcl90.lib tclstub.lib
-tcllib_32 = tcl85.lib
+!if "" == "$(TCLLIB)"
+TCLLIB = tcl86t.lib
+!endif
+
+!if "" == "$(TCLSH)"
+TCLSH = tclsh.exe
+!endif
 
 !if "" == "$(TARGET_CPU)"
 TARGET_CPU = $(VSCMD_ARG_TGT_ARCH)
-!endif
-
-!if "x86" == "$(TARGET_CPU)"
-TCLPATH = $(tcl_32)
-TCLLIB  = $(tcllib_32)
-!elseif "x64" == "$(TARGET_CPU)"
-TCLPATH = $(tcl_64)
-TCLLIB  = $(tcllib_64)
-!else
-!message Warning: Unexpected TARGET_CPU:  $(TARGET_CPU)
-TCLPATH = $(tcl_64)
-TCLLIB  = $(tcllib_64)
 !endif
 
 # I should be able to implicitly use these environment variable mappings:
@@ -127,7 +126,7 @@ NMAKE = nmake /nologo TCLPATH="$(TCLPATH)" TCLLIB="$(TCLLIB)" LIB="$(LIB)" DEBUG
 # --atp@piskorski.com, 2014/10/10 17:25 EDT
 
 core_targets = _nsthread _nsd _nscgi _nscp _nsdb _nsdbtest _nssock _nslog _nsperm _nsssl _nsproxy
-module_targets = _nsoracle
+module_targets = _nsoracle _nszlib
 
 tgts_core_clean = $(core_targets:_=C)
 tgts_modl_clean = $(module_targets:_=C)
@@ -168,42 +167,92 @@ $(tgts_modl_clean):
 	pushd "..\$(@:C=)" & $(NMAKE) -f Makefile.win32 clean & popd )
 
 _nsversion:
-	tclsh win32-util/configure.tcl
-	@if not exist sample-config.tcl copy sample-config.tcl.in sample-config.tcl
+	$(TCLSH) win32-util/configure.tcl
+	@if not exist conf\sample-config.tcl (copy conf\sample-config.tcl.in conf\sample-config.tcl)
 
 _install:
 !if "" == "$(INSTALLDIR)"
-	tclsh win32-util/install-nsd.tcl -i 1
+	$(TCLSH) win32-util/install-nsd.tcl -i 1
 !else
-	tclsh win32-util/install-nsd.tcl -i 1 -t $(INSTALLDIR)\ -c 0 -m nsoracle
+	$(TCLSH) win32-util/install-nsd.tcl -i 1 -t $(INSTALLDIR)\ -c 0 -m "nsoracle nszlib"
 !endif
+	-md $(INSTALLDIR)\certificates
+	copy tests\testserver\certificates\server.pem $(INSTALLDIR)\certificates
+	copy ca-bundle.crt $(INSTALLDIR)
 
-_cert: $(PEM_FILE)
-$(PEM_FILE): $(PEM_PRIVATE)
-	openssl genrsa 2048 > host.key
-	openssl req -new -config $(SSLCONFIG) -x509 -nodes -sha1 -days 365 -key host.key > host.cert
-	copy host.cert+host.key server.pem
-	del host.cert
-    del host.key
-	openssl dhparam 1024 >> server.pem
-	move server.pem $(PEM_FILE)
-	-openssl rehash $(TEST_CERTIFICATES)
+_cert: _cert_ca _cert_server _cert_client
+	-@openssl rehash certificates
 
-$(PEM_PRIVATE):
-	openssl genrsa -out $(PEM_PRIVATE) 512
-	openssl rsa -in $(PEM_PRIVATE) -pubout > $(PEM_PUBLIC)
+_cert_ca: certificates\ca.crt
+_cert_server: _cert_ca certificates\server.crt
+_cert_client: _cert_ca certificates\client.crt
+
+certificates\ca.crt:
+	-@mkdir certificates
+	@openssl genrsa -out certificates\ca.key 4096
+	@openssl req -new -key certificates\ca.key -out certificates\ca.csr -subj "/CN=NaviServer Demo CA"
+	@echo [ca_ext] > certificates\ca.ext
+	@echo basicConstraints = critical, CA:TRUE >> certificates\ca.ext
+	@echo keyUsage = critical, keyCertSign, cRLSign >> certificates\ca.ext
+	@echo subjectKeyIdentifier = hash >> certificates\ca.ext
+	@openssl x509 -req -in certificates\ca.csr -signkey certificates\ca.key -out certificates\ca.crt -days 3650 -sha256 -extfile certificates\ca.ext -extensions ca_ext
+
+certificates\server.crt:
+	@openssl genrsa -out certificates\server.key 2048
+	@openssl rsa -in certificates\server.key -pubout -out certificates\server-public.pem
+	@openssl req -new -key certificates\server.key -out certificates\server.csr -subj "/CN=localhost"
+	@echo [server_ext] > certificates\server.ext
+	@echo basicConstraints = CA:FALSE >> certificates\server.ext
+	@echo keyUsage = digitalSignature, keyEncipherment >> certificates\server.ext
+	@echo extendedKeyUsage = serverAuth >> certificates\server.ext
+	@echo subjectAltName = @alt_names >> certificates\server.ext
+	@echo.>> certificates\server.ext
+	@echo [alt_names] >> certificates\server.ext
+	@echo DNS.1 = localhost >> certificates\server.ext
+	@echo IP.1 = 127.0.0.1 >> certificates\server.ext
+	@echo IP.2 = ::1 >> certificates\server.ext
+	@openssl x509 -req -in certificates\server.csr -CA certificates\ca.crt -CAkey certificates\ca.key -CAserial certificates\server.srl -CAcreateserial -out certificates\server.crt -days 365 -sha256 -extfile certificates\server.ext -extensions server_ext
+	@copy certificates\server.crt + certificates\server.key certificates\server.pem
+
+certificates\client.crt:
+	@openssl genrsa -out certificates\client.key 2048
+	@openssl req -new -key certificates\client.key -out certificates\client.csr -subj "/CN=test-client"
+	@echo [client_ext] > certificates\client.ext
+	@echo basicConstraints = CA:FALSE >> certificates\client.ext
+	@echo keyUsage = digitalSignature >> certificates\client.ext
+	@echo extendedKeyUsage = clientAuth >> certificates\client.ext
+	@echo subjectAltName = @alt_names >> certificates\client.ext
+	@echo.>> certificates\client.ext
+	@echo [alt_names] >> certificates\client.ext
+	@echo DNS.1 = client1.example.org >> certificates\client.ext
+	@echo DNS.2 = client2.example.org >> certificates\client.ext
+	@echo email.1 = test-client@example.org >> certificates\client.ext
+	@echo URI.1 = spiffe://example.org/user/test-client >> certificates\client.ext
+	@openssl x509 -req -in certificates\client.csr -CA certificates\ca.crt -CAkey certificates\ca.key -CAserial certificates\client.srl -CAcreateserial -out certificates\client.crt -days 365 -sha256 -extfile certificates\client.ext -extensions client_ext
+
+ca-bundle.crt:
+	@curl -s -fS -k -L -o ca-bundle.crt "https://raw.githubusercontent.com/bagder/ca-bundle/refs/heads/master/ca-bundle.crt"
 
 # Make sure all required dlls are available in the PATH (tcl*.dll, libtommath.dll, zlib.dll, libcrypto*.dll, libssl*.dll)
-_path=$(PWD)\nsd;$(PWD)\nsthread;$(PWD)\nsdb;$(PWD)\nsproxy;$(TCLPATH)\bin;$(openssl_dir)\bin;C:\P\ps;C:\Windows\system32
+_path=$(PWD)\nsd;$(PWD)\nsthread;$(PWD)\nsdb;$(PWD)\nsproxy;$(TCLPATH)\bin;$(OPENSSL)\bin;C:\P\ps;C:\Windows\system32
 
-_test:
+_test_cert: _cert
+	copy /y certificates\*.* tests\testserver\certificates\ > NUL
+
+_test: _test_cert
 	setlocal
 	set PATH=$(_path)
-	$(PWD)\nsd\nsd.exe -c -t $(PWD)/tests/test.nscfg $(PWD)/tests/all.tcl 1>> test-win-out-0.txt 2>&1
+	$(PWD)\nsd\nsd.exe -c -t $(PWD)/tests/test.nscfg $(PWD)/tests/all.tcl -notfile ns_proxy.test $(TESTFLAGS) 1>> test-win-out-0.txt 2>&1
 	endlocal
 
-_test_one:
+_test_one: _test_cert
 	setlocal
 	set PATH=$(_path)
 	$(PWD)\nsd\nsd.exe -c -t $(PWD)/tests/test.nscfg $(PWD)/tests/all.tcl -verbose sp -file ns_thread.test
+	endlocal
+
+_shell:
+	setlocal
+	set PATH=$(_path)
+	$(PWD)\nsd\nsd.exe -c -t $(PWD)/tests/test.nscfg $(SHELLFLAGS)
 	endlocal

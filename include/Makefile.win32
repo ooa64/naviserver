@@ -119,8 +119,19 @@ NS_DB_P=0
 # To activate zlib, provide location of include and library files here
 # and activate HAVE_ZLIB in nsconfig-win32.h, and make sure, zlib is
 # installed on your system
+
+!if "" == "$(ZLIB)"
+!if "" == "$(ZLIBSRC)"
 zlib_lib=c:\P\lib
 zlib_include=c:\P\include
+!else
+zlib_lib=..\nsd\zlib
+zlib_include=$(ZLIBSRC)
+!endif
+!else
+zlib_lib=$(ZLIB)\lib
+zlib_include=$(ZLIB)\include
+!endif
 
 # For past OpenSSL-related link problems, see:
 #   https://sourceforge.net/p/naviserver/mailman/message/36519758/
@@ -132,15 +143,22 @@ zlib_include=c:\P\include
 #   Use:  openssl_libs = ssleay32MDd.lib libeay32MDd.lib
 # - Win32OpenSSL-1_1_1a.exe and Win64OpenSSL-1_1_1a.exe, c. 2018-11-21.
 #   Use:  openssl_libs = libssl32MTd.lib libcrypto32MTd.lib
+# - Win64OpenSSL-4.0.1
+#   Use:  openssl_libs = libssl.lib libcrypto.lib, at lib\VC\x64\MD or MDd 
 # https://indy.fulgan.com/SSL/
 # - openssl-1.0.2q-i386-win32.zip  , openssl-1.0.2q-i386-win32_LinkLibs.zip
 # - openssl-1.0.2q-x64_86-win64.zip, openssl-1.0.2q-x64_86-win64_LinkLibs.zip
 #   Use:  openssl_libs = ssleay32.lib libeay32.lib
 
-openssl_64 = C:\P\OpenSSL-Win64-3.1.0
+!if "" == "$(OPENSSL)"
+openssl_64 = C:\P\OpenSSL-Win64
 openssl_32 = C:\P\OpenSSL-Win32
 #openssl_64 = C:\P\openssl-indy_1.0.2q\64
 #openssl_32 = C:\P\openssl-indy_1.0.2q\32
+!else
+openssl_64 = $(OPENSSL)
+openssl_32 = $(OPENSSL)
+!endif
 
 # Make sure you also add e.g. C:\P\OpenSSL-Win64\bin to your system PATH,
 # so that NaviServer finds the libssl*.dll it needs when it runs.
@@ -157,13 +175,14 @@ TARGET_CPU = $(VSCMD_ARG_TGT_ARCH)
 #openssl_libs = ssleay32.lib libeay32.lib
 #openssl_libs = ssleay32MDd.lib libeay32MDd.lib
 openssl_libs = libssl32MDd.lib libcrypto32MDd.lib
-openssl_dir = $(openssl_32)
+openssl_libdir = $(openssl_32)\lib\VC
+openssl_dir = $(openssl_32) 
 !elseif "x64" == "$(TARGET_CPU)"
-openssl_libs = libssl64MDd.lib libcrypto64MDd.lib
-openssl_dir = $(openssl_64)
+openssl_libs = libssl.lib libcrypto.lib
+openssl_libdir = $(openssl_64)\lib\VC\x64\MDd 
+openssl_dir = $(openssl_64) 
 !else
 !message Warning: Unexpected TARGET_CPU:  $(TARGET_CPU)
-openssl_dir = $(openssl_64)
 !endif
 #!message openssl_dir is set to:  $(openssl_dir)
 
@@ -201,7 +220,7 @@ LIBS = $(LIBS) /LIBPATH:"$(NS_DIR)\nsd" libnsd.lib
 !  if ("nsssl" == "$(DLL)" || "nsd" == "$(PGM)")
    # Since c. 2016, nsd.exe needs to link against OpenSSL, otherwise you get
    # "unresolved external symbol" for _SSL_get_version and _SSL_get_cipher:
-LIBS = $(LIBS) "/LIBPATH:$(openssl_dir)\lib\VC" $(openssl_libs)
+LIBS = $(LIBS) "/LIBPATH:$(openssl_libdir)" $(openssl_libs)
 !  endif
 
 !  if ("nsd" == "$(PGM)" && "$(zlib_lib)" != "")
@@ -255,7 +274,7 @@ LIBS	= $(LIBS) tcl84t.lib
 COPTS	= /W3 /nologo /c /EHsc /DEBUG
 
 DEFS	= $(DEFS) /D "_WINDOWS" /D "TCL_THREADS=1" \
-		  /D "FD_SETSIZE=128" /D "_MBCS" \
+		  /D "FD_SETSIZE=2048" /D "_MBCS" \
 		  /D _CRT_SECURE_NO_WARNINGS /D _CRT_SECURE_NO_DEPRECATE
 
 LOPTS   = /NOLOGO /SUBSYSTEM:CONSOLE /OPT:NOREF /OPT:NOICF
