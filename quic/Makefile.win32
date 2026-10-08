@@ -1,0 +1,21 @@
+# Emacs mode:  -*-Makefile-*-
+
+# This is the Windows nmake specific file
+
+# dynamic nghttp3, needs nghttp3.dll
+#NGHTTP3_CFLAGS = -I$(NGHTTP3)/include -DHAVE_NGHTTP3
+#NGHTTP3_LIBS   = /LIBPATH:$(NGHTTP3)/lib nghttp3.lib
+
+# static nghttp3
+NGHTTP3_CFLAGS = -I$(NGHTTP3)/include -DHAVE_NGHTTP3 -DNGHTTP3_STATICLIB
+NGHTTP3_LIBS   = /LIBPATH:$(NGHTTP3)/lib nghttp3_static.lib
+
+MODNAME  = quic
+MOD      = quic.so
+MODOBJS  = quic.o chunk.o shared.o strndup.o
+HDRS     = shared.h chunk.h thread-affinity.h
+
+LIBS  	 = $(LIBS) $(NGHTTP3_LIBS)
+DEFS     = $(DEFS) $(NGHTTP3_CFLAGS) 
+
+!include "..\include\Makefile.win32"

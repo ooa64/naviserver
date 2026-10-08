@@ -367,7 +367,7 @@ if {[info exists httpsport] && $httpsport ne ""} {
     }
 
     set sslInfo     [ns_info ssl -details]
-    set quicFile    [file join [ns_info bindir] quic.so]
+    set quicFile    [file join [ns_info bindir] quic[info sh]]
     set h3Available [expr {[file readable $quicFile] && "quic" in [dict get $sslInfo capabilities]}]
 
     ns_section -update \
@@ -458,11 +458,11 @@ if {[info exists httpsport] && $httpsport ne ""} {
 
     if {[info exists h3] && $h3 == 1} {
         #
-        # HTTP/3 driver (quic.so), sharing the HTTPS configuration
+        # HTTP/3 driver (quic[info sh]), sharing the HTTPS configuration
         #
         ns_section ns/modules {
             if {$h3Available} {
-                ns_param h3 quic.so
+                ns_param h3 quic[info sh]
             } {
                 ns_log warning "cannot load quic driver: NaviServer was compiled with OpenSSL older than 4.0.2"
             }

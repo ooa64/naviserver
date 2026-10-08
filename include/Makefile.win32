@@ -217,7 +217,7 @@ LIBS = $(LIBS) /LIBPATH:"$(NS_DIR)\nsthread" nsthread.lib
 LIBS = $(LIBS) /LIBPATH:"$(NS_DIR)\nsd" libnsd.lib
 !  endif
 
-!  if ("nsssl" == "$(DLL)" || "nsd" == "$(PGM)")
+!  if ("nsssl" == "$(DLL)" || "quic" == "$(DLL)" ||"nsd" == "$(PGM)")
    # Since c. 2016, nsd.exe needs to link against OpenSSL, otherwise you get
    # "unresolved external symbol" for _SSL_get_version and _SSL_get_cipher:
 LIBS = $(LIBS) "/LIBPATH:$(openssl_libdir)" $(openssl_libs)
