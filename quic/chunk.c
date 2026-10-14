@@ -108,7 +108,10 @@ ChunkAlloc(size_t sz)
     return ch;
 }
 
-inline Chunk *
+#ifndef _MSC_VER
+inline
+#endif
+Chunk *
 ChunkInit(const char *buffer, size_t sz)
 {
     Chunk *ch = ChunkAlloc(sz);
@@ -137,7 +140,10 @@ ChunkInit(const char *buffer, size_t sz)
  *
  *----------------------------------------------------------------------
  */
-inline void
+#ifndef _MSC_VER
+inline
+#endif
+void
 ChunkEnqueue(ChunkQueue *q, Chunk *ch, const char *label)
 {
     (void)label;
