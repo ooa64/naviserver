@@ -445,7 +445,7 @@ set statsTestCode [catch {
         file delete -force [file join [ns_config test home] ns-stats-restart-diagnostics.txt]
     } -result 1
 
-    test stats-history-fresh-process {stored history survives a new process without connecting baselines} -returnCodes {ok error} -constraints ns_stats_sqlite -setup {
+    test stats-history-fresh-process {stored history survives a new process without connecting baselines} -returnCodes {ok error} -constraints {ns_stats_sqlite macOrUnix} -setup {
         ::ns_stats_test::history
     } -body {
         set cfg [makeFile {} ns-stats-restart.nscfg]
