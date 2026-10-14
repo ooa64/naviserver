@@ -674,7 +674,9 @@ nx::Class create ::ns::stats::SQLiteHistory {
             if {$path eq "" || $path eq ":memory:" || [string match file:* $path]} {
                 error "history requires a persistent file datasource"
             }
-            file attributes $path -permissions 0600
+            if {$::tcl_platform(platform) ne "windows"} {
+                file attributes $path -permissions 0600
+            }
             # A dedicated database avoids altering another application's budget.
             if {[:scalar $db {
                 SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT GLOB 'ns_stats_*' AND name NOT GLOB 'sqlite_*'}]
