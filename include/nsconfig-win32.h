@@ -15,3 +15,5 @@
 
 #define HAVE_STDINT_H 1
 #define HAVE_TIMEGM 1
+
+#define HAVE_INTTYPES_H 1
