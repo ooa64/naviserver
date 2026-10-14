@@ -31,6 +31,7 @@
 #include <math.h>
 
 #if defined(_MSC_VER)
+# include <float.h>
 # define NS_ISFINITE(x) _finite(x)
 # define NS_ISINF(x)    (!_finite(x) && !_isnan(x))
 # define NS_ISNAN(x)    _isnan(x)
