@@ -319,6 +319,8 @@ MSVC++ 14.44 _MSC_VER == 1944 (Visual Studio 2022 version 17.14)
 #   define HAVE_UINTPTR_T
 #  endif
 
+# define STDIN_FILENO                 _fileno(stdin)
+
 # else
 /*
  * MinGW
