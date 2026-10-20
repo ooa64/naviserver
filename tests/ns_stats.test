@@ -31,6 +31,40 @@ namespace eval ::ns_stats_test {
         ::ns_stats sampling tick
     }
 
+    proc windowSamples {} {
+        variable windowMixins
+        set windowMixins [ns_stats info object mixins]
+        if {![nsf::object::exists ::ns::stats::TestWindowSnapshot]} {
+            nx::Class create ::ns::stats::TestWindowSnapshot {
+                :public method snapshot {args} {
+                    return [nsv_get ns_stats_test_window current]
+                }
+            }
+        }
+        ns_stats object mixins add ::ns::stats::TestWindowSnapshot
+        ns_stats sampling stop
+        nsv_set ns_stats recent {}
+        set previous {}
+        for {set i 0} {$i <= 6} {incr i} {
+            set current [dict create schemaVersion 1 timestamp [expr {1000000000+$i*10000000}] \
+                process {pid 1 bootTime 1} servers [dict create test [dict create pools [dict create default \
+                    [dict create counters [dict create requests [expr {$i*$i*10}] runtime [expr {$i*2.0}]]]]]] \
+                drivers {} cpu [dict create tid [dict create name -conn:test:default:1- \
+                    user [expr {$i*1000000}] system 0]] availability {cpu true}]
+            set record [ns_stats calculate $current $previous 10 window-test]
+            dict set record raw $current
+            nsv_set ns_stats pair $record
+            ns_stats eval [list :retainSample $record]
+            set previous $current
+        }
+        nsv_set ns_stats_test_window current $current
+    }
+
+    proc windowCleanup {} {
+        ns_stats object mixins set $::ns_stats_test::windowMixins
+        nsv_unset -nocomplain ns_stats_test_window
+    }
+
     proc history {} {
         variable pool
         ns_stats history disable
@@ -102,7 +136,7 @@ namespace eval ::ns_stats_test {
         dict set sample sampling intervalSeconds 10
         dict set sample sampling ready $ready
         set payload [::nsf::dispatch ::ns_stats quote [::nsf::dispatch ::ns_stats pack $sample]]
-        ::nsf::dispatch ::ns_stats sql $db "INSERT INTO ns_stats_samples VALUES($stamp,[::nsf::dispatch ::ns_stats quote $instance],[::nsf::dispatch ::ns_stats quote $topology],$payload)"
+        ::nsf::dispatch ::ns_stats sql $db "INSERT INTO ns_stats_samples(at,instance,topology,payload) VALUES($stamp,[::nsf::dispatch ::ns_stats quote $instance],[::nsf::dispatch ::ns_stats quote $topology],$payload)"
     }
 }
 
@@ -129,6 +163,67 @@ set statsTestCode [catch {
     test stats-command-object {the public command is an NX object} -returnCodes {ok error} -constraints ns_stats -body {
         list [nsf::object::exists ::ns_stats] [::ns_stats info class] [info procs ::ns_stats]
     } -result {1 ::ns::ns_stats {}}
+
+    test stats-window-six-intervals {display window compares endpoints without changing sampling} -returnCodes {ok error} -constraints ns_stats -setup {
+        ::ns_stats_test::windowSamples
+    } -body {
+        set before [ns_stats sampling status]
+        set sample [ns_stats sample -window 60s]
+        list [dict get $sample sampling ready] [dict get $sample sampling elapsedSeconds] \
+            [dict get $sample servers test pools default deltas requests] \
+            [dict get $sample servers test pools default rates requests] \
+            [dict get $sample cpuPercent groups connection] \
+            [expr {[dict get $before running] eq [dict get [ns_stats sampling status] running]
+                   && [dict get $before interval] == [dict get [ns_stats sampling status] interval]}]
+    } -cleanup {::ns_stats_test::windowCleanup} -result {true 60.0 360 6.0 10.0 1}
+
+    test stats-window-insufficient {a display period cannot silently shrink to retained history} -returnCodes {ok error} -constraints ns_stats -setup {
+        ::ns_stats_test::windowSamples
+    } -body {
+        set sample [ns_stats sample -window 120s]
+        list [dict get $sample sampling ready] [dict get $sample sampling incompleteReason] \
+            [dict get $sample servers test pools default rates requests]
+    } -cleanup {::ns_stats_test::windowCleanup} -result {false insufficient-history {}}
+
+    test stats-window-gap {missing samples invalidate the selected period} -returnCodes {ok error} -constraints ns_stats -setup {
+        ::ns_stats_test::windowSamples
+    } -body {
+        nsv_set ns_stats recent [lreplace [nsv_get ns_stats recent] 3 3]
+        set sample [ns_stats sample -window 60]
+        list [dict get $sample sampling ready] [dict get $sample sampling incompleteReason]
+    } -cleanup {::ns_stats_test::windowCleanup} -result {false sampling-gap}
+
+    test stats-window-restart {a display period cannot cross a sampler restart} -returnCodes {ok error} -constraints ns_stats -setup {
+        ::ns_stats_test::windowSamples
+    } -body {
+        set records [nsv_get ns_stats recent]
+        for {set i 0} {$i < 4} {incr i} {
+            set record [lindex $records $i]
+            dict set record instance older-instance
+            lset records $i $record
+        }
+        nsv_set ns_stats recent $records
+        set sample [ns_stats sample -window 60]
+        list [dict get $sample sampling ready] [dict get $sample sampling incompleteReason]
+    } -cleanup {::ns_stats_test::windowCleanup} -result {false insufficient-history}
+
+    test stats-window-current-endpoint {display counters and period end at a fresh observation rather than the last scheduled tick} -returnCodes {ok error} -constraints ns_stats -setup {
+        ::ns_stats_test::windowSamples
+    } -body {
+        set current [nsv_get ns_stats_test_window current]
+        dict incr current timestamp 2000000
+        dict set current servers test pools default counters requests 400
+        nsv_set ns_stats_test_window current $current
+        set before [nsv_get ns_stats pair]
+        set sample [ns_stats sample -window 60s]
+        list [dict get $sample timestamp] [dict get $sample sampling elapsedSeconds] \
+            [dict get $sample servers test pools default deltas requests] \
+            [expr {$before eq [nsv_get ns_stats pair]}]
+    } -cleanup {::ns_stats_test::windowCleanup} -result {1062000000 62.0 400 1}
+
+    test stats-window-invalid {display period is bounded by the recent buffer duration} -returnCodes {ok error} -constraints ns_stats -body {
+        list [catch {ns_stats sample -window -1}] [catch {ns_stats sample -window 901s}]
+    } -result {1 1}
 
     test stats-recent-history {published samples have bounded memory history without raw CPU maps} -returnCodes {ok error} -constraints ns_stats -setup {
         nsv_set ns_stats recent {}
@@ -633,6 +728,94 @@ set statsTestCode [catch {
         ::ns_stats_test::stop
         foreach suffix {{} .pid .log} {removeFile ns-stats-restart.nscfg$suffix}
     } -result 1
+if {[testConstraint ns_stats_sqlite]} {
+    test stats-allocator-projection {saved samples have a compact projection without topology} -constraints ns_stats_sqlite -setup {
+        ns_stats history disable
+        ns_stats history configure -pool ns_stats_test
+        ::ns_stats_test::samples
+        ns_stats history save
+    } -body {
+        set now [clock seconds]
+        set q [ns_stats history allocator -from [expr {$now-60}] -to [expr {$now+0}]]
+        # Current-second samples are end-exclusive; query their stored column directly.
+        set config [nsv_get ns_stats history]
+        set db [ns_stats eval [list :historyConnect $config]]
+        try {
+            set rows [ns_stats eval [list :sql $db {SELECT allocator FROM ns_stats_samples WHERE allocator IS NOT NULL ORDER BY at DESC LIMIT 1}]]
+            set point [dict get [lindex $rows 0] allocator]
+        } finally {ns_db releasehandle $db}
+        list [lsort [dict keys $point]] [dict exists $q timings readMs] [dict get $q projection]
+    } -cleanup {ns_stats history disable} -result {{instance memory sampling timestamp} 1 allocator}
+
+    test stats-allocator-legacy {legacy snapshots decode once and compact reads preserve endpoints and missing metrics} -constraints ns_stats_sqlite -setup {
+        ns_stats history disable
+        ns_stats history configure -pool ns_stats_test
+        set config [nsv_get ns_stats history]
+        set db [ns_stats eval [list :historyConnect $config]]
+        set from [expr {[clock seconds]-120}]
+        set stamp [expr {($from+10)*1000000}]
+        set record [dict create timestamp $stamp instance fixture sampling {intervalSeconds 10} \
+            process {allocatorBytes {current_allocated_bytes 123 heap_size 456}}]
+        set packed [ns_stats eval [list :pack $record]]
+        set literal [ns_stats eval [list :quote $packed]]
+        ns_stats eval [list :sql $db "INSERT OR REPLACE INTO ns_stats_samples(at,instance,topology,payload) VALUES($stamp,'fixture','unused',$literal)"]
+        ns_db releasehandle $db
+    } -body {
+        set q [ns_stats history allocator -from $from -to [expr {$from+20}]]
+        set point [lindex [dict get $q records] 0]
+        list [dict get $q legacyDecoded] [dict get $point memory] [dict get $q coverage complete] [dict get $q more]
+    } -cleanup {ns_stats history disable} -result {1 {current_allocated_bytes 123 heap_size 456} false 0}
+
+    test stats-allocator-compact-page {compact range reads never decode snapshots and paginate without duplicates} -constraints ns_stats_sqlite -setup {
+        ns_stats history disable
+        ns_stats history configure -pool ns_stats_test
+        set config [nsv_get ns_stats history]
+        set db [ns_stats eval [list :historyConnect $config]]
+        set from [expr {[clock seconds]-300}]
+        foreach offset {10 20 30} instance {first first restarted} {
+            set stamp [expr {($from+$offset)*1000000}]
+            set point [dict create timestamp $stamp instance $instance sampling {intervalSeconds 10} \
+                memory [dict create current_allocated_bytes $offset]]
+            set literal [ns_stats eval [list :quote $point]]
+            ns_stats eval [list :sql $db "INSERT OR REPLACE INTO ns_stats_samples(at,instance,topology,payload,allocator) VALUES($stamp,'$instance','unused','not-a-compressed-snapshot',$literal)"]
+        }
+        ns_db releasehandle $db
+    } -body {
+        set first [ns_stats history allocator -from $from -to [expr {$from+30}] -limit 1]
+        set second [ns_stats history allocator -from $from -to [expr {$from+30}] -cursor [dict get $first nextCursor] -limit 1]
+        set all [ns_stats history allocator -from $from -to [expr {$from+40}]]
+        list [dict get $first more] [dict get $second more] \
+            [dict get [lindex [dict get $first records] 0] memory current_allocated_bytes] \
+            [dict get [lindex [dict get $second records] 0] memory current_allocated_bytes] \
+            [dict get $all legacyDecoded] [dict get [lindex [dict get $all records] end] instance]
+    } -cleanup {ns_stats history disable} -result {1 0 10 20 0 restarted}
+
+    test stats-allocator-migration {old schema gains a nullable projection without rewriting payloads} -constraints ns_stats_sqlite -setup {
+        ns_stats history disable
+        ns_stats history configure -pool ns_stats_test
+        set config [nsv_get ns_stats history]
+        set db [ns_stats eval [list :historyConnect $config]]
+    } -body {
+        ns_stats eval [list :sql $db {BEGIN IMMEDIATE}]
+        ns_stats eval [list :sql $db {ALTER TABLE ns_stats_samples RENAME TO ns_stats_samples_saved}]
+        ns_stats eval [list :sql $db {CREATE TABLE ns_stats_samples (at INTEGER PRIMARY KEY,instance TEXT NOT NULL,topology TEXT NOT NULL,payload TEXT NOT NULL)}]
+        ns_stats eval [list :sql $db {INSERT INTO ns_stats_samples VALUES(1,'old','unused','unchanged')}]
+        ns_stats eval [list :historySchema $db]
+        set row [lindex [ns_stats eval [list :sql $db {SELECT payload,coalesce(allocator,'') AS allocator FROM ns_stats_samples}]] 0]
+        list [dict get $row payload] [dict get $row allocator]
+    } -cleanup {
+        ns_stats eval [list :sql $db {ROLLBACK}]
+        ns_db releasehandle $db
+        ns_stats history disable
+    } -result {unchanged {}}
+
+    test stats-allocator-validation {allocator query enforces bounds and cursor limits} -body {
+        list [catch {ns_stats history allocator -from 0 -to 1 -limit 10001}] \
+            [catch {ns_stats history allocator -from 1 -to 1}] \
+            [catch {ns_stats history allocator -from 0 -to 1 -cursor -1}]
+    } -result {1 1 1}
+}
+
 } statsTestResult statsTestOptions]
 
 if {[testConstraint ns_stats]} {
@@ -654,5 +837,74 @@ if {$statsTestCode} {
     return -options $statsTestOptions $statsTestResult
 }
 unset statsTestCode statsTestResult statsTestOptions
+
+if {[testConstraint ns_stats]} {
+    nx::Class create ::cpuCapacityFixture -superclass ::ns::stats::Collector {
+        :property {files {}}
+        :method systemText {path} {
+            if {![dict exists ${:files} $path]} {error "Unavailable fixture file"}
+            return [dict get ${:files} $path]
+        }
+    }
+    ::cpuCapacityFixture create ::capacityFixture
+    proc ::capacityFiles {} {
+        return [dict create /sys/devices/system/cpu/online 0-15 /proc/self/status "Cpus_allowed_list:\t0-7" \
+            /proc/self/cgroup {0::/tenant/app} \
+            /proc/self/mountinfo {20 1 0:20 / /cg rw - cgroup2 cgroup rw} \
+            /cg/tenant/app/cpu.max {250000 100000} /cg/tenant/cpu.max {50000 100000} /cg/cpu.max {max 100000} \
+            /cg/tenant/app/cpuset.cpus.effective 0-3 /cg/tenant/cpuset.cpus.effective 0-7 \
+            /cg/tenant/app/cpu.stat "nr_periods 100\nnr_throttled 30\nthrottled_usec 2500000"]
+    }
+    test ns-stats-cpu-capacity-v2 {visible ancestor quota, affinity and cpuset constrain fractional core capacity} -body {
+        ::capacityFixture configure -files [::capacityFiles]
+        set c [::capacityFixture cpuCapacity]
+        list [dict get $c hostLogicalCpus] [dict get $c affinityCpus] [dict get $c cpusetCpus] \
+            [dict get $c effectiveCores] [dict get $c constraintsComplete] [dict get $c quotaStatus] \
+            [dict get $c throttling /cg/tenant/app throttledSeconds]
+    } -result {16 8 4 0.5 1 limited 2.5}
+    test ns-stats-cpu-capacity-v1 {legacy controller mount roots, inherited cpuset and nanosecond throttling work} -body {
+        set files [dict create /sys/devices/system/cpu/online 0-7 /proc/self/status {Cpus_allowed_list: 0-3} \
+            /proc/self/cgroup "2:cpu,cpuacct:/tenant/app\n3:cpuset:/tenant/app" \
+            /proc/self/mountinfo "20 1 0:20 /tenant /cpu rw - cgroup cgroup rw,cpu,cpuacct\n21 1 0:21 /tenant /set rw - cgroup cgroup rw,cpuset" \
+            /cpu/app/cpu.cfs_quota_us -1 /cpu/app/cpu.cfs_period_us 100000 \
+            /cpu/cpu.cfs_quota_us 150000 /cpu/cpu.cfs_period_us 100000 \
+            /set/app/cpuset.cpus {} /set/cpuset.cpus 0-1 \
+            /cpu/app/cpu.stat "nr_periods 10\nnr_throttled 2\nthrottled_time 500000000"]
+        ::capacityFixture configure -files $files
+        set c [::capacityFixture cpuCapacity]
+        list [dict get $c effectiveCores] [dict get $c cpusetCpus] \
+            [dict get $c throttling /cpu/app throttledSeconds] [dict get $c constraintsComplete]
+    } -result {1.5 2 0.5 1}
+    test ns-stats-cpu-capacity-unlimited {unlimited quota is distinguished from missing CPU information} -body {
+        set files [::capacityFiles]
+        dict set files /cg/tenant/app/cpu.max {max 100000}
+        dict set files /cg/tenant/cpu.max {max 100000}
+        ::capacityFixture configure -files $files
+        set unlimited [::capacityFixture cpuCapacity]
+        ::capacityFixture configure -files {}
+        set missing [::capacityFixture cpuCapacity]
+        list [dict get $unlimited effectiveCores] [dict get $unlimited quotaStatus] \
+            [dict get $missing effectiveCores] [dict get $missing constraintsComplete] \
+            [expr {"quota-unavailable-or-partial" in [dict get $missing incompleteReasons]}]
+    } -result {4 unlimited {} 0 1}
+    test ns-stats-cpu-capacity-throttle-deltas {same-process sampling derives interval throttling and rejects reset counters} -body {
+        set before [ns_stats snapshot]
+        dict set before timestamp 1000000
+        dict set before process cpuCapacity throttling /cg {periods 100 throttledPeriods 20 throttledSeconds 1.0}
+        set current $before
+        dict set current timestamp 11000000
+        dict set current process cpuCapacity throttling /cg {periods 200 throttledPeriods 50 throttledSeconds 3.5}
+        set r [ns_stats calculate $current $before 10 fixture]
+        set row [dict get $r process cpuCapacity throttling /cg]
+        dict set current process cpuCapacity throttling /cg {periods 1 throttledPeriods 0 throttledSeconds 0}
+        set reset [ns_stats calculate $current $before 10 fixture]
+        list [dict get $row deltaThrottledSeconds] [dict get $row throttledPeriodPercent] \
+            [dict get $reset process cpuCapacity throttling /cg deltaPeriods]
+    } -result {2.5 30.0 {}}
+    ::capacityFixture destroy
+    ::cpuCapacityFixture destroy
+    rename ::capacityFiles {}
+}
+
 
 cleanupTests

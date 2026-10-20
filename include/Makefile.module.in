@@ -23,7 +23,11 @@
 #     TCL         List of module shared Tcl files
 #     TCL_INIT    Optional init.tcl template (@NS_MODULE_VERSION@, @NS_MODULE_TAG@)
 #     TCL_INIT_FILE  Generated entry point (default init.tcl)
-#     NS_MODULE_VERSION  Release version for a Tcl entry point
+#     TCL_VERSION Optional metadata template (default version.tcl.in if present, Tcl modules only)
+#     TCL_VERSION_FILE Generated metadata (default version.tcl)
+#     VERSION_SVG Optional version badge template (default version.svg.in if present)
+#     VERSION_SVG_FILE Generated badge (default .version.svg)
+#     NS_MODULE_VERSION  Release version used by metadata and badge templates
 #     NS_MODULE_TAG  Build tag (default git describe; archives retain recorded tag)
 #     LIBNM       Root name of dynamic library (without lib prefix or extension)
 #     LIBOBJS     List of library object files (required with LIBNM)
@@ -37,6 +41,9 @@
 #     INSTALL     Extra install directive(s)
 #     CLEAN       Extra clean directive(s)
 #     DESTDIR     Root directory for install
+#     MODULE_CONFIG_PARAMETERS  Module-owned dictionary (doc/tcl/config-parameters.tcl)
+#     MODULE_PARAMETER_INCLUDE  Committed doctools fragment (doc/src/include/parameters.man)
+#     DOC_TOOLS   Installed/shared documentation tools, overridable for source development
 #
 #     At least one of PGM, MOD, LIBNM, TCL, or TCL_INIT must be defined.  For backwards compatibility,
 #     MODOBJS will default to OBJS and MODINST can be used for module install.
@@ -90,18 +97,44 @@ ifdef INCLUDED_IN_NAVISERVER
     endif
 endif
 
-# Tcl modules may generate their entry point from a template. Mixed modules
-# retain metadata from Ns_ModuleGetInfo() and need no Tcl declarations.
-ifdef TCL_INIT
-    ifndef NS_MODULE_VERSION
-        $(error NS_MODULE_VERSION not specified for TCL_INIT)
+# Optional module-owned templates share one release version and build tag.
+# Native/mixed modules retain metadata from Ns_ModuleGetInfo(); automatic Tcl
+# metadata discovery is limited to modules without a binary component.
+# Evaluate discovery immediately: ifdef tests the stored value, so a deferred
+# wildcard expression would enable templates even when no matching file exists.
+ifndef MOD
+    ifeq ($(origin TCL_VERSION), undefined)
+        TCL_VERSION := $(wildcard version.tcl.in)
     endif
+endif
+ifeq ($(origin VERSION_SVG), undefined)
+    VERSION_SVG := $(wildcard version.svg.in)
+endif
+
+ifdef TCL_INIT
     TCL_INIT_FILE ?= init.tcl
     TCL += $(TCL_INIT_FILE)
     BUILD += $(TCL_INIT_FILE)
+endif
+ifdef TCL_VERSION
+    TCL_VERSION_FILE ?= version.tcl
+    TCL += $(TCL_VERSION_FILE)
+    BUILD += $(TCL_VERSION_FILE)
+endif
+ifdef VERSION_SVG
+    VERSION_SVG_FILE ?= .version.svg
+    TCL += $(VERSION_SVG_FILE)
+    BUILD += $(VERSION_SVG_FILE)
+endif
+
+ifneq ($(strip $(TCL_INIT)$(TCL_VERSION)$(VERSION_SVG)),)
+    ifndef NS_MODULE_VERSION
+        $(error NS_MODULE_VERSION not specified for module version templates)
+    endif
     ifndef NS_MODULE_TAG
         NS_MODULE_TAG := $(shell git describe --abbrev=12 --always --dirty=+ 2>/dev/null \
-            || sed -n 's/^ns_module tag {\(.*\)}$$/\1/p' $(TCL_INIT_FILE) 2>/dev/null)
+            || sed -n -e 's/^ns_module tag {\(.*\)}$$/\1/p' \
+                -e 's/^set [^ ]*::tag {\(.*\)}$$/\1/p' $(TCL_VERSION_FILE) $(TCL_INIT_FILE) 2>/dev/null)
         ifeq ($(strip $(NS_MODULE_TAG)),)
             NS_MODULE_TAG = unknown
         endif
@@ -180,8 +213,16 @@ ifdef MODULE_INFO_HEADER
     $(MODOBJS) $(LIBOBJS) $(PGMOBJS): $(MODULE_INFO_HEADER)
 endif
 
+# Install module-owned documentation metadata independently of rendered manuals.
+MODULE_CONFIG_PARAMETERS ?= doc/tcl/config-parameters.tcl
+ifneq ($(wildcard $(MODULE_CONFIG_PARAMETERS)),)
+    INSTALL += install-config-parameters
+endif
+
 all build: $(BUILD)
 
+# Generate only the templates a module supplies. Preserve timestamps when the
+# expanded contents are unchanged, including builds from distribution archives.
 ifdef TCL_INIT
 $(TCL_INIT_FILE): $(TCL_INIT) FORCE_MODULE_INFO
 	@sed -e 's|@NS_MODULE_VERSION@|$(NS_MODULE_VERSION)|g' \
@@ -195,6 +236,31 @@ $(TCL_INIT_FILE): $(TCL_INIT) FORCE_MODULE_INFO
 install-tcl: $(TCL_INIT_FILE)
 endif
 
+ifdef TCL_VERSION
+$(TCL_VERSION_FILE): $(TCL_VERSION) FORCE_MODULE_INFO
+	@sed -e 's|@NS_MODULE_VERSION@|$(NS_MODULE_VERSION)|g' \
+	     -e 's|@NS_MODULE_TAG@|$(NS_MODULE_TAG)|g' $(TCL_VERSION) > $@.tmp
+	@if test -r $@ && cmp -s $@.tmp $@; then \
+	    $(RM) $@.tmp; \
+	else \
+	    mv $@.tmp $@; \
+	fi
+
+install-tcl: $(TCL_VERSION_FILE)
+endif
+
+ifdef VERSION_SVG
+$(VERSION_SVG_FILE): $(VERSION_SVG) FORCE_MODULE_INFO
+	@sed -e 's|@NS_MODULE_VERSION@|$(NS_MODULE_VERSION)|g' \
+	     -e 's|@NS_MODULE_TAG@|$(NS_MODULE_TAG)|g' $(VERSION_SVG) > $@.tmp
+	@if test -r $@ && cmp -s $@.tmp $@; then \
+	    $(RM) $@.tmp; \
+	else \
+	    mv $@.tmp $@; \
+	fi
+
+install-tcl: $(VERSION_SVG_FILE)
+endif
 ifdef MODULE_INFO_HEADER
 $(MODULE_INFO_HEADER): FORCE_MODULE_INFO
 	@{ \
@@ -277,3 +343,47 @@ cppcheck:
 	cppcheck --verbose --force --enable=all $(CFLAGS_INCLUDE) *.c
 
 .PHONY: clean-mod clean-lib clean-alib clean-pgm FORCE_MODULE_INFO
+
+# Module-owned parameter documentation. Ordinary builds check only that the
+# committed fragment exists; regeneration and rendering are explicit operations.
+# Override DOC_TOOLS to use a NaviServer source checkout during development.
+DOC_TOOLS ?= $(NAVISERVER)/share/naviserver/doc/tools
+MODULE_CONFIG_PARAMETERS ?= doc/tcl/config-parameters.tcl
+MODULE_PARAMETER_INCLUDE ?= doc/src/include/parameters.man
+MODULE_DOC_HTML ?= doc/html
+MODULE_DOC_MAN ?= doc/man
+
+ifneq ($(wildcard $(MODULE_CONFIG_PARAMETERS)),)
+    ifndef MODNAME
+        $(error MODNAME is required for module parameter documentation)
+    endif
+    .PHONY: config-parameters-includes regen-config-parameters-includes check-config-parameters build-doc check-doc install-config-parameters
+    all build: config-parameters-includes
+    REGEN_CONFIG_PARAMETERS ?= 0
+    ifeq ($(REGEN_CONFIG_PARAMETERS),1)
+    config-parameters-includes: regen-config-parameters-includes
+    else
+    config-parameters-includes:
+	@if test ! -r "$(MODULE_PARAMETER_INCLUDE)"; then \
+	    echo "missing generated module parameter include: $(MODULE_PARAMETER_INCLUDE)"; \
+	    echo "run make regen-config-parameters-includes"; exit 1; \
+	fi
+    endif
+    regen-config-parameters-includes:
+	$(TCLSH_PROG) "$(DOC_TOOLS)/gen-config-parameters.tcl" \
+	    --config "$(MODULE_CONFIG_PARAMETERS)" --module "$(MODNAME)" --output "$(MODULE_PARAMETER_INCLUDE)"
+    check-config-parameters:
+	$(TCLSH_PROG) "$(DOC_TOOLS)/gen-config-parameters.tcl" \
+	    --config "$(MODULE_CONFIG_PARAMETERS)" --module "$(MODNAME)" --output "$(MODULE_PARAMETER_INCLUDE)" --check
+    build-doc: config-parameters-includes
+	$(TCLSH_PROG) "$(DOC_TOOLS)/build-module-doc.tcl" --source "$(CURDIR)" \
+	    --module "$(MODNAME)" --output "$(MODULE_DOC_HTML)" --format html
+	$(TCLSH_PROG) "$(DOC_TOOLS)/build-module-doc.tcl" --source "$(CURDIR)" \
+	    --module "$(MODNAME)" --output "$(MODULE_DOC_MAN)" --format nroff
+    check-doc: check-config-parameters
+	$(TCLSH_PROG) "$(DOC_TOOLS)/build-module-doc.tcl" --source "$(CURDIR)" \
+	    --module "$(MODNAME)" --output "$(MODULE_DOC_HTML)" --format validate
+    install-config-parameters: config-parameters-includes
+	$(MKDIR) "$(DESTDIR)$(INSTTCL)/$(MODNAME)/doc/tcl"
+	$(INSTALL_DATA) "$(MODULE_CONFIG_PARAMETERS)" "$(DESTDIR)$(INSTTCL)/$(MODNAME)/doc/tcl/config-parameters.tcl"
+endif

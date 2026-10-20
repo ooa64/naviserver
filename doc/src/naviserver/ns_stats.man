@@ -39,8 +39,8 @@ are not collected. CPU counters are microseconds, matched by OS thread ID
 and creation time. Numeric allocator properties are bytes; they are not process RSS.
 No active-request URLs, peer addresses or thread callback arguments are retained.
 
-[call [cmd "ns_stats sample"] [opt [option "-server server"]]]
-Reads the latest published record without collecting or modifying it. sampling
+[call [cmd "ns_stats sample"] [opt [option "-server server"]] [opt [option "-window duration"]]]
+Without [option -window], reads the latest published record without collecting or modifying it. sampling
 contains ready, from/to epoch seconds, measured elapsedSeconds, ageSeconds, reset,
 intervalSeconds and running. Without a baseline, ready is false and interval
 values are empty. Published records add per-pool and per-driver deltas/rates,
@@ -52,10 +52,42 @@ Unavailable values are empty Tcl values with availability/readiness information;
 JSON consumers should represent these as null, never as zero.
 
 [para]
+[option -window] selects a display period from the bounded recent memory buffer,
+without changing the sampling schedule. The default 0 uses the latest single
+interval. Values up to 900 seconds accept time units, for example 60s.
+A fresh snapshot is compared with the retained endpoint nearest the requested
+age, within half a sampling interval. This does not publish a sample or advance
+the background sampler baseline. Rates, request timing averages and CPU
+use these endpoints; current gauges come from the fresh snapshot.
+The actual period is reported in sampling.elapsedSeconds. Insufficient history,
+a gap or a sampler restart leaves ready false and reports incompleteReason;
+the command does not silently substitute a shorter period. SQLite is not needed.
+
+[para]
 -server filters server/pool data. Drivers, CPU and allocator data remain explicitly
 process-scoped and must not be attributed to the selected virtual server.
 Snapshots are observations collected over a short interval, not an atomic freeze
 of the whole system. Capacity estimates and status thresholds belong to consumers.
+
+[para]
+process.cpuCapacity reports CPU ceilings on Linux: hostLogicalCpus,
+affinityCpus, cpusetCpus, quotaCores and effectiveCores. The collector resolves
+cgroup v1/v2 mounts and walks visible parents, taking the minimum observed
+ceiling, including fractional quotas. quotaStatus distinguishes limited,
+unlimited and unknown. constraintsComplete and incompleteReasons describe
+visible-limit availability, not a CPU reservation. Hidden ancestor constraints,
+CPU shares and host contention can reduce actual available capacity. Unsupported
+platforms or inaccessible files leave unknown values empty, never zero.
+[para]
+throttlingAvailable marks available cgroup CPU counters. throttling keeps each
+visible CPU group separate, with path, periods, throttledPeriods and
+throttledSeconds. Samples add deltaPeriods, deltaThrottledPeriods,
+deltaThrottledSeconds and throttledPeriodPercent when a valid same-process
+baseline exists; missing or decreased counters produce empty derived values.
+These counters include other processes, and ancestors may include siblings.
+Do not sum ancestors or interpret throttled period percentage as CPU utilization.
+Compare process CPU core equivalents with the qualified effectiveCores ceiling
+for the same sample period. Existing history without capacity data remains unknown.
 
 [call [cmd "ns_stats sampling start"] [opt [option "-interval seconds"]]]
 
@@ -149,6 +181,30 @@ interval. Payload sizes, topology changes, gaps and restarts can change the esti
 repeat measurements under representative load. Changing the budget at runtime requires
 history disable followed by history configure; update ns/stats for future restarts.
 
+[call [cmd "ns_stats history allocator"] [option "-from epochSeconds"] [option "-to epochSeconds"] \
+    [opt [option "-limit count"]] [opt [option "-cursor microseconds"]]]
+Returns compact, process-wide allocator history from the history owner server.
+The epoch interval is inclusive at from and exclusive at to, at most 24 hours,
+ending no later than now. Limit is 1..10000 (default 10000). records contain only
+timestamp (microseconds), instance, sampling.intervalSeconds and memory. Memory
+contains available current_allocated_bytes, heap_size and total_physical_bytes;
+missing gauges remain absent. Process identity and cadence allow callers to
+preserve restart boundaries and sampling gaps. more and nextCursor use the same
+paging convention as history query.
+
+[para]
+New persisted samples include a small allocator projection, avoiding full snapshot
+and topology decoding. Existing databases receive a nullable column automatically
+on configure/save; old rows are still readable by decoding their original payload.
+Queries do not backfill or modify stored samples. legacyDecoded reports the number
+of such rows decoded in this response. One bounded sample SELECT reads each page;
+there is no full-window coverage rescan. Consequently coverage.complete and
+coverage.windowExamined are false: this projection does not certify retained
+boundary coverage, eviction or write-failure absence. Use history query when that
+certification is required. timings reports checkoutMs, readMs, decodeMs and totalMs
+in milliseconds; checkout includes connection setup, read covers the sample SELECT,
+and decode includes compact-point construction and any legacy decompression.
+
 [call [cmd "ns_stats history query"] [option "-from epochSeconds"] [option "-to epochSeconds"] \
     [opt [option "-server server"]] [opt [option "-limit count"]] [opt [option "-cursor microseconds"]]]
 Returns historical records, referenced topologies and coverage. Query from the
@@ -191,7 +247,7 @@ independent of the requested window or cursor.
  ns_stats sampling stop
 [example_end]
 
-[section CONFIGURATION]
+[section {SQLite Pool Configuration}]
 [example_begin]
  # Load nsdb as a server module and configure nsdbsqlite normally.
  ns_section ns/db/pools {

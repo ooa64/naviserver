@@ -40,6 +40,152 @@ nx::Class create ::ns::stats::Collector {
     #
     #   Provides the collection interface inherited by ns::stats::Sampler.
 
+    :method systemText {path} {
+        set f [open $path r]
+        try {return [string trim [read $f 1048576]]} finally {close $f}
+    }
+    :method cpuListCount {text} {
+        set ranges {}
+        foreach item [split $text ,] {
+            if {![regexp {^([0-9]+)(?:-([0-9]+))?$} [string trim $item] -> first last]} {error "Invalid CPU list"}
+            if {$last eq ""} {set last $first}
+            if {$last<$first} {error "Invalid CPU range"}
+            lappend ranges [list $first $last]
+        }
+        set count 0; set end -1
+        foreach range [lsort -integer -index 0 $ranges] {
+            lassign $range first last
+            if {$last>$end} {incr count [expr {$last-max($first,$end+1)+1}]; set end $last}
+        }
+        return $count
+    }
+    :method mountPath {value} {
+        return [string map [list {\040} " " {\011} "\t" {\134} "\\"] $value]
+    }
+    :public method cpuCapacity {} {
+        #
+        # Inspect host logical CPUs, process affinity and visible cgroup v1/v2
+        # CPU quotas, cpusets and throttling counters. effectiveCores is the minimum
+        # known ceiling, not reserved or guaranteed CPU capacity. Missing probes
+        # remain unknown and are reflected in constraint completeness and reasons.
+        # Counters can include other processes or sibling cgroups; do not sum
+        # ancestor counters as independent process usage. Does not change limits.
+        #
+        # @return Dictionary of visible CPU ceilings, effectiveCores, constraint completeness,
+        #     cumulative cgroup throttling counters and limitations; unavailable values are
+        #     empty.
+        #
+        set result {hostLogicalCpus {} affinityCpus {} cpusetCpus {} quotaCores {} effectiveCores {} quotaStatus unknown constraintsComplete false throttlingAvailable false throttlingScope cgroup-hierarchy throttling {} limitations {Visible CPU ceilings are not reserved capacity. Hidden ancestor limits, host contention and CPU shares can reduce availability. Throttling counters are cumulative for each visible cgroup, including other processes; ancestor counters can include sibling groups.}}
+        set reasons {}; set ceilings {}
+        if {![catch {:cpuListCount [:systemText /sys/devices/system/cpu/online]} count] && $count>0} {
+            dict set result hostLogicalCpus $count; lappend ceilings $count
+        }
+        if {![catch {:systemText /proc/self/status} status]
+            && [regexp -line {^Cpus_allowed_list:\s*([^\n]+)} $status -> list]
+            && ![catch {:cpuListCount [string trim $list]} count] && $count>0} {
+            dict set result affinityCpus $count; lappend ceilings $count
+        } else {lappend reasons affinity-unavailable}
+        set memberships {}
+        if {![catch {:systemText /proc/self/cgroup} text]} {
+            foreach line [split $text \n] {
+                if {![regexp {^[0-9]+:([^:]*):(.*)$} $line -> controllers path]} continue
+                if {$controllers eq ""} {dict set memberships unified $path}
+                foreach controller [split $controllers ,] {dict set memberships $controller $path}
+            }
+        }
+        set quotaSeen false; set quotaMissing false; set hierarchySeen false
+        set groups {}; set visited {}
+        if {![catch {:systemText /proc/self/mountinfo} mounts]} {
+            foreach line [split $mounts \n] {
+                set parts [split $line " "]
+                set separator [lsearch -exact $parts -]
+                if {$separator<6} continue
+                set type [lindex $parts [expr {$separator+1}]]
+                if {$type ni {cgroup cgroup2}} continue
+                set root [:mountPath [lindex $parts 3]]
+                set mount [:mountPath [lindex $parts 4]]
+                set controllers [split [lindex $parts [expr {$separator+3}]] ,]
+                set key {}; set cpu false; set cpuset false
+                if {$type eq "cgroup2" && [dict exists $memberships unified]} {
+                    set key unified; set cpu true; set cpuset true
+                } else {
+                    foreach controller {cpu cpuset} {
+                        if {$controller in $controllers && [dict exists $memberships $controller]} {
+                            set key $controller
+                            if {$controller eq "cpu"} {set cpu true} else {set cpuset true}
+                        }
+                    }
+                }
+                if {$key eq ""} continue
+                set member [dict get $memberships $key]
+                # Do not traverse outside a visible mount, including namespace
+                # membership paths containing parent components.
+                if {".." in [file split $member]} {lappend reasons cgroup-path-unresolvable; continue}
+                if {$root eq "/"} {set relative [string trimleft $member /]
+                } elseif {$member eq "/" || $member eq $root} {set relative {}
+                } elseif {[string first "$root/" $member]==0} {set relative [string range $member [expr {[string length $root]+1}] end]
+                } else {continue}
+                set directory [file join $mount $relative]
+                set hierarchySeen true
+                while {1} {
+                    if {[lsearch -exact $visited [list $directory $cpu $cpuset]]<0} {
+                        lappend visited [list $directory $cpu $cpuset]
+                        if {$cpu} {
+                            if {$type eq "cgroup2"} {
+                                set readable [expr {![catch {:systemText $directory/cpu.max} maximum]}]
+                                if {$readable && [regexp {^(max|[0-9]+) ([1-9][0-9]*)$} $maximum -> quota period]} {
+                                    set quotaSeen true
+                                    if {$quota ne "max" && $quota>0} {lappend ceilings [expr {double($quota)/$period}]; set q [expr {double($quota)/$period}]
+                                        if {[dict get $result quotaCores] eq "" || $q<[dict get $result quotaCores]} {dict set result quotaCores $q}}
+                                } elseif {$directory ne $mount} {set quotaMissing true}
+                            } else {
+                                if {![catch {:systemText $directory/cpu.cfs_quota_us} quota]
+                                    && ![catch {:systemText $directory/cpu.cfs_period_us} period]
+                                    && [string is entier -strict $quota] && [string is entier -strict $period] && $period>0} {
+                                    set quotaSeen true
+                                    if {$quota>0} {set q [expr {double($quota)/$period}]; lappend ceilings $q
+                                        if {[dict get $result quotaCores] eq "" || $q<[dict get $result quotaCores]} {dict set result quotaCores $q}}
+                                } else {set quotaMissing true}
+                            }
+                            if {![catch {:systemText $directory/cpu.stat} counters]} {
+                                set row [dict create path $directory]
+                                foreach counter [split $counters \n] {
+                                    lassign $counter name value
+                                    if {![string is entier -strict $value] || $value<0} continue
+                                    switch -- $name {
+                                        nr_periods {dict set row periods $value}
+                                        nr_throttled {dict set row throttledPeriods $value}
+                                        throttled_usec {dict set row throttledSeconds [expr {$value/1000000.0}]}
+                                        throttled_time {dict set row throttledSeconds [expr {$value/1000000000.0}]}
+                                    }
+                                }
+                                if {[dict size $row]>1} {dict set groups $directory $row}
+                            }
+                        }
+                        if {$cpuset} {
+                            set file [expr {$type eq "cgroup2" ? "cpuset.cpus.effective" : "cpuset.cpus"}]
+                            if {![catch {:systemText $directory/$file} list] && $list ne "" && ![catch {:cpuListCount $list} count] && $count>0} {
+                                lappend ceilings $count
+                                if {[dict get $result cpusetCpus] eq "" || $count<[dict get $result cpusetCpus]} {dict set result cpusetCpus $count}
+                            }
+                        }
+                    }
+                    if {$directory eq $mount} break
+                    set directory [file dirname $directory]
+                }
+            }
+        }
+        if {!$hierarchySeen} {lappend reasons cgroup-hierarchy-unavailable}
+        if {!$quotaSeen || $quotaMissing} {lappend reasons quota-unavailable-or-partial}
+        dict set result quotaStatus [expr {[dict get $result quotaCores] ne "" ? "limited" : ($quotaSeen && !$quotaMissing ? "unlimited" : "unknown")}]
+        if {[llength $ceilings]} {dict set result effectiveCores [lindex [lsort -real $ceilings] 0]}
+        dict set result constraintsComplete [expr {$reasons eq ""}]
+        dict set result incompleteReasons [lsort -unique $reasons]
+        dict set result throttling $groups
+        dict set result throttlingAvailable [expr {[dict size $groups]>0}]
+        return $result
+    }
+
     :method selectServer {record server {validate true}} {
         # Restrict virtual-server data; historical records may refer to removed servers.
         if {$server ne ""} {
@@ -57,13 +203,18 @@ nx::Class create ::ns::stats::Collector {
 
     :public method describe {{-server {}}} {
         #
-        #   Return a dictionary describing the NaviServer process, virtual
-        #   servers, connection pools and network drivers. An optional server
-        #   argument restricts virtual-server data; process-wide information
-        #   retains its process scope. Availability fields identify optional
-        #   information that could not be collected.
+        # Return a dictionary describing the NaviServer process, virtual
+        # servers, connection pools and network drivers. An optional server
+        # argument restricts virtual-server data; process-wide information
+        # retains its process scope. Availability fields identify optional
+        # information that could not be collected.
         #
-        #   Does not start sampling or modify the sampling baseline.
+        # Does not start sampling or modify the sampling baseline.
+        #
+        # @param server Optional virtual-server name; empty selects all configured servers.
+        #     Process and driver information remain process-wide.
+        # @return Topology dictionary with schemaVersion, scope, process, servers, drivers and
+        #     availability information.
         #
         set result [dict create schemaVersion 1 scope process \
                         process [dict create \
@@ -81,6 +232,7 @@ nx::Class create ::ns::stats::Collector {
                                               os $::tcl_platform(os) \
                                               osVersion $::tcl_platform(osVersion) \
                                               machine $::tcl_platform(machine)]
+        dict set result process cpuCapacity [:cpuCapacity]
         foreach s [ns_info servers] {
             set pools {}
             foreach p [ns_server -server $s pools] {
@@ -148,14 +300,21 @@ nx::Class create ::ns::stats::Collector {
     }
 
     :public method snapshot {{-server {}}} {
-        #   Collect current gauges, cumulative counters, allocator statistics
-        #   and thread CPU times into a timestamped dictionary. The timestamp
-        #   is in epoch microseconds; collectionSeconds records collection
-        #   duration. The observations are collected sequentially and do not
-        #   constitute an atomic snapshot of the entire process.
         #
-        #   An optional server argument restricts virtual-server data.
-        #   Does not publish a sample or advance the sampling baseline.
+        # Collect current gauges, cumulative counters, allocator statistics
+        # and thread CPU times into a timestamped dictionary. The timestamp
+        # is in epoch microseconds; collectionSeconds records collection
+        # duration. The observations are collected sequentially and do not
+        # constitute an atomic snapshot of the entire process.
+        #
+        # An optional server argument restricts virtual-server data.
+        # Does not publish a sample or advance the sampling baseline.
+        #
+        # @param server Optional virtual-server name; empty selects all configured servers.
+        #     Process metrics remain process-wide.
+        # @return Timestamped dictionary of gauges, cumulative counters, thread CPU counters,
+        #     units and availability; timestamp is in epoch microseconds.
+        #
 
         set start [clock microseconds]
         set result [dict create \
@@ -167,6 +326,7 @@ nx::Class create ::ns::stats::Collector {
                         cpu {} \
                         availability {} \
                         units {time seconds cpuCounter microseconds cpuPercent percentOfOneCore}]
+        dict set result process cpuCapacity [:cpuCapacity]
         if {![catch {ns_driver stats} stats]} {
             foreach entry $stats {
                 set counters {}
@@ -288,13 +448,17 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
     }
     :public method "sampling status" {} {
         #
-        #   Return the process-wide sampler configuration and status, including
-        #   running state, scheduler identifier, interval, process instance,
-        #   collection errors and readiness of the latest interval sample.
+        # Return the process-wide sampler configuration and status, including
+        # running state, scheduler identifier, interval, process instance,
+        # collection errors and readiness of the latest interval sample.
         #
-        #   latestAt is in epoch seconds; ageSeconds is the elapsed time since
-        #   the latest publication. Both are empty before the first sample.
-        #   Does not collect new observations or modify sampler state.
+        # latestAt is in epoch seconds; ageSeconds is the elapsed time since
+        # the latest publication. Both are empty before the first sample.
+        # Does not collect new observations or modify sampler state.
+        #
+        # @return Status dictionary including running, interval in seconds, scheduler, instance,
+        #     errors, lastError, ready, latestAt and ageSeconds.
+        #
 
         set result [nsv_get ns_stats control]
         dict unset result busy
@@ -312,15 +476,21 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
     }
 
     :public method "sampling start" {{-interval 10}} {
-        #   Start the process-wide sampling callback at the requested interval
-        #   in seconds (default 10, range 1..3600). Time units and fractional
-        #   seconds are normalized with ns_baseunit. Repeated calls with the
-        #   same running interval reuse the scheduler; a different interval
-        #   requires stopping the sampler first.
         #
-        #   Clears the previous sample and baseline when starting a stopped
-        #   sampler. Returns the resulting status dictionary. Persistence
-        #   must be enabled separately.
+        # Start the process-wide sampling callback at the requested interval
+        # in seconds (default 10, range 1..3600). Time units and fractional
+        # seconds are normalized with ns_baseunit. Repeated calls with the
+        # same running interval reuse the scheduler; a different interval
+        # requires stopping the sampler first.
+        #
+        # Clears the previous sample and baseline when starting a stopped
+        # sampler. Returns the resulting status dictionary. Persistence
+        # must be enabled separately.
+        #
+        # @param interval Sampling cadence, accepting ns_baseunit time syntax; 1..3600 seconds,
+        #     default 10 seconds.
+        # @return Resulting sampling status dictionary.
+        #
 
         set interval [ns_baseunit -time $interval]
         if {$interval < 1 || $interval > 3600} {
@@ -347,12 +517,15 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
 
     :public method "sampling stop" {} {
         #
-        #   Unschedule collection and invalidate any collection already in
-        #   progress so it cannot publish into the stopped sampler.
+        # Unschedule collection and invalidate any collection already in
+        # progress so it cannot publish into the stopped sampler.
         #
-        #   Retains the latest published sample for subsequent reads.
-        #   Returns the resulting status dictionary. Does not disable the
-        #   separately configured history persistence callback.
+        # Retains the latest published sample for subsequent reads.
+        # Returns the resulting status dictionary. Does not disable the
+        # separately configured history persistence callback.
+        #
+        # @return Resulting sampling status dictionary; the last published sample remains
+        #     available.
         #
         :locked {
             set state [nsv_get ns_stats control]
@@ -368,47 +541,127 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
         return [:sampling status]
     }
 
-    :public method sample {{-server {}}} {
+    :public method sample {{-server {}} {-window 0}} {
         #
-        #   Return the latest published sample, updating its reported age and
-        #   running state. Before any publication, return a dictionary with
-        #   sampling readiness false and no interval observations.
+        # Return the latest published sample, updating its reported age and
+        # running state. Before any publication, return a dictionary with
+        # sampling readiness false and no interval observations.
         #
-        #   An optional server argument restricts virtual-server data; CPU
-        #   measurements remain process-wide. Does not collect observations
-        #   or advance the baseline. The internal raw baseline is omitted
-        #   from the returned dictionary.
+        # An optional server argument restricts virtual-server data; CPU
+        # measurements remain process-wide. Without -window, does not collect
+        # observations or advance the baseline. With -window (0..900 seconds, time units
+        # accepted), collect a fresh snapshot and compare it with the nearest retained
+        # endpoint to that age (within half a sampling interval). Missing
+        # history, gaps or sampler restarts leave readiness false. The
+        # measured elapsedSeconds reports the actual selected period.
+        # The internal raw baseline is omitted
+        # from the returned dictionary.
+        #
+        # @param server Optional virtual-server name; empty returns all servers. CPU metrics
+        #     remain process-wide.
+        # @param window Requested display period, accepting ns_baseunit time syntax; 0..900
+        #     seconds, default 0 for the latest published sample.
+        # @return Sample dictionary with sampling readiness and age; a positive window adds
+        #     freshly calculated interval metrics when a suitable continuous baseline exists.
         #
         if {$server ne "" && $server ni [ns_info servers]} {
             error "unknown server: $server"
         }
-        set result [nsv_get ns_stats pair]
+        set window [ns_baseunit -time $window]
+        if {$window < 0 || $window > 900} {
+            error "display window must be 0..900 seconds"
+        }
+        :locked {
+            set result [nsv_get ns_stats pair]
+            set recent [expr {$window > 0 ? [nsv_get ns_stats recent] : {}}]
+        }
         if {$result eq ""} {
             return [dict create schemaVersion 1 \
                         sampling {ready false from {} to {} elapsedSeconds {} ageSeconds {} reset false} \
                         servers {} availability {}]
         }
+        if {$window > 0} {
+            set current [:snapshot]
+            set target [expr {[dict get $current timestamp]-$window*1000000}]
+            set baseline {}
+            set distance Inf
+            foreach record $recent {
+                if {[dict get $record timestamp] >= [dict get $current timestamp]
+                    || [dict get $record instance] ne [dict get $result instance]} {
+                    continue
+                }
+                set difference [expr {abs([dict get $record timestamp]-$target)}]
+                if {$difference < $distance} {
+                    set baseline $record
+                    set distance $difference
+                }
+            }
+            set cadence [dict get $result sampling intervalSeconds]
+            set reason {}
+            if {$baseline eq "" || $distance > 0.5*$cadence*1000000} {
+                set baseline {}
+                set reason insufficient-history
+            } else {
+                set previous $baseline
+                foreach record $recent {
+                    if {[dict get $record timestamp] <= [dict get $baseline timestamp]
+                        || [dict get $record timestamp] > [dict get $current timestamp]} {
+                        continue
+                    }
+                    if {[dict get $record instance] ne [dict get $result instance]
+                        || ![dict get $record sampling ready]
+                        || [dict get $record timestamp]-[dict get $previous timestamp]
+                           > 1.5*max($cadence,[dict get $previous sampling intervalSeconds])*1000000} {
+                        set reason sampling-gap
+                        set baseline {}
+                        break
+                    }
+                    set previous $record
+                }
+            }
+            if {$baseline ne "" && [dict get $current timestamp]-[dict get $previous timestamp]
+                > 1.5*$cadence*1000000} {
+                set baseline {}
+                set reason sampling-gap
+            }
+            # Older retained records may predate CPU baseline retention.
+            if {$baseline ne "" && ![dict exists $baseline cpu]} {
+                dict set baseline cpu {}
+            }
+            set result [:calculate $current $baseline $cadence [dict get $result instance]]
+            dict set result sampling requestedSeconds $window
+            dict set result sampling incompleteReason $reason
+        }
         dict set result sampling running [dict get [nsv_get ns_stats control] running]
         dict set result sampling ageSeconds [expr {max(0,([clock microseconds]-[dict get $result timestamp])/1000000.0)}]
-        dict unset result raw
+        if {[dict exists $result raw]} {dict unset result raw}
         # CPU is process-wide; filtering server pools never attributes CPU to a vhost.
         return [:selectServer $result $server]
     }
 
     :public method calculate {current previous interval instance} {
         #
-        #   Derive interval diagnostics from current and previous snapshots.
-        #   Return the current observations augmented with counter deltas,
-        #   rates, average request phase times and thread CPU percentages.
-        #   Rates use measured elapsed time; interval records the configured
-        #   sampling cadence, and instance identifies the sampler lifetime.
+        # Derive interval diagnostics from current and previous snapshots.
+        # Return the current observations augmented with counter deltas,
+        # rates, average request phase times and thread CPU percentages.
+        # Rates use measured elapsed time; interval records the configured
+        # sampling cadence, and instance identifies the sampler lifetime.
         #
-        #   Interval results require a previous snapshot from the same process
-        #   lifetime and positive elapsed time. Missing baselines or decreased
-        #   counters yield empty derived values. CPU comparisons match thread
-        #   identifiers and creation times; percentages use one core as 100%.
+        # Interval results require a previous snapshot from the same process
+        # lifetime and positive elapsed time. Missing baselines or decreased
+        # counters yield empty derived values. CPU comparisons match thread
+        # identifiers and creation times; percentages use one core as 100%.
         #
-        #   Does not collect observations or modify shared state.
+        # Does not collect observations or modify shared state.
+        #
+        # @param current Current snapshot dictionary, including its epoch-microsecond timestamp
+        #     and process identity.
+        # @param previous Previous snapshot dictionary, or empty when no baseline exists.
+        # @param interval Configured sampling cadence in seconds; rates use actual elapsed time
+        #     instead.
+        # @param instance Sampler lifetime identifier attached to the calculated sample.
+        # @return Current observations augmented with sampling metadata, counter deltas, rates,
+        #     average timings and CPU percentages; unavailable derived values remain empty.
         #
         set stamp [dict get $current timestamp]
         set elapsed {}
@@ -521,6 +774,23 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
                 dict set totals $group [expr {$total+$percent}]
             }
         }
+        if {[dict exists $current process cpuCapacity throttling]} {
+            dict for {path row} [dict get $current process cpuCapacity throttling] {
+                foreach field {periods throttledPeriods throttledSeconds} {
+                    set delta {}
+                    if {$ready && [dict exists $row $field] && [dict exists $previous process cpuCapacity throttling $path $field]} {
+                        set old [dict get $previous process cpuCapacity throttling $path $field]
+                        if {[dict get $row $field]>=$old} {set delta [expr {[dict get $row $field]-$old}]}
+                    }
+                    dict set row delta[string toupper [string index $field 0]][string range $field 1 end] $delta
+                }
+                dict set row throttledPeriodPercent {}
+                if {[dict get $row deltaPeriods] ne "" && [dict get $row deltaPeriods]>0 && [dict get $row deltaThrottledPeriods] ne ""} {
+                    dict set row throttledPeriodPercent [expr {100.0*[dict get $row deltaThrottledPeriods]/[dict get $row deltaPeriods]}]
+                }
+                dict set result process cpuCapacity throttling $path $row
+            }
+        }
         dict set result cpuPercent [dict create \
                                         scope process \
                                         matchedThreads $matched \
@@ -532,8 +802,9 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
 
     :method retainSample {sample} {
         # Called while holding the existing ns_stats coordination lock.
-        # Keep compact interval metrics, not the raw baseline or per-thread maps.
-        set record [dict remove $sample raw cpu]
+        # Keep bounded endpoint CPU counters for display-window calculations.
+        # Raw baselines and derived per-thread maps are not retained.
+        set record [dict remove $sample raw]
         if {[dict exists $record cpuPercent threads]} {
             dict unset record cpuPercent threads
         }
@@ -557,12 +828,24 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
         {-limit:integer 180}
         {-cursor:integer 0}
     } {
-        #   Read the bounded process-wide recent sample buffer without SQLite.
-        #   Retains at most 180 compact samples and 15 minutes at publication.
-        #   Returns interval metrics, coverage and timestamp-based paging.
-        #   Raw/per-thread CPU counters are omitted. Reading does not collect,
-        #   start sampling, advance baselines or write persistent history.
-        #   The buffer survives sampler stop/start but not a process restart.
+        #
+        # Read the bounded process-wide recent sample buffer without SQLite.
+        # Retains at most 180 compact samples and 15 minutes at publication.
+        # Returns interval metrics, coverage and timestamp-based paging.
+        # Raw/per-thread CPU counters are omitted. Reading does not collect,
+        # start sampling, advance baselines or write persistent history.
+        # The buffer survives sampler stop/start but not a process restart.
+        #
+        # @param from Inclusive lower bound in epoch seconds; must be nonnegative.
+        # @param to Exclusive upper bound in epoch seconds; after from, at most 24 hours later
+        #     and no later than now.
+        # @param server Optional historical virtual-server name; empty returns all stored server
+        #     data.
+        # @param limit Maximum records per page, 1..180; default 180.
+        # @param cursor Nonnegative timestamp cursor in microseconds, default 0; pass nextCursor
+        #     unchanged for continuation.
+        # @return Dictionary containing records, retained bounds, coverage, more and nextCursor
+        #     for the in-memory history buffer.
         #
         if {$from<0 || $to<=$from || $to-$from>86400 || $to>[clock seconds]
             || $limit<1 || $limit>180 || $cursor<0} {
@@ -621,7 +904,7 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
                     lappend gaps [dict create from [dict get $previous sampling to] to [dict get $record sampling to]]
                 }
             }
-            lappend records [:selectServer $record $server false]
+            lappend records [:selectServer [dict remove $record cpu] $server false]
             set previous $record
         }
         # Retained bounds refer to the buffer, independently of the selected page.
@@ -654,16 +937,17 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
 
     :public method "sampling tick" {} {
         #
-        #   Perform one scheduled collection and publish its interval sample.
-        #   Skip collection when the sampler is stopped or another collection
-        #   is in progress. Collect observations outside the coordination lock,
-        #   then calculate and publish only if the sampler generation is still
-        #   current.
+        # Perform one scheduled collection and publish its interval sample.
+        # Skip collection when the sampler is stopped or another collection
+        # is in progress. Collect observations outside the coordination lock,
+        # then calculate and publish only if the sampler generation is still
+        # current.
         #
-        #   Retain the raw snapshot as the next interval baseline. Collection
-        #   failures retain the previous publication, update error status and
-        #   emit a warning. Does not write SQLite history; persistence runs
-        #   through a separate callback.
+        # Retain the raw snapshot as the next interval baseline. Collection
+        # failures retain the previous publication, update error status and
+        # emit a warning. Does not write SQLite history; persistence runs
+        # through a separate callback.
+        #
         #
         set generation {}
         :locked {
@@ -837,6 +1121,11 @@ nx::Class create ::ns::stats::SQLiteHistory {
         } {
             :sql $db $query
         }
+        # Additive migration: existing compressed snapshots remain readable.
+        set columns [lmap row [:sql $db {SELECT name FROM pragma_table_info('ns_stats_samples')}] {dict get $row name}]
+        if {"allocator" ni $columns} {
+            :sql $db {ALTER TABLE ns_stats_samples ADD COLUMN allocator TEXT}
+        }
         set version [:scalar $db {SELECT value FROM ns_stats_meta WHERE key='schemaVersion'}]
         if {$version ne "" && $version ne "1"} {
             error "unsupported diagnostics history schema"
@@ -857,13 +1146,22 @@ nx::Class create ::ns::stats::SQLiteHistory {
         {-maxBytes 67108864}
     } {
         #
-        #   Validate the database pool and retention limits, initialize the
-        #   schema and start a separate persistence callback. Repeated
-        #   configuration with identical settings is harmless; changing
-        #   active settings requires disabling persistence first.
-        #   Return the resulting history status. Does not start sampling.
-        #   Normalize retention to fractional seconds and maxBytes to bytes
-        #   with ns_baseunit before validating the bounds.
+        # Validate the database pool and retention limits, initialize the
+        # schema and start a separate persistence callback. Repeated
+        # configuration with identical settings is harmless; changing
+        # active settings requires disabling persistence first.
+        # Return the resulting history status. Does not start sampling.
+        # Normalize retention to fractional seconds and maxBytes to bytes
+        # with ns_baseunit before validating the bounds.
+        #
+        # @param pool Required dedicated persistent nsdbsqlite pool, accessible to the
+        #     configuring virtual server.
+        # @param retention Retention duration accepting ns_baseunit time syntax; 60..604800
+        #     seconds, default 86400 seconds.
+        # @param maxBytes Storage budget accepting ns_baseunit size syntax; at least 4 MiB,
+        #     default 67108864 bytes. Includes database journal headroom.
+        # @return History status dictionary after schema initialization and persistence
+        #     scheduling.
         #
         set retention [ns_baseunit -time $retention]
         set maxBytes [ns_baseunit -size $maxBytes]
@@ -907,9 +1205,11 @@ nx::Class create ::ns::stats::SQLiteHistory {
 
     :public method "history disable" {} {
         #
-        #   Stop future persistence callbacks without deleting stored history
-        #   or stopping sampling. An outstanding write may finish.
-        #   Return the resulting history status.
+        # Stop future persistence callbacks without deleting stored history
+        # or stopping sampling. An outstanding write may finish.
+        # Return the resulting history status.
+        #
+        # @return Resulting history status dictionary; retained database records are not deleted.
         #
         :locked {
             set config [nsv_get ns_stats history]
@@ -927,9 +1227,12 @@ nx::Class create ::ns::stats::SQLiteHistory {
 
     :public method "history status" {} {
         #
-        #   Return shared history configuration and persistence status without
-        #   opening the database. Internal coordination and cached topology
-        #   fields are omitted.
+        # Return shared history configuration and persistence status without
+        # opening the database. Internal coordination and cached topology
+        # fields are omitted.
+        #
+        # @return Persistence status dictionary including owner, pool, retention, maxBytes,
+        #     scheduler and write failures; enabled is false when never configured.
         #
         set config [nsv_get ns_stats history]
         if {$config eq ""} {
@@ -961,24 +1264,25 @@ nx::Class create ::ns::stats::SQLiteHistory {
 
     :public method "history save" {} {
         #
-        #   Persist the latest published sample if history is enabled, no write
-        #   is in progress and its timestamp has not already been saved.
-        #   Claim the write under the shared coordination lock, then perform
-        #   database operations outside that lock.
+        # Persist the latest published sample if history is enabled, no write
+        # is in progress and its timestamp has not already been saved.
+        # Claim the write under the shared coordination lock, then perform
+        # database operations outside that lock.
         #
-        #   Store the compressed sample and associated topology in one
-        #   transaction, deduplicating samples by timestamp. Apply age and
-        #   storage-budget eviction, retain coverage events and remove topology
-        #   no longer referenced by retained samples.
+        # Store the compressed sample and associated topology in one
+        # transaction, deduplicating samples by timestamp. Apply age and
+        # storage-budget eviction, retain coverage events and remove topology
+        # no longer referenced by retained samples.
         #
-        #   On failure, roll back the transaction, retain the pending sample
-        #   for retry and update failure status. Repeated identical warnings
-        #   are throttled. A subsequent successful write records the failed
-        #   interval for coverage reporting.
+        # On failure, roll back the transaction, retain the pending sample
+        # for retry and update failure status. Repeated identical warnings
+        # are throttled. A subsequent successful write records the failed
+        # interval for coverage reporting.
         #
-        #   Release the database handle and clear the write claim on completion.
-        #   Does not collect observations or advance the sampling baseline;
-        #   callers inspect history status for the persistence outcome.
+        # Release the database handle and clear the write claim on completion.
+        # Does not collect observations or advance the sampling baseline;
+        # callers inspect history status for the persistence outcome.
+        #
         #
         set config {}
         set generation {}
@@ -1027,7 +1331,8 @@ nx::Class create ::ns::stats::SQLiteHistory {
             }
             set packed [:pack $record]
             set packedTopology [:pack $topology]
-            set size [expr {[string length $packed]+[string length $packedTopology]}]
+            set allocator [:allocatorPoint $record]
+            set size [expr {[string length $packed]+[string length $packedTopology]+[string length $allocator]}]
             set db [:historyConnect $config]
             :historySchema $db
             :sql $db {BEGIN IMMEDIATE}
@@ -1051,7 +1356,7 @@ nx::Class create ::ns::stats::SQLiteHistory {
                 error "history topology fingerprint collision"
             }
             :sql $db "INSERT OR IGNORE INTO ns_stats_topology VALUES([:quote $topologyId],[:quote $packedTopology])"
-            :sql $db "INSERT OR IGNORE INTO ns_stats_samples VALUES($stamp,[:quote [dict get $record instance]],[:quote $topologyId],[:quote $packed])"
+            :sql $db "INSERT OR IGNORE INTO ns_stats_samples(at,instance,topology,payload,allocator) VALUES($stamp,[:quote [dict get $record instance]],[:quote $topologyId],[:quote $packed],[:quote $allocator])"
             foreach gap [dict get $config gaps] {
                 lassign $gap first last n
                 :sql $db "INSERT INTO ns_stats_events(at,first,last,n,reason) VALUES($stamp,$first,$last,$n,'write-failure')"
@@ -1175,9 +1480,15 @@ nx::Class create ::ns::stats::SQLiteHistory {
     }
 
     :public method "history storage" {} {
+        #
         # Return retained bounds/count and SQLite space usage for sizing the
         # dedicated history database. Run in the history owner server. Does
         # not collect samples, write history or change its configuration.
+        #
+        # @return Dictionary of retained epoch-second bounds, sample count, SQLite page usage,
+        #     effective byte cap and estimated bytes per sample/second; unavailable estimates are
+        #     empty.
+        #
         set config [nsv_get ns_stats history]
         if {$config eq ""} {
             error "history is not configured"
@@ -1199,6 +1510,98 @@ nx::Class create ::ns::stats::SQLiteHistory {
         }
     }
 
+    :method allocatorPoint {record} {
+        set memory {}
+        foreach key {current_allocated_bytes heap_size total_physical_bytes} {
+            if {[dict exists $record process allocatorBytes $key]} {
+                dict set memory $key [dict get $record process allocatorBytes $key]
+            }
+        }
+        return [dict create timestamp [dict get $record timestamp] instance [dict get $record instance] \
+                    sampling [dict create intervalSeconds [dict get $record sampling intervalSeconds]] memory $memory]
+    }
+
+    :public method "history allocator" {
+        -from:integer,required
+        -to:integer,required
+        {-limit:integer 10000}
+        {-cursor:integer 0}
+    } {
+        #
+        # Read compact process-wide allocator history from the configured owner
+        # server using one bounded sample SELECT. New samples provide stored
+        # projections; old rows without a projection are decoded once in this read.
+        # No topology loading or full-window payload rescan is performed.
+        #
+        # Preserve missing gauges as absent dictionary keys. Timestamps are epoch
+        # microseconds; instance and intervalSeconds allow callers to preserve
+        # restart boundaries and gaps. Reading does not collect or write samples.
+        # Coverage complete and windowExamined remain false: this projection does
+        # not certify window boundaries or absence of eviction/write failures.
+        # Use history query when full-window coverage assessment is required.
+        # Timings distinguish checkout, sample SQL read, decoding and total time.
+        #
+        # @param from Inclusive lower bound in epoch seconds; must be nonnegative.
+        # @param to Exclusive upper bound in epoch seconds; after from, at most 24 hours later
+        #         and no later than now.
+        # @param limit Maximum compact records per page, 1..10000; default 10000.
+        # @param cursor Nonnegative timestamp cursor in microseconds, default 0; pass nextCursor
+        #        unchanged for continuation.
+        # @return Dictionary containing compact records (timestamp, instance,
+        #        sampling.intervalSeconds and memory), more, nextCursor, legacyDecoded, timings in
+        #        milliseconds and conservative coverage metadata.
+        #
+        set started [clock microseconds]
+        if {$from < 0 || $to <= $from || $to-$from > 86400 || $to > [clock seconds]
+            || $limit < 1 || $limit > 10000 || $cursor < 0} {
+            error "expected an epoch window up to 24 hours, limit 1..10000 and nonnegative cursor"
+        }
+        set config [nsv_get ns_stats history]
+        if {$config eq ""} {error "history is not configured"}
+        if {[dict get $config owner] ne [ns_info server]} {error "query history from its configured owner server"}
+        set db [:historyConnect $config]
+        set checkedOut [clock microseconds]
+        set transaction false
+        try {
+            :sql $db {BEGIN}
+            set transaction true
+            set columns [lmap row [:sql $db {SELECT name FROM pragma_table_info('ns_stats_samples')}] {dict get $row name}]
+            if {"allocator" in $columns} {
+                set projection {coalesce(allocator,'') AS allocator,CASE WHEN allocator IS NULL THEN payload ELSE '' END AS legacy}
+            } else {
+                set projection {'' AS allocator,payload AS legacy}
+            }
+            set low [expr {$from*1000000}]; set high [expr {$to*1000000}]
+            set beforeRead [clock microseconds]
+            set rows [:sql $db "SELECT at,instance,$projection FROM ns_stats_samples WHERE at >= $low AND at < $high AND at > $cursor ORDER BY at LIMIT [expr {$limit+1}]"]
+            set afterRead [clock microseconds]
+            set more [expr {[llength $rows]>$limit}]
+            set records {}; set legacy 0
+            foreach row [lrange $rows 0 [expr {$limit-1}]] {
+                if {[dict get $row allocator] eq ""} {
+                    set point [:allocatorPoint [:unpack [dict get $row legacy]]]
+                    incr legacy
+                } else {
+                    set point [dict get $row allocator]
+                }
+                lappend records $point
+            }
+            set decoded [clock microseconds]
+            :sql $db {COMMIT}
+            set transaction false
+            return [dict create schemaVersion 1 source sqlite projection allocator from $from to $to \
+                records $records more $more nextCursor [expr {$more ? [dict get [lindex $rows $limit-1] at] : ""}] \
+                legacyDecoded $legacy coverage [dict create complete false windowExamined false \
+                    incompleteReasons [expr {$more ? {allocator-projection-not-certified more-pages} : {allocator-projection-not-certified}}]] \
+                timings [dict create checkoutMs [expr {($checkedOut-$started)/1000.0}] \
+                    readMs [expr {($afterRead-$beforeRead)/1000.0}] decodeMs [expr {($decoded-$afterRead)/1000.0}] \
+                    totalMs [expr {([clock microseconds]-$started)/1000.0}]]]
+        } finally {
+            if {$transaction} {catch {:sql $db {ROLLBACK}}}
+            ns_db releasehandle $db
+        }
+    }
+
     :public method "history query" {
         -from:integer,required
         -to:integer,required
@@ -1207,10 +1610,22 @@ nx::Class create ::ns::stats::SQLiteHistory {
         {-cursor:integer 0}
     } {
         #
-        #   Return stored samples, associated topology, paging information and
-        #   coverage for an epoch interval. Queries run in the configuring
-        #   virtual server and use an operation-local database handle.
-        #   Historical server selection may include servers no longer active.
+        # Return stored samples, associated topology, paging information and
+        # coverage for an epoch interval. Queries run in the configuring
+        # virtual server and use an operation-local database handle.
+        # Historical server selection may include servers no longer active.
+        #
+        # @param from Inclusive lower bound in epoch seconds; must be nonnegative.
+        # @param to Exclusive upper bound in epoch seconds; after from, at most 24 hours later
+        #     and no later than now.
+        # @param server Optional historical virtual-server name, including one no longer
+        #     configured; empty returns all stored server data.
+        # @param limit Maximum records per page, 1..1000; default 1000.
+        # @param cursor Nonnegative timestamp cursor in microseconds, default 0; pass nextCursor
+        #     unchanged for continuation.
+        # @return Dictionary containing records, referenced topologies, storage statistics,
+        #     coverage, more and nextCursor. Final-page coverage examines the full requested
+        #     window.
         #
         if {$from < 0
             || $to <= $from
@@ -1399,9 +1814,9 @@ nx::Class create ::ns::ns_stats -superclass ::ns::stats::Sampler {
 
     :public method "history persist" {} {
         #
-        #   Scheduled persistence entry point. Restore the configured history
-        #   mixins in this interpreter, then save the latest published sample.
-        #   Return without database access when persistence is disabled.
+        # Scheduled persistence entry point. Restore the configured history
+        # mixins in this interpreter, then save the latest published sample.
+        # Return without database access when persistence is disabled.
         #
         set config [nsv_get ns_stats history]
         if {$config eq "" || ![dict get $config enabled]} {
