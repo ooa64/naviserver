@@ -106,6 +106,19 @@
  Closes the named connection channel. The [option "-server"] can be
  used for cleanup of stale handles.
 
+[para]
+Closing a listening connection channel cancels its accept callback and
+releases the listening socket and port registration before returning.
+When called from the socket callback thread itself, teardown is deferred
+until the current callback returns. Before server startup completes,
+teardown is queued for the callback thread without waiting for startup.
+An external close can wait for an accept script running on the shared
+socket callback thread; this wait has no separate timeout. Accept scripts
+must return promptly and must not wait for another thread that is closing
+a listener. Existing accepted connections remain independent of the
+listening channel. Listener callbacks cannot be replaced
+using [cmd "ns_connchan callback"].
+
 [call [cmd "ns_connchan exists"] [arg channel]]
 
  Returns 1 if the named connection channel exists, 0 otherwise.
@@ -202,6 +215,8 @@ server.
     [opt [option "-key [arg value]"]] \
     [opt [option "-hostname [arg value ]"]] \
     [opt [option "-insecure"]] \
+    [opt [option "-localhost [arg value]"]] \
+    [opt [option "-localport [arg port]"]] \
     [opt [option "-timeout [arg time]"]] \
     [opt [option "-tls"]] \
     [opt --] \
@@ -223,6 +238,17 @@ The timeout value [arg time] can be specified in the form
 [arg secs[opt :microseconds]], or [arg secs.fraction],
 or as a number with a time unit.
 
+
+[para]
+The options [option -localhost] and [option -localport] bind the outgoing
+TCP socket to a local address and port before connecting. The address may
+be a numeric IP address or a hostname resolved through the existing
+resolver. A specified address must match the destination address family.
+Without [option -localhost], the wildcard address of the destination
+family is used. The default local port is [const 0], allowing the operating
+system to select an ephemeral port. These options also apply to the TCP
+connection underlying [option -tls]; TLS hostname verification and SNI
+continue to use the remote host and [option -hostname].
 
 [call [cmd "ns_connchan listen"] \
 	[opt [option "-driver [arg value]"]] \

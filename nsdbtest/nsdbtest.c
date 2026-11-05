@@ -33,6 +33,9 @@ static int            Exec(const Ns_DbHandle *handle, char *sql) NS_GNUC_NONNULL
 static int            GetRow(Ns_DbHandle *handle, Ns_Set *row) NS_GNUC_NONNULL(1,2);
 static Ns_ReturnCode  Flush(Ns_DbHandle *handle) NS_GNUC_NONNULL(1);
 static Ns_ReturnCode  ResetHandle(Ns_DbHandle *handle) NS_GNUC_NONNULL(1);
+static Ns_DbStatsProc Stats NS_GNUC_NONNULL(1, 2);
+static Ns_DbBindExecProc TextBind NS_GNUC_NONNULL(1, 2, 3);
+static Ns_DbBindTypedExecProc TypedBind NS_GNUC_NONNULL(1, 2, 3);
 
 /*
  * Local variables defined in this file.
@@ -72,10 +75,109 @@ static const char *const dbName = "nsdbtest";
  */
 
 NS_EXPORT Ns_ReturnCode
-Ns_DbDriverInit(const char *driver, const char *UNUSED(configPath))
+Ns_DbDriverInit(const char *driver, const char *configPath)
 {
-    return Ns_DbRegisterDriver(driver, &procs[0]);
+    const char *mode = Ns_ConfigGetValue(configPath, "bindMode");
+    const char *stats = Ns_ConfigGetValue(configPath, "statsMode");
+
+    if (mode != NULL || stats != NULL) {
+        Ns_DbProc callbacks[sizeof(procs) / sizeof(procs[0]) + 3u];
+        size_t count = sizeof(procs) / sizeof(procs[0]) - 1u;
+
+        memcpy(callbacks, procs, sizeof(procs));
+        if (mode != NULL && (STREQ(mode, "text") || STREQ(mode, "both"))) {
+            callbacks[count++] = (Ns_DbProc){DbFn_Bind, (ns_funcptr_t)TextBind};
+        }
+        if (mode != NULL && (STREQ(mode, "typed") || STREQ(mode, "both"))) {
+            callbacks[count++] = (Ns_DbProc){DbFn_BindTyped, (ns_funcptr_t)TypedBind};
+        }
+        if (stats != NULL) {
+            callbacks[count++] = (Ns_DbProc){DbFn_Stats, (ns_funcptr_t)Stats};
+        }
+        callbacks[count] = (Ns_DbProc){DbFn_End, NULL};
+        return Ns_DbRegisterDriver(driver, callbacks);
+    }
+    return Ns_DbRegisterDriver(driver, procs);
 }
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Stats --
+ *
+ *      Supply isolated statistics callback probes, without executing SQL.
+ *
+ * Results:
+ *      A dictionary, an intentional driver error, or a malformed result,
+ *      selected by the fixture datasource.
+ *
+ * Side effects:
+ *      Set the Tcl result and, for the error probe, its error code.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+Stats(Tcl_Interp *interp, Ns_DbHandle *handle, const char *database)
+{
+    Tcl_Obj *resultObj;
+
+    if (STREQ(handle->datasource, "error")) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("statistics fixture error", TCL_INDEX_NONE));
+        Tcl_SetErrorCode(interp, "NSDB", "STATS", "FIXTURE", (char *)0L);
+        return TCL_ERROR;
+    }
+    if (STREQ(handle->datasource, "invalid")) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("not a dictionary", TCL_INDEX_NONE));
+        return TCL_OK;
+    }
+    resultObj = Tcl_NewDictObj();
+    {
+        Tcl_Obj *connection = Tcl_NewDictObj(), *backend = Tcl_NewDictObj();
+        Tcl_Obj *specific = Tcl_NewDictObj();
+
+        Tcl_DictObjPut(NULL, connection, Tcl_NewStringObj("cacheHits", TCL_INDEX_NONE), Tcl_NewIntObj(17));
+        Tcl_DictObjPut(NULL, specific, Tcl_NewStringObj("database", TCL_INDEX_NONE),
+                       Tcl_NewStringObj(database != NULL ? database : "default", TCL_INDEX_NONE));
+        Tcl_DictObjPut(NULL, backend, Tcl_NewStringObj("nsdbtest", TCL_INDEX_NONE), specific);
+        Tcl_DictObjPut(NULL, resultObj, Tcl_NewStringObj("connection", TCL_INDEX_NONE), connection);
+        Tcl_DictObjPut(NULL, resultObj, Tcl_NewStringObj("backend", TCL_INDEX_NONE), backend);
+    }
+    Tcl_SetObjResult(interp, resultObj);
+    return TCL_OK;
+}
+
+/*
+ * Test-only bind callbacks deliberately fail for the "callback" probe so Tcl
+ * tests can identify which callback core selected. Ordinary probes return DML.
+ */
+static int
+TextBind(Tcl_Interp *interp, Ns_DbHandle *UNUSED(handle), const char *sql,
+         TCL_SIZE_T UNUSED(count), Tcl_Obj *const *UNUSED(names), Tcl_Obj *const *UNUSED(values))
+{
+    if (strncmp(sql, "callback", 8u) == 0) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("text callback", TCL_INDEX_NONE));
+        return NS_ERROR;
+    }
+    return NS_DML;
+}
+
+static int
+TypedBind(Tcl_Interp *interp, Ns_DbHandle *UNUSED(handle), const char *sql,
+          TCL_SIZE_T UNUSED(count), Tcl_Obj *const *UNUSED(names), Tcl_Obj *const *UNUSED(values),
+          const Ns_DbBindValueType *types)
+{
+    if (strncmp(sql, "callback", 8u) == 0) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("typed callback", TCL_INDEX_NONE));
+        return NS_ERROR;
+    }
+    if (strcmp(sql, "null-types") == 0 && types != NULL) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("expected default text types", TCL_INDEX_NONE));
+        return NS_ERROR;
+    }
+    return NS_DML;
+}
+
 
 
 /*

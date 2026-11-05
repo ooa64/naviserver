@@ -576,13 +576,10 @@ Ns_ConnSendFileVec(Ns_Conn *conn, Ns_FileVec *bufs, int nbufs)
         }
         nwrote += (size_t)sent;
         if (nwrote < towrite) {
-            const Ns_Sock *sock = (Ns_Sock *)sockPtr;
-
             if (sent > 0) {
                 (void)Ns_ResetFileVec(bufs, nbufs, (size_t)sent);
             }
-            if (Ns_SockTimedWait(sock->sock, NS_SOCK_WRITE,
-                                 &waitTimeout) != NS_OK) {
+            if (NsDriverSendWait(sockPtr, &waitTimeout) != NS_OK) {
                 break;
             }
         }
@@ -1271,11 +1268,9 @@ Ns_CompleteHeaders(Ns_Conn *conn, size_t dataLength,
                    );
 
             /*
-             * HTTP/3 provides its own message framing. Its synthetic request
-             * line uses HTTP/1.1, so the request version alone cannot determine
-             * whether chunked transfer encoding is applicable.
+             * HTTP/3 provides its own message framing.  Never apply
+             * HTTP/1 chunked transfer coding to a QUIC response.
              */
-
             if ((connPtr->responseLength < 0)
                 && ((connPtr->drvPtr->opts & NS_DRIVER_QUIC) == 0u)
                 && (conn->request.version > 1.0)
@@ -1360,9 +1355,8 @@ HdrPlanFraming(Ns_Conn *conn, size_t bodyLength, unsigned int flags)
                      "multipart/byteranges", 20 )
                );
         /*
-         * HTTP/3 provides its own message framing. Its synthetic request
-         * line uses HTTP/1.1, so the request version alone cannot determine
-         * whether chunked transfer encoding is applicable.
+         * HTTP/3 provides its own message framing. Never apply HTTP/1
+         * chunked transfer coding to a QUIC response.
          */
         if ((connPtr->responseLength < 0)
             && ((connPtr->drvPtr->opts & NS_DRIVER_QUIC) == 0u)

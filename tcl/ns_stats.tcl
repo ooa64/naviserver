@@ -25,6 +25,398 @@ namespace eval ::ns::stats {
     }
 }
 
+# Linux observations are part of every snapshot, including periodic samples.
+proc ::ns::stats::linuxReadFile {path} {
+    set content ""
+    if {[file readable $path]} {
+        try {
+            set f [open $path r]
+            set content [read $f]
+        } on error {errorMsg} {
+            # ignore errors
+        } finally {
+            if {[info exists f]} {close $f}
+        }
+    }
+    return $content
+}
+#
+# Parse files such as /proc/net/snmp and /proc/net/netstat. These
+# contain pairs of lines, with names in the first line and values in
+# the second line.
+#
+proc ::ns::stats::linuxReadNamedCounters {path} {
+    set content [::ns::stats::linuxReadFile $path]
+    set result  {}
+
+    if {$content eq ""} {
+        return $result
+    }
+
+    set lines [split [string trim $content] \n]
+    set count [llength $lines]
+
+    for {set i 0} {$i + 1 < $count} {incr i} {
+        set nameFields  [regexp -all -inline {\S+} [lindex $lines $i]]
+        set valueFields [regexp -all -inline {\S+} [lindex $lines [expr {$i + 1}]]]
+
+        if {[llength $nameFields] < 2
+            || [llength $valueFields] < 2} {
+            continue
+        }
+
+        set nameSection  [string trimright [lindex $nameFields 0] :]
+        set valueSection [string trimright [lindex $valueFields 0] :]
+
+        if {$nameSection ne $valueSection
+            || [llength $nameFields] != [llength $valueFields]} {
+            continue
+        }
+
+        foreach name [lrange $nameFields 1 end] value [lrange $valueFields 1 end] {
+            if {[string is integer -strict $value]} {
+                dict set result $nameSection $name $value
+            }
+        }
+
+        incr i
+    }
+
+    return $result
+}
+#
+# Parse /proc/net/snmp6. Unlike /proc/net/snmp, this file has one
+# name/value pair per line.
+#
+proc ::ns::stats::linuxReadSnmp6 {} {
+    set content [::ns::stats::linuxReadFile /proc/net/snmp6]
+    set result  {}
+
+    foreach line [split [string trim $content] \n] {
+        set fields [regexp -all -inline {\S+} $line]
+
+        if {[llength $fields] == 2
+            && [string is integer -strict [lindex $fields 1]]} {
+            dict set result [lindex $fields 0] [lindex $fields 1]
+        }
+    }
+
+    return $result
+}
+
+#
+# Return aggregate counters from all non-loopback network interfaces.
+#
+proc ::ns::stats::linuxReadDeviceCounters {} {
+    set content [::ns::stats::linuxReadFile /proc/net/dev]
+    set result  {}
+
+    if {$content eq ""} {
+        return $result
+    }
+
+    set rxDrops  0
+    set txDrops  0
+    set rxErrors 0
+    set txErrors 0
+    set found    0
+
+    foreach line [split $content \n] {
+        if {![regexp {^\s*([^:]+):\s*(.*)$} $line _ interface values]} {
+            continue
+        }
+
+        set interface [string trim $interface]
+        if {$interface eq "lo"} {
+            continue
+        }
+
+        set fields [regexp -all -inline {\S+} $values]
+
+        #
+        # /proc/net/dev fields:
+        #
+        # RX: bytes packets errors dropped fifo frame compressed multicast
+        # TX: bytes packets errors dropped fifo colls carrier compressed
+        #
+        if {[llength $fields] < 16} {
+            continue
+        }
+
+        incr rxErrors [lindex $fields 2]
+        incr rxDrops  [lindex $fields 3]
+        incr txErrors [lindex $fields 10]
+        incr txDrops  [lindex $fields 11]
+        set found 1
+    }
+
+    if {$found} {
+        set result [dict create \
+                        interfaceRxDrops  $rxDrops \
+                        interfaceTxDrops  $txDrops \
+                        interfaceRxErrors $rxErrors \
+                        interfaceTxErrors $txErrors]
+    }
+
+    return $result
+}
+
+#
+# Return the inode numbers of sockets owned by the NaviServer process.
+#
+proc ::ns::stats::linuxProcessSocketInodes {} {
+    set result {}
+
+    foreach fd [glob -nocomplain /proc/self/fd/*] {
+        if {[catch {file readlink $fd} target]} {
+            continue
+        }
+
+        if {[regexp {^socket:\[([0-9]+)\]$} $target _ inode]} {
+            dict set result $inode 1
+        }
+    }
+
+    return $result
+}
+
+#
+# Return aggregate kernel queues for sockets owned by NaviServer.
+#
+# For TCP listeners, rx_queue is an accept-queue count. For connected
+# TCP and UDP sockets, tx_queue and rx_queue describe queued data.
+#
+proc ::ns::stats::linuxReadSocketQueues {} {
+    set socketInodes [::ns::stats::linuxProcessSocketInodes]
+
+    if {[dict size $socketInodes] == 0} {
+        return {}
+    }
+
+    set result [dict create \
+                    tcpListenQueued     0 \
+                    tcpListenMax        0 \
+                    tcpListeners        0 \
+                    tcpReceiveBytes     0 \
+                    tcpReceiveMax       0 \
+                    tcpSendBytes        0 \
+                    tcpSendMax          0 \
+                    udpReceiveBytes     0 \
+                    udpReceiveMax       0 \
+                    udpSendBytes        0 \
+                    udpSendMax          0 \
+                    udpSocketDrops      0 \
+                    udpSocketsWithDrops 0 \
+                    udpSocketDropMax    0
+               ]
+
+    set tablesRead 0
+
+    foreach protocol {tcp udp} {
+        foreach path [list \
+                          /proc/self/net/$protocol \
+                          /proc/self/net/${protocol}6] {
+            set content [::ns::stats::linuxReadFile $path]
+
+            if {$content eq ""} {
+                continue
+            }
+            incr tablesRead
+
+            foreach line [lrange [split [string trim $content] \n] 1 end] {
+                set fields [regexp -all -inline {\S+} $line]
+
+                #
+                # Relevant fields:
+                #
+                #  3: socket state
+                #  4: tx_queue:rx_queue
+                #  9: socket inode
+                #
+                if {[llength $fields] < 10} {
+                    continue
+                }
+
+                set inode [lindex $fields 9]
+
+                if {![dict exists $socketInodes $inode]} {
+                    continue
+                }
+
+                set state      [lindex $fields 3]
+                set queueField [lindex $fields 4]
+
+                if {[scan $queueField %x:%x txQueue rxQueue] != 2} {
+                    continue
+                }
+
+                if {$protocol eq "tcp" && $state eq "0A"} {
+                    dict incr result tcpListeners
+                    dict incr result tcpListenQueued $rxQueue
+
+                    if {$rxQueue > [dict get $result tcpListenMax]} {
+                        dict set result tcpListenMax $rxQueue
+                    }
+
+                } elseif {$protocol eq "tcp"} {
+                    dict incr result tcpReceiveBytes $rxQueue
+                    dict incr result tcpSendBytes    $txQueue
+
+                    if {$rxQueue > [dict get $result tcpReceiveMax]} {
+                        dict set result tcpReceiveMax $rxQueue
+                    }
+                    if {$txQueue > [dict get $result tcpSendMax]} {
+                        dict set result tcpSendMax $txQueue
+                    }
+
+                } else {
+                    dict incr result udpReceiveBytes $rxQueue
+                    dict incr result udpSendBytes    $txQueue
+
+                    if {$rxQueue > [dict get $result udpReceiveMax]} {
+                        dict set result udpReceiveMax $rxQueue
+                    }
+                    if {$txQueue > [dict get $result udpSendMax]} {
+                        dict set result udpSendMax $txQueue
+                    }
+
+                    #
+                    # Linux exposes the cumulative socket drop counter
+                    # as the final field in /proc/net/udp{,6}.
+                    #
+                    set drops [lindex $fields end]
+                    if {[string is integer -strict $drops]} {
+                        dict incr result udpSocketDrops $drops
+
+                        if {$drops > 0} {
+                            dict incr result udpSocketsWithDrops
+                        }
+                        if {$drops > [dict get $result udpSocketDropMax]} {
+                            dict set result udpSocketDropMax $drops
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return [expr {$tablesRead > 0 ? $result : {}}]
+}
+
+# Whole block devices only: partitions would duplicate their parent counters.
+# stat fields and inflight are documented in Documentation/block/stat.rst
+# and Documentation/ABI/stable/sysfs-block in the Linux kernel.
+proc ::ns::stats::linuxDiskSnapshot {} {
+    set disks {}
+    foreach path [lsort [glob -nocomplain -directory /sys/block *]] {
+        set name [file tail $path]
+        if {[string match loop* $name] || [string match ram* $name]} {continue}
+        set fields [regexp -all -inline {\S+} [::ns::stats::linuxReadFile $path/stat]]
+        if {[llength $fields] < 11} {continue}
+        set valid 1
+        foreach value $fields {
+            if {![string is entier -strict $value] || $value < 0} {set valid 0; break}
+        }
+        if {!$valid} {continue}
+        set disk [dict create reads [lindex $fields 0] readMs [lindex $fields 3] \
+                      writes [lindex $fields 4] writeMs [lindex $fields 7]]
+        set inflight [regexp -all -inline {\S+} [::ns::stats::linuxReadFile $path/inflight]]
+        if {[llength $inflight] == 2 && [string is entier -strict [lindex $inflight 1]]
+            && [lindex $inflight 1] >= 0} {
+            dict set disk writeQueue [lindex $inflight 1]
+        }
+        dict set disks $name $disk
+    }
+    return $disks
+}
+
+proc ::ns::stats::linuxNetworkSnapshot {} {
+
+    if {![string equal -nocase Linux $::tcl_platform(os)]} {
+        return {}
+    }
+
+    set snmp    [::ns::stats::linuxReadNamedCounters /proc/net/snmp]
+    set netstat [::ns::stats::linuxReadNamedCounters /proc/net/netstat]
+    set snmp6   [::ns::stats::linuxReadSnmp6]
+    set devices [::ns::stats::linuxReadDeviceCounters]
+    set queues  [::ns::stats::linuxReadSocketQueues]
+    set disks   [::ns::stats::linuxDiskSnapshot]
+
+    set counters {}
+
+    foreach {target source section name} {
+        tcpListenOverflows netstat TcpExt ListenOverflows
+        tcpListenDrops     netstat TcpExt ListenDrops
+        tcpBacklogDrops    netstat TcpExt TCPBacklogDrop
+        tcpReceiveDrops    netstat TcpExt TCPRcvQDrop
+        tcpRetransmits     snmp    Tcp    RetransSegs
+        tcpInputErrors     snmp    Tcp    InErrs
+        udpReceiveDrops4   snmp    Udp    RcvbufErrors
+        udpSendDrops4      snmp    Udp    SndbufErrors
+        udpInputErrors4    snmp    Udp    InErrors
+    } {
+        set data [set $source]
+
+        if {[dict exists $data $section $name]} {
+            dict set counters $target [dict get $data $section $name]
+        }
+    }
+
+    foreach {target name} {
+        udpReceiveDrops6 Udp6RcvbufErrors
+        udpSendDrops6    Udp6SndbufErrors
+        udpInputErrors6  Udp6InErrors
+    } {
+        if {[dict exists $snmp6 $name]} {
+            dict set counters $target [dict get $snmp6 $name]
+        }
+    }
+
+    #
+    # Provide combined IPv4/IPv6 UDP counters for the summary.
+    #
+    foreach {combined ipv4 ipv6} {
+        udpReceiveDrops udpReceiveDrops4 udpReceiveDrops6
+        udpSendDrops    udpSendDrops4    udpSendDrops6
+        udpInputErrors  udpInputErrors4  udpInputErrors6
+    } {
+        set found 0
+        set total 0
+
+        foreach name [list $ipv4 $ipv6] {
+            if {[dict exists $counters $name]} {
+                incr total [dict get $counters $name]
+                set found 1
+            }
+        }
+
+        if {$found} {
+            dict set counters $combined $total
+        }
+    }
+
+    dict for {name value} $devices {
+        dict set counters $name $value
+    }
+
+    if {[dict size $counters] == 0
+        && [dict size $queues] == 0 && [dict size $disks] == 0} {
+        return {}
+    }
+
+    if {[dict exists $queues udpSocketDrops]} {
+        dict set counters udpSocketDrops [dict get $queues udpSocketDrops]
+        dict unset queues udpSocketDrops
+    }
+
+    return [dict create \
+                counters $counters \
+                gauges   $queues \
+                disks    $disks]
+}
+
+
 nx::Class create ::ns::stats::Collector {
     #
     #   Collect structured NaviServer topology and runtime diagnostics.
@@ -47,15 +439,24 @@ nx::Class create ::ns::stats::Collector {
     :method cpuListCount {text} {
         set ranges {}
         foreach item [split $text ,] {
-            if {![regexp {^([0-9]+)(?:-([0-9]+))?$} [string trim $item] -> first last]} {error "Invalid CPU list"}
-            if {$last eq ""} {set last $first}
-            if {$last<$first} {error "Invalid CPU range"}
+            if {![regexp {^([0-9]+)(?:-([0-9]+))?$} [string trim $item] -> first last]} {
+                error "Invalid CPU list"
+            }
+            if {$last eq ""} {
+                set last $first
+            }
+            if {$last < $first} {
+                error "Invalid CPU range"
+            }
             lappend ranges [list $first $last]
         }
         set count 0; set end -1
         foreach range [lsort -integer -index 0 $ranges] {
             lassign $range first last
-            if {$last>$end} {incr count [expr {$last-max($first,$end+1)+1}]; set end $last}
+            if {$last > $end} {
+                incr count [expr {$last-max($first,$end+1)+1}]
+                set end $last
+            }
         }
         return $count
     }
@@ -77,20 +478,30 @@ nx::Class create ::ns::stats::Collector {
         #
         set result {hostLogicalCpus {} affinityCpus {} cpusetCpus {} quotaCores {} effectiveCores {} quotaStatus unknown constraintsComplete false throttlingAvailable false throttlingScope cgroup-hierarchy throttling {} limitations {Visible CPU ceilings are not reserved capacity. Hidden ancestor limits, host contention and CPU shares can reduce availability. Throttling counters are cumulative for each visible cgroup, including other processes; ancestor counters can include sibling groups.}}
         set reasons {}; set ceilings {}
-        if {![catch {:cpuListCount [:systemText /sys/devices/system/cpu/online]} count] && $count>0} {
-            dict set result hostLogicalCpus $count; lappend ceilings $count
+        if {![catch {:cpuListCount [:systemText /sys/devices/system/cpu/online]} count] && $count > 0} {
+            dict set result hostLogicalCpus $count
+            lappend ceilings $count
         }
         if {![catch {:systemText /proc/self/status} status]
             && [regexp -line {^Cpus_allowed_list:\s*([^\n]+)} $status -> list]
-            && ![catch {:cpuListCount [string trim $list]} count] && $count>0} {
-            dict set result affinityCpus $count; lappend ceilings $count
-        } else {lappend reasons affinity-unavailable}
+            && ![catch {:cpuListCount [string trim $list]} count] && $count > 0} {
+            dict set result affinityCpus $count
+            lappend ceilings $count
+        } else {
+            lappend reasons affinity-unavailable
+        }
         set memberships {}
         if {![catch {:systemText /proc/self/cgroup} text]} {
             foreach line [split $text \n] {
-                if {![regexp {^[0-9]+:([^:]*):(.*)$} $line -> controllers path]} continue
-                if {$controllers eq ""} {dict set memberships unified $path}
-                foreach controller [split $controllers ,] {dict set memberships $controller $path}
+                if {![regexp {^[0-9]+:([^:]*):(.*)$} $line -> controllers path]} {
+                    continue
+                }
+                if {$controllers eq ""} {
+                    dict set memberships unified $path
+                }
+                foreach controller [split $controllers ,] {
+                    dict set memberships $controller $path
+                }
             }
         }
         set quotaSeen false; set quotaMissing false; set hierarchySeen false
@@ -99,59 +510,93 @@ nx::Class create ::ns::stats::Collector {
             foreach line [split $mounts \n] {
                 set parts [split $line " "]
                 set separator [lsearch -exact $parts -]
-                if {$separator<6} continue
+                if {$separator < 6} {
+                    continue
+                }
                 set type [lindex $parts [expr {$separator+1}]]
-                if {$type ni {cgroup cgroup2}} continue
+                if {$type ni {cgroup cgroup2}} {
+                    continue
+                }
                 set root [:mountPath [lindex $parts 3]]
                 set mount [:mountPath [lindex $parts 4]]
                 set controllers [split [lindex $parts [expr {$separator+3}]] ,]
                 set key {}; set cpu false; set cpuset false
                 if {$type eq "cgroup2" && [dict exists $memberships unified]} {
-                    set key unified; set cpu true; set cpuset true
+                    set key unified
+                    set cpu true
+                    set cpuset true
                 } else {
                     foreach controller {cpu cpuset} {
                         if {$controller in $controllers && [dict exists $memberships $controller]} {
                             set key $controller
-                            if {$controller eq "cpu"} {set cpu true} else {set cpuset true}
+                            if {$controller eq "cpu"} {
+                                set cpu true
+                            } else {
+                                set cpuset true
+                            }
                         }
                     }
                 }
-                if {$key eq ""} continue
+                if {$key eq ""} {
+                    continue
+                }
                 set member [dict get $memberships $key]
                 # Do not traverse outside a visible mount, including namespace
                 # membership paths containing parent components.
-                if {".." in [file split $member]} {lappend reasons cgroup-path-unresolvable; continue}
-                if {$root eq "/"} {set relative [string trimleft $member /]
-                } elseif {$member eq "/" || $member eq $root} {set relative {}
-                } elseif {[string first "$root/" $member]==0} {set relative [string range $member [expr {[string length $root]+1}] end]
-                } else {continue}
+                if {".." in [file split $member]} {
+                    lappend reasons cgroup-path-unresolvable
+                    continue
+                }
+                if {$root eq "/"} {
+                    set relative [string trimleft $member /]
+                } elseif {$member eq "/" || $member eq $root} {
+                    set relative {}
+                } elseif {[string first "$root/" $member] == 0} {
+                    set relative [string range $member [string length $root]+1 end]
+                } else {
+                    continue
+                }
                 set directory [file join $mount $relative]
                 set hierarchySeen true
                 while {1} {
-                    if {[lsearch -exact $visited [list $directory $cpu $cpuset]]<0} {
+                    if {[lsearch -exact $visited [list $directory $cpu $cpuset]] < 0} {
                         lappend visited [list $directory $cpu $cpuset]
                         if {$cpu} {
                             if {$type eq "cgroup2"} {
                                 set readable [expr {![catch {:systemText $directory/cpu.max} maximum]}]
                                 if {$readable && [regexp {^(max|[0-9]+) ([1-9][0-9]*)$} $maximum -> quota period]} {
                                     set quotaSeen true
-                                    if {$quota ne "max" && $quota>0} {lappend ceilings [expr {double($quota)/$period}]; set q [expr {double($quota)/$period}]
-                                        if {[dict get $result quotaCores] eq "" || $q<[dict get $result quotaCores]} {dict set result quotaCores $q}}
-                                } elseif {$directory ne $mount} {set quotaMissing true}
+                                    if {$quota ne "max" && $quota > 0} {
+                                        lappend ceilings [expr {double($quota)/$period}]
+                                        set q [expr {double($quota)/$period}]
+                                        if {[dict get $result quotaCores] eq "" || $q < [dict get $result quotaCores]} {
+                                            dict set result quotaCores $q}
+                                    }
+                                } elseif {$directory ne $mount} {
+                                    set quotaMissing true
+                                }
                             } else {
                                 if {![catch {:systemText $directory/cpu.cfs_quota_us} quota]
                                     && ![catch {:systemText $directory/cpu.cfs_period_us} period]
-                                    && [string is entier -strict $quota] && [string is entier -strict $period] && $period>0} {
+                                    && [string is entier -strict $quota] && [string is entier -strict $period] && $period > 0} {
                                     set quotaSeen true
-                                    if {$quota>0} {set q [expr {double($quota)/$period}]; lappend ceilings $q
-                                        if {[dict get $result quotaCores] eq "" || $q<[dict get $result quotaCores]} {dict set result quotaCores $q}}
-                                } else {set quotaMissing true}
+                                    if {$quota>0} {
+                                        set q [expr {double($quota)/$period}]
+                                        lappend ceilings $q
+                                        if {[dict get $result quotaCores] eq "" || $q < [dict get $result quotaCores]} {
+                                            dict set result quotaCores $q}
+                                    }
+                                } else {
+                                    set quotaMissing true
+                                }
                             }
                             if {![catch {:systemText $directory/cpu.stat} counters]} {
                                 set row [dict create path $directory]
                                 foreach counter [split $counters \n] {
                                     lassign $counter name value
-                                    if {![string is entier -strict $value] || $value<0} continue
+                                    if {![string is entier -strict $value] || $value < 0} {
+                                        continue
+                                    }
                                     switch -- $name {
                                         nr_periods {dict set row periods $value}
                                         nr_throttled {dict set row throttledPeriods $value}
@@ -159,14 +604,18 @@ nx::Class create ::ns::stats::Collector {
                                         throttled_time {dict set row throttledSeconds [expr {$value/1000000000.0}]}
                                     }
                                 }
-                                if {[dict size $row]>1} {dict set groups $directory $row}
+                                if {[dict size $row] > 1} {
+                                    dict set groups $directory $row
+                                }
                             }
                         }
                         if {$cpuset} {
                             set file [expr {$type eq "cgroup2" ? "cpuset.cpus.effective" : "cpuset.cpus"}]
-                            if {![catch {:systemText $directory/$file} list] && $list ne "" && ![catch {:cpuListCount $list} count] && $count>0} {
+                            if {![catch {:systemText $directory/$file} list] && $list ne "" && ![catch {:cpuListCount $list} count] && $count > 0} {
                                 lappend ceilings $count
-                                if {[dict get $result cpusetCpus] eq "" || $count<[dict get $result cpusetCpus]} {dict set result cpusetCpus $count}
+                                if {[dict get $result cpusetCpus] eq "" || $count < [dict get $result cpusetCpus]} {
+                                    dict set result cpusetCpus $count
+                                }
                             }
                         }
                     }
@@ -182,7 +631,7 @@ nx::Class create ::ns::stats::Collector {
         dict set result constraintsComplete [expr {$reasons eq ""}]
         dict set result incompleteReasons [lsort -unique $reasons]
         dict set result throttling $groups
-        dict set result throttlingAvailable [expr {[dict size $groups]>0}]
+        dict set result throttlingAvailable [expr {[dict size $groups] > 0}]
         return $result
     }
 
@@ -326,6 +775,11 @@ nx::Class create ::ns::stats::Collector {
                         cpu {} \
                         availability {} \
                         units {time seconds cpuCounter microseconds cpuPercent percentOfOneCore}]
+        # Optional probes must not prevent publication of core diagnostics.
+        set linuxNetwork {}
+        if {[catch {::ns::stats::linuxNetworkSnapshot} linuxNetwork]} {set linuxNetwork {}}
+        dict set result linuxNetwork $linuxNetwork
+        dict set result availability linuxNetwork [expr {$linuxNetwork ne ""}]
         dict set result process cpuCapacity [:cpuCapacity]
         if {![catch {ns_driver stats} stats]} {
             foreach entry $stats {
@@ -446,6 +900,15 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
             }
         }
     }
+    :method memoryLimits {} {
+        set retention [ns_baseunit -time [ns_config ns/stats samplingRetention 15m]]
+        set count [ns_config -int -min 2 -max 10000 ns/stats samplingMaxSamples 180]
+        if {$retention < 1 || $retention > 86400} {
+            error "ns/stats samplingRetention must be 1 second..24 hours"
+        }
+        return [dict create retentionSeconds $retention maxSamples $count]
+    }
+
     :public method "sampling status" {} {
         #
         # Return the process-wide sampler configuration and status, including
@@ -467,6 +930,29 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
         dict set result ready [expr {$sample ne "" && [dict get $sample sampling ready]}]
         dict set result latestAt {}
         dict set result ageSeconds {}
+        set limits [:memoryLimits]
+        dict set result retentionSeconds [dict get $limits retentionSeconds]
+        dict set result maxSamples [dict get $limits maxSamples]
+        dict set result maxWindowSeconds [expr {min([dict get $limits retentionSeconds],
+                                                     ([dict get $limits maxSamples]-1)*[dict get $result interval])}]
+        set recent [nsv_get ns_stats recent]
+        set available 0.0
+        if {$recent ne ""} {
+            set last [lindex $recent end]
+            set first $last
+            foreach record [lreverse [lrange $recent 0 end-1]] {
+                if {[dict get $first instance] ne [dict get $record instance]
+                    || [dict get $first instance] ne [dict get $result instance]
+                    || ![dict get $first sampling ready]
+                    || [dict get $first timestamp]-[dict get $record timestamp]
+                       > 1.5*max([dict get $first sampling intervalSeconds],
+                                 [dict get $record sampling intervalSeconds])*1000000} {break}
+                set first $record
+            }
+            set available [expr {min([dict get $result maxWindowSeconds],
+                                    ([dict get $last timestamp]-[dict get $first timestamp])/1000000.0)}]
+        }
+        dict set result availableWindowSeconds $available
         if {$sample ne ""} {
             set stamp [dict get $sample timestamp]
             dict set result latestAt [expr {$stamp/1000000.0}]
@@ -496,6 +982,7 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
         if {$interval < 1 || $interval > 3600} {
             error "interval must be 1..3600 seconds"
         }
+        :memoryLimits
         :locked {
             set state [nsv_get ns_stats control]
             if {[dict get $state running]} {
@@ -549,7 +1036,7 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
         #
         # An optional server argument restricts virtual-server data; CPU
         # measurements remain process-wide. Without -window, does not collect
-        # observations or advance the baseline. With -window (0..900 seconds, time units
+        # observations or advance the baseline. With -window (up to the configured memory limit, time units
         # accepted), collect a fresh snapshot and compare it with the nearest retained
         # endpoint to that age (within half a sampling interval). Missing
         # history, gaps or sampler restarts leave readiness false. The
@@ -559,8 +1046,8 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
         #
         # @param server Optional virtual-server name; empty returns all servers. CPU metrics
         #     remain process-wide.
-        # @param window Requested display period, accepting ns_baseunit time syntax; 0..900
-        #     seconds, default 0 for the latest published sample.
+        # @param window Requested display period, accepting ns_baseunit time syntax; bounded by memory retention
+        #     and sample count, default 0 for the latest published sample.
         # @return Sample dictionary with sampling readiness and age; a positive window adds
         #     freshly calculated interval metrics when a suitable continuous baseline exists.
         #
@@ -568,8 +1055,12 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
             error "unknown server: $server"
         }
         set window [ns_baseunit -time $window]
-        if {$window < 0 || $window > 900} {
-            error "display window must be 0..900 seconds"
+        set limits [:memoryLimits]
+        set control [nsv_get ns_stats control]
+        set maximum [expr {min([dict get $limits retentionSeconds],
+                              ([dict get $limits maxSamples]-1)*[dict get $control interval])}]
+        if {$window < 0 || $window > $maximum} {
+            error "display window must be 0..$maximum seconds; configure ns/stats samplingRetention and samplingMaxSamples for longer windows"
         }
         :locked {
             set result [nsv_get ns_stats pair]
@@ -619,8 +1110,8 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
                     set previous $record
                 }
             }
-            if {$baseline ne "" && [dict get $current timestamp]-[dict get $previous timestamp]
-                > 1.5*$cadence*1000000} {
+            if {$baseline ne ""
+                && [dict get $current timestamp]-[dict get $previous timestamp] > 1.5*$cadence*1000000} {
                 set baseline {}
                 set reason sampling-gap
             }
@@ -690,6 +1181,14 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
                                       intervalSeconds $interval]
         if {$ready} {
             dict set result sampling from [expr {[dict get $previous timestamp]/1000000.0}]
+        }
+
+        # Keep the matching Linux endpoint with the derived interval. This also
+        # lets display-window samples and persisted history use the exact baseline,
+        # without another /proc read or a page-request baseline.
+        dict set result previousLinuxNetwork {}
+        if {$ready && [dict exists $previous linuxNetwork]} {
+            dict set result previousLinuxNetwork [dict get $previous linuxNetwork]
         }
 
         dict for {s server} [dict get $current servers] {
@@ -780,12 +1279,14 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
                     set delta {}
                     if {$ready && [dict exists $row $field] && [dict exists $previous process cpuCapacity throttling $path $field]} {
                         set old [dict get $previous process cpuCapacity throttling $path $field]
-                        if {[dict get $row $field]>=$old} {set delta [expr {[dict get $row $field]-$old}]}
+                        if {[dict get $row $field] >= $old} {
+                            set delta [expr {[dict get $row $field]-$old}]
+                        }
                     }
                     dict set row delta[string toupper [string index $field 0]][string range $field 1 end] $delta
                 }
                 dict set row throttledPeriodPercent {}
-                if {[dict get $row deltaPeriods] ne "" && [dict get $row deltaPeriods]>0 && [dict get $row deltaThrottledPeriods] ne ""} {
+                if {[dict get $row deltaPeriods] ne "" && [dict get $row deltaPeriods] > 0 && [dict get $row deltaThrottledPeriods] ne ""} {
                     dict set row throttledPeriodPercent [expr {100.0*[dict get $row deltaThrottledPeriods]/[dict get $row deltaPeriods]}]
                 }
                 dict set result process cpuCapacity throttling $path $row
@@ -810,10 +1311,11 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
         }
         set records [nsv_get ns_stats recent]
         lappend records $record
-        set cutoff [expr {[dict get $record timestamp]-900000000}]
+        set limits [:memoryLimits]
+        set cutoff [expr {[dict get $record timestamp]-[dict get $limits retentionSeconds]*1000000}]
         set dropped [nsv_get ns_stats recentDroppedThrough]
-        while {[llength $records]>180
-               || ([llength $records]>1 && [dict get [lindex $records 0] timestamp]<$cutoff)} {
+        while {[llength $records] > [dict get $limits maxSamples]
+               || ([llength $records] > 1 && [dict get [lindex $records 0] timestamp] < $cutoff)} {
             set dropped [dict get [lindex $records 0] timestamp]
             set records [lrange $records 1 end]
         }
@@ -830,7 +1332,7 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
     } {
         #
         # Read the bounded process-wide recent sample buffer without SQLite.
-        # Retains at most 180 compact samples and 15 minutes at publication.
+        # Retains compact samples within the configured memory age/count limits.
         # Returns interval metrics, coverage and timestamp-based paging.
         # Raw/per-thread CPU counters are omitted. Reading does not collect,
         # start sampling, advance baselines or write persistent history.
@@ -847,11 +1349,11 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
         # @return Dictionary containing records, retained bounds, coverage, more and nextCursor
         #     for the in-memory history buffer.
         #
-        if {$from<0 || $to<=$from || $to-$from>86400 || $to>[clock seconds]
-            || $limit<1 || $limit>180 || $cursor<0} {
+        if {$from < 0 || $to <= $from || $to - $from > 86400 || $to > [clock seconds]
+            || $limit < 1 || $limit > 180 || $cursor < 0} {
             error "expected an epoch window up to 24 hours, limit 1..180 and nonnegative cursor"
         }
-        if {[string length $server]>512 || [string first \x00 $server]>=0} {
+        if {[string length $server] > 512 || [string first \x00 $server] >= 0} {
             error "invalid server name"
         }
         :locked {
@@ -872,22 +1374,22 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
                 set first $stamp
             }
             set last $stamp
-            if {$stamp<$from*1000000 || $stamp<=$cursor} {
+            if {$stamp < $from*1000000 || $stamp <= $cursor} {
                 set previous $record
                 continue
             }
-            if {$stamp>=$to*1000000} {
+            if {$stamp >= $to*1000000} {
                 # A gap crossing the upper bound must not certify coverage.
                 if {$previous ne ""} {
                     set delta [expr {($stamp-[dict get $previous timestamp])/1000000.0}]
-                    if {$delta>1.5*max([dict get $previous sampling intervalSeconds],
+                    if {$delta > 1.5*max([dict get $previous sampling intervalSeconds],
                                        [dict get $record sampling intervalSeconds])} {
                         lappend gaps [dict create from [dict get $previous sampling to] to [dict get $record sampling to]]
                     }
                 }
                 break
             }
-            if {[llength $records]>=$limit} {
+            if {[llength $records] >= $limit} {
                 set more true
                 break
             }
@@ -899,7 +1401,7 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
                     lappend restarts [dict get $record sampling to]
                 }
                 set delta [expr {($stamp-[dict get $previous timestamp])/1000000.0}]
-                if {$delta>1.5*max([dict get $previous sampling intervalSeconds],
+                if {$delta > 1.5*max([dict get $previous sampling intervalSeconds],
                                    [dict get $record sampling intervalSeconds])} {
                     lappend gaps [dict create from [dict get $previous sampling to] to [dict get $record sampling to]]
                 }
@@ -912,14 +1414,14 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
             set first [dict get [lindex $retained 0] timestamp]
             set last [dict get [lindex $retained end] timestamp]
         }
-        set overlap [expr {$dropped ne "" && $dropped>=$from*1000000}]
-        if {!$more && $cursor>0} {
+        set overlap [expr {$dropped ne "" && $dropped >= $from*1000000}]
+        if {!$more && $cursor > 0} {
             set window [:sampling history -from $from -to $to -server $server -limit 180]
             set coverage [dict get $window coverage]
             return [dict create schemaVersion 1 source memory from $from to $to records $records \
-                        nextCursor {} more false retentionSeconds 900 maxSamples 180 coverage $coverage]
+                        nextCursor {} more false retentionSeconds [dict get [:memoryLimits] retentionSeconds] maxSamples [dict get [:memoryLimits] maxSamples] coverage $coverage]
         }
-        set complete [expr {$first ne "" && $first<=$from*1000000 && $last>=$to*1000000
+        set complete [expr {$first ne "" && $first <= $from*1000000 && $last >= $to*1000000
                              && !$more && $cursor==0 && !$overlap && $gaps eq ""
                              && $restarts eq "" && $resets==0}]
         set next {}
@@ -927,7 +1429,7 @@ nx::Class create ::ns::stats::Sampler -superclass ::ns::stats::Collector {
             set next [dict get [lindex $records end] timestamp]
         }
         return [dict create schemaVersion 1 source memory from $from to $to records $records \
-                    nextCursor $next more $more retentionSeconds 900 maxSamples 180 \
+                    nextCursor $next more $more retentionSeconds [dict get [:memoryLimits] retentionSeconds] maxSamples [dict get [:memoryLimits] maxSamples] \
                     coverage [dict create complete $complete windowExamined [expr {!$more && $cursor==0}] \
                         retainedFrom [expr {$first eq "" ? 0 : $first/1000000.0}] \
                         retainedTo [expr {$last eq "" ? 0 : $last/1000000.0}] \
@@ -1034,11 +1536,6 @@ nx::Class create ::ns::stats::SQLiteHistory {
         return [encoding convertfrom utf-8 [zlib decompress [binary decode hex $value]]]
     }
 
-    :method quote {value} {
-        # Payloads are hex-encoded by pack; other values use standard nsdb quoting.
-        return [ns_dbquotevalue $value]
-    }
-
     # Fixed SQL statements use quote for values. Fetch only non-null columns
     # (including aggregate coalesce), since older nsdbsqlite drivers cannot
     # return SQL NULL safely. Flush pending rows and release the row set.
@@ -1051,7 +1548,7 @@ nx::Class create ::ns::stats::SQLiteHistory {
         try {
             while {[ns_db getrow $db $row]} {
                 set result {}
-                for {set i 0} {$i<[ns_set size $row]} {incr i} {
+                for {set i 0} {$i < [ns_set size $row]} {incr i} {
                     dict set result [ns_set key $row $i] [ns_set value $row $i]
                 }
                 lappend rows $result
@@ -1090,18 +1587,11 @@ nx::Class create ::ns::stats::SQLiteHistory {
             } {
                 error "history requires a dedicated database"
             }
-            foreach query {
-                {PRAGMA busy_timeout=1000}
-                {PRAGMA journal_mode=DELETE}
-                {PRAGMA synchronous=FULL}
-                {PRAGMA temp_store=MEMORY}
-            } {
-                :sql $db $query
-            }
+            # Connection policy is established by the SQLite pool, not by history.
             set page [:scalar $db {PRAGMA page_size}]
             set maximum [expr {int([dict get $config maxBytes]*0.45)/$page}]
 
-            if {[:scalar $db {PRAGMA page_count}]>$maximum} {
+            if {[:scalar $db {PRAGMA page_count}] > $maximum} {
                 error "existing history database exceeds byte budget"
             }
             :sql $db "PRAGMA max_page_count=$maximum"
@@ -1130,9 +1620,9 @@ nx::Class create ::ns::stats::SQLiteHistory {
         if {$version ne "" && $version ne "1"} {
             error "unsupported diagnostics history schema"
         }
-        set source [:quote [list [ns_info hostname] [ns_info home]]]
+        set source [ns_dbquotevalue [list [ns_info hostname] [ns_info home]]]
         set stored [:scalar $db {SELECT value FROM ns_stats_meta WHERE key='source'}]
-        if {$stored ne "" && [:quote $stored] ne $source} {
+        if {$stored ne "" && [ns_dbquotevalue $stored] ne $source} {
             error "history database belongs to another process installation"
         }
         :sql $db {INSERT OR IGNORE INTO ns_stats_meta VALUES('schemaVersion','1')}
@@ -1256,7 +1746,7 @@ nx::Class create ::ns::stats::SQLiteHistory {
         set now [clock microseconds]
         :sql $db "DELETE FROM ns_stats_samples WHERE $where"
         :sql $db {DELETE FROM ns_stats_topology WHERE id NOT IN (SELECT DISTINCT topology FROM ns_stats_samples)}
-        :sql $db "INSERT INTO ns_stats_events(at,first,last,n,reason) VALUES($now,$first,$last,$n,[:quote $reason])"
+        :sql $db "INSERT INTO ns_stats_events(at,first,last,n,reason) VALUES($now,$first,$last,$n,[ns_dbquotevalue $reason])"
         set prior [:scalar $db {SELECT value FROM ns_stats_meta WHERE key='droppedThrough'}]
         set through [expr {$prior eq "" ? $last : max($last,$prior)}]
         :sql $db "INSERT OR REPLACE INTO ns_stats_meta VALUES('droppedThrough','$through')"
@@ -1311,7 +1801,7 @@ nx::Class create ::ns::stats::SQLiteHistory {
             # Collection and SQLite work happen outside the shared control mutex.
             set now [clock seconds]
             set topology [dict get $config topology]
-            if {$topology eq "" || $now-[dict get $config topologyAt]>=60} {
+            if {$topology eq "" || $now-[dict get $config topologyAt] >= 60} {
                 set topology [:describe]
                 foreach k {pid bootTime uptimeSeconds} {dict unset topology process $k}
                 dict set config topology $topology
@@ -1351,12 +1841,12 @@ nx::Class create ::ns::stats::SQLiteHistory {
                 }
                 :historyDrop $db {at IN (SELECT at FROM ns_stats_samples ORDER BY at LIMIT 100)} size
             }
-            set stored [:scalar $db "SELECT payload FROM ns_stats_topology WHERE id=[:quote $topologyId]"]
+            set stored [:scalar $db "SELECT payload FROM ns_stats_topology WHERE id=[ns_dbquotevalue $topologyId]"]
             if {$stored ne "" && [:unpack $stored] ne $topology} {
                 error "history topology fingerprint collision"
             }
-            :sql $db "INSERT OR IGNORE INTO ns_stats_topology VALUES([:quote $topologyId],[:quote $packedTopology])"
-            :sql $db "INSERT OR IGNORE INTO ns_stats_samples(at,instance,topology,payload,allocator) VALUES($stamp,[:quote [dict get $record instance]],[:quote $topologyId],[:quote $packed],[:quote $allocator])"
+            :sql $db "INSERT OR IGNORE INTO ns_stats_topology VALUES([ns_dbquotevalue $topologyId],[ns_dbquotevalue $packedTopology])"
+            :sql $db "INSERT OR IGNORE INTO ns_stats_samples(at,instance,topology,payload,allocator) VALUES($stamp,[ns_dbquotevalue [dict get $record instance]],[ns_dbquotevalue $topologyId],[ns_dbquotevalue $packed],[ns_dbquotevalue $allocator])"
             foreach gap [dict get $config gaps] {
                 lassign $gap first last n
                 :sql $db "INSERT INTO ns_stats_events(at,first,last,n,reason) VALUES($stamp,$first,$last,$n,'write-failure')"
@@ -1431,17 +1921,17 @@ nx::Class create ::ns::stats::SQLiteHistory {
             foreach row $rows {
                 set cursor [dict get $row at]
                 set record [:unpack [dict get $row payload]]
-                if {$cursor<$high && ![dict get $record sampling ready]} {
+                if {$cursor < $high && ![dict get $record sampling ready]} {
                     incr resets
                 }
                 if {$previous ne ""} {
-                    if {$cursor<$high && [dict get $previous instance] ne [dict get $record instance]} {
+                    if {$cursor < $high && [dict get $previous instance] ne [dict get $record instance]} {
                         lappend restarts [dict get $record sampling to]
                     }
                     set delta [expr {($cursor-[dict get $previous timestamp])/1000000.0}]
-                    if {$delta>1.5*max([dict get $previous sampling intervalSeconds],
-                                       [dict get $record sampling intervalSeconds])
-                        || ($cursor>=$high && (![dict get $record sampling ready]
+                    if {$delta > 1.5*max([dict get $previous sampling intervalSeconds],
+                                         [dict get $record sampling intervalSeconds])
+                        || ($cursor >= $high && (![dict get $record sampling ready]
                             || [dict get $previous instance] ne [dict get $record instance]))} {
                         lappend gaps [dict create from [dict get $previous sampling to] to [dict get $record sampling to]]
                     }
@@ -1468,15 +1958,15 @@ nx::Class create ::ns::stats::SQLiteHistory {
         set freePages [:scalar $db {PRAGMA freelist_count}]
         set used [expr {($pageCount-$freePages)*$pageSize}]
         set span [expr {($last-$first)/1000000.0}]
-        return [dict create retainedFrom [expr {$first>0 ? $first/1000000.0 : ""}] \
-                    retainedTo [expr {$last>0 ? $last/1000000.0 : ""}] \
+        return [dict create retainedFrom [expr {$first > 0 ? $first/1000000.0 : ""}] \
+                    retainedTo [expr {$last > 0 ? $last/1000000.0 : ""}] \
                     retainedSeconds $span sampleCount [dict get $bounds n] \
                     pageSize $pageSize allocatedBytes [expr {$pageCount*$pageSize}] \
                     usedBytes $used freeBytes [expr {$freePages*$pageSize}] \
                     databaseLimitBytes [expr {[:scalar $db {PRAGMA max_page_count}]*$pageSize}] \
                     maxBytes [dict get $config maxBytes] \
-                    bytesPerSample [expr {[dict get $bounds n]>0 ? double($used)/[dict get $bounds n] : ""}] \
-                    bytesPerSecond [expr {$span>0 ? $used/$span : ""}]]
+                    bytesPerSample [expr {[dict get $bounds n] > 0 ? double($used)/[dict get $bounds n] : ""}] \
+                    bytesPerSecond [expr {$span > 0 ? $used/$span : ""}]]
     }
 
     :public method "history storage" {} {
@@ -1571,13 +2061,15 @@ nx::Class create ::ns::stats::SQLiteHistory {
             } else {
                 set projection {'' AS allocator,payload AS legacy}
             }
-            set low [expr {$from*1000000}]; set high [expr {$to*1000000}]
+            set low [expr {$from*1000000}]
+            set high [expr {$to*1000000}]
             set beforeRead [clock microseconds]
             set rows [:sql $db "SELECT at,instance,$projection FROM ns_stats_samples WHERE at >= $low AND at < $high AND at > $cursor ORDER BY at LIMIT [expr {$limit+1}]"]
             set afterRead [clock microseconds]
-            set more [expr {[llength $rows]>$limit}]
-            set records {}; set legacy 0
-            foreach row [lrange $rows 0 [expr {$limit-1}]] {
+            set more [expr {[llength $rows] > $limit}]
+            set records {}
+            set legacy 0
+            foreach row [lrange $rows 0 $limit-1] {
                 if {[dict get $row allocator] eq ""} {
                     set point [:allocatorPoint [:unpack [dict get $row legacy]]]
                     incr legacy
@@ -1597,7 +2089,9 @@ nx::Class create ::ns::stats::SQLiteHistory {
                     readMs [expr {($afterRead-$beforeRead)/1000.0}] decodeMs [expr {($decoded-$afterRead)/1000.0}] \
                     totalMs [expr {([clock microseconds]-$started)/1000.0}]]]
         } finally {
-            if {$transaction} {catch {:sql $db {ROLLBACK}}}
+            if {$transaction} {
+                catch {:sql $db {ROLLBACK}}
+            }
             ns_db releasehandle $db
         }
     }
@@ -1637,7 +2131,7 @@ nx::Class create ::ns::stats::SQLiteHistory {
         } {
             error "expected an epoch window up to 24 hours, limit 1..1000 and nonnegative cursor"
         }
-        if {[string length $server]>512 || [string first \x00 $server] >= 0} {
+        if {[string length $server] > 512 || [string first \x00 $server] >= 0} {
             error "invalid server name"
         }
         set config [nsv_get ns_stats history]
@@ -1657,7 +2151,7 @@ nx::Class create ::ns::stats::SQLiteHistory {
             set count [expr {$limit + 1}]
             set rows [:sql $db "SELECT at,topology,payload FROM ns_stats_samples WHERE at >= $low AND at < $high AND at > $cursor ORDER BY at LIMIT $count"]
             set more [expr {[llength $rows] > $limit}]
-            set rows [lrange $rows 0 [expr {$limit - 1}]]
+            set rows [lrange $rows 0 $limit-1]
             set records {}
             set gaps {}
             set restarts {}
@@ -1690,7 +2184,7 @@ nx::Class create ::ns::stats::SQLiteHistory {
                 dict set record topologyId $id
                 if {![dict exists $topology $id]} {
                     dict set topology $id [:selectServer \
-                                               [:unpack [:scalar $db "SELECT payload FROM ns_stats_topology WHERE id=[:quote $id]"]] \
+                                               [:unpack [:scalar $db "SELECT payload FROM ns_stats_topology WHERE id=[ns_dbquotevalue $id]"]] \
                                                $server false]
                 }
                 lappend records [:selectServer $record $server false]
@@ -1733,16 +2227,30 @@ nx::Class create ::ns::stats::SQLiteHistory {
                 set restarts [dict get $window restartBoundaries]
                 set resets [dict get $window resetSamples]
             }
-            set complete [expr {$first>0 && $first<=$low && $last>=$high && !$more
+            set complete [expr {$first > 0 && $first <= $low && $last >= $high && !$more
                                 && !$overlap && $gaps eq "" && $restarts eq "" && $resets==0}]
             set reasons {}
-            if {$more} {lappend reasons more-pages}
-            if {$first==0 || $first>$low} {lappend reasons before-retained-history}
-            if {$last<$high} {lappend reasons after-latest-sample}
-            if {$overlap} {lappend reasons eviction-or-write-failure}
-            if {$gaps ne ""} {lappend reasons gaps}
-            if {$restarts ne ""} {lappend reasons restarts}
-            if {$resets>0} {lappend reasons baseline-or-reset}
+            if {$more} {
+                lappend reasons more-pages
+            }
+            if {$first == 0 || $first > $low} {
+                lappend reasons before-retained-history
+            }
+            if {$last < $high} {
+                lappend reasons after-latest-sample
+            }
+            if {$overlap} {
+                lappend reasons eviction-or-write-failure
+            }
+            if {$gaps ne ""} {
+                lappend reasons gaps
+            }
+            if {$restarts ne ""} {
+                lappend reasons restarts
+            }
+            if {$resets > 0} {
+                lappend reasons baseline-or-reset
+            }
             set result [dict create \
                             schemaVersion 1 from $from to $to records $records \
                             topologies $topology nextCursor $next more $more \
@@ -1780,6 +2288,31 @@ nx::Class create ::ns::ns_stats -superclass ::ns::stats::Sampler {
     #   SQLiteHistory supplies the history ensemble as an object mixin;
     #   persistence remains inactive until history configure is called.
     #
+    :method syntaxErrors {args} {
+        # NX qualifies the object name in generated usage. Present the public
+        # command name consistently with NaviServer's other Tcl commands.
+        try {
+            next
+        } on error {message options} {
+            # Parameterless NX ensemble methods report only the final selector.
+            set method [lindex $args 0]
+            set ensemble [current calledmethod]
+            if {(($ensemble eq "sampling" && $method in {stop status})
+                 || ($ensemble eq "history" && $method in {status disable storage}))
+                && $message eq "wrong # args: should be \"$method\""} {
+                set message "wrong # args: should be \"ns_stats $ensemble $method\""
+            }
+            return -options $options [string map {
+                {should be "::ns_stats } {should be "ns_stats }
+                {should be:
+        ::ns_stats } {should be:
+        ns_stats }
+            } $message]
+        }
+    }
+    :filters add syntaxErrors
+    :filters guard syntaxErrors {[current calledmethod] in {describe snapshot sample sampling history}}
+
     :method startup {} {
         #
         #   Apply the process-wide ns/stats startup configuration once, in
@@ -1799,7 +2332,7 @@ nx::Class create ::ns::ns_stats -superclass ::ns::stats::Sampler {
             return
         }
         set interval [ns_baseunit -time [ns_config $section samplingInterval 10s]]
-        if {$sampling && ($interval<1 || $interval>3600)} {
+        if {$sampling && ($interval < 1 || $interval > 3600)} {
             error "ns/stats samplingInterval must be 1..3600 seconds"
         }
         if {$pool ne ""} {
@@ -1852,3 +2385,9 @@ if {![ns_info started]} {
     }
     unset statsStartupServer
 }
+
+# Local variables:
+#    mode: tcl
+#    tcl-indent-level: 4
+#    indent-tabs-mode: nil
+# End:

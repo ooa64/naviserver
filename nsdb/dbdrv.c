@@ -73,6 +73,12 @@ typedef struct DbDriver {
     SpReturnCodeProc *spreturncodeProc;
     SpGetParamsProc  *spgetparamsProc;
     VersionProc      *versionProc;
+    Ns_DbStatsProc   *statsProc;
+    const Ns_DbBatchDriverOps *batchOps;
+    Ns_DbBindExecProc *bindExecProc;
+    Ns_DbBindTypedExecProc *bindTypedExecProc;
+    Ns_DbBindTypesProc *bindTypesProc;
+    Ns_DbBindParameterProc *bindParameterProc;
 } DbDriver;
 
 /*
@@ -206,8 +212,32 @@ Ns_DbRegisterDriver(const char *driver, const Ns_DbProc *procs)
             driverPtr->spgetparamsProc = (SpGetParamsProc *) procs->func;
             break;
 
+        case DbFn_BindParameter:
+            driverPtr->bindParameterProc = (Ns_DbBindParameterProc *) procs->func;
+            break;
+
+        case DbFn_BindTypes:
+            driverPtr->bindTypesProc = (Ns_DbBindTypesProc *) procs->func;
+            break;
+
+        case DbFn_BindTyped:
+            driverPtr->bindTypedExecProc = (Ns_DbBindTypedExecProc *) procs->func;
+            break;
+
+        case DbFn_Bind:
+            driverPtr->bindExecProc = (Ns_DbBindExecProc *) procs->func;
+            break;
+
+        case DbFn_Batch:
+            driverPtr->batchOps = ((Ns_DbBatchDriverProc *) procs->func)();
+            break;
+
         case DbFn_Version:
             driverPtr->versionProc = (VersionProc *) procs->func;
+            break;
+
+        case DbFn_Stats:
+            driverPtr->statsProc = (Ns_DbStatsProc *) procs->func;
             break;
 
 #ifdef NS_WITH_DEPRECATED
@@ -342,6 +372,71 @@ Ns_DbDriverVersionInfo(Ns_DbHandle *handle)
         result = (*driverPtr->versionProc)(handle);
     }
     return result;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Ns_DbStats --
+ *
+ *      Read optional driver statistics without executing an nsdb statement.
+ *      Preserve the pool-statistics API and permit older drivers to omit the
+ *      callback. Driver dictionaries retain their backend-specific fields;
+ *      core adds the driver name and whether the callback is supported.
+ *
+ * Results:
+ *      TCL_OK with a statistics dictionary, or TCL_ERROR. Callback errors are
+ *      returned unchanged. An explicit database selector requires a callback.
+ *
+ * Side effects:
+ *      Set the interpreter result. Never reconnect a disconnected handle or
+ *      flush pending results, reset counters, or alter driver diagnostics.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+Ns_DbStats(Tcl_Interp *interp, Ns_DbHandle *handle, const char *database)
+{
+    const DbDriver *driverPtr = NsDbGetDriver(handle);
+    const char     *name = Ns_DbDriverName(handle);
+    bool            supported = driverPtr != NULL && driverPtr->statsProc != NULL;
+    Tcl_Obj        *resultObj;
+
+    if (name == NULL) {
+        name = handle->driver != NULL ? handle->driver : "unknown";
+    }
+    if (!supported) {
+        if (database != NULL) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("driver %s does not support handle statistics or database selection", name));
+            Tcl_SetErrorCode(interp, "NSDB", "STATS", "UNSUPPORTED", (char *)0L);
+            return TCL_ERROR;
+        }
+        resultObj = Tcl_NewDictObj();
+    } else {
+        TCL_SIZE_T size;
+
+        if (!handle->connected) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("statistics require a connected database handle", TCL_INDEX_NONE));
+            Tcl_SetErrorCode(interp, "NSDB", "STATS", "DISCONNECTED", (char *)0L);
+            return TCL_ERROR;
+        }
+        if ((*driverPtr->statsProc)(interp, handle, database) != TCL_OK) {
+            return TCL_ERROR;
+        }
+        if (Tcl_DictObjSize(interp, Tcl_GetObjResult(interp), &size) != TCL_OK) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("driver statistics callback did not return a dictionary", TCL_INDEX_NONE));
+            Tcl_SetErrorCode(interp, "NSDB", "STATS", "INVALID_RESULT", (char *)0L);
+            return TCL_ERROR;
+        }
+        resultObj = Tcl_DuplicateObj(Tcl_GetObjResult(interp));
+    }
+    Tcl_DictObjPut(NULL, resultObj, Tcl_NewStringObj("driver", TCL_INDEX_NONE),
+                   Tcl_NewStringObj(name, TCL_INDEX_NONE));
+    Tcl_DictObjPut(NULL, resultObj, Tcl_NewStringObj("supported", TCL_INDEX_NONE),
+                   Tcl_NewBooleanObj(supported));
+    Tcl_SetObjResult(interp, resultObj);
+    return TCL_OK;
 }
 
 /*
@@ -1109,6 +1204,192 @@ Ns_DbSpGetParams(Ns_DbHandle *handle)
     }
 
     return aset;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * NsDbGetBatchOps --
+ *
+ *      Retrieve a handle driver's optional native batch operations.
+ *
+ * Results:
+ *      Borrowed operations table, or NULL when batch support is absent.
+ *
+ * Side effects:
+ *      None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+const Ns_DbBatchDriverOps *
+NsDbGetBatchOps(const Ns_DbHandle *handle)
+{
+    const DbDriver *driver = NsDbGetDriver(handle);
+
+    return driver == NULL ? NULL : driver->batchOps;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Ns_DbBindSupported --
+ *
+ *      Report whether a driver implements typed or legacy text bindings.
+ *
+ * Results:
+ *      True when either optional callback is registered.
+ *
+ * Side effects:
+ *      None.
+ *
+ *----------------------------------------------------------------------
+ */
+bool
+Ns_DbBindSupported(const Ns_DbHandle *handle)
+{
+    const DbDriver *driver = NsDbGetDriver(handle);
+
+    return driver != NULL
+        && (driver->bindTypedExecProc != NULL || driver->bindExecProc != NULL);
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Ns_DbBindSupportedTypes --
+ *
+ *      Retrieve native parameter capabilities without passing a new value
+ *      representation to a driver that predates it. Legacy typed callbacks
+ *      support text/binary; legacy text callbacks support text only.
+ *
+ * Results:
+ *      A bit mask indexed by Ns_DbBindValueType, or zero without bind support.
+ *
+ * Side effects:
+ *      Invokes the optional driver capability callback; no SQL is executed.
+ *
+ *----------------------------------------------------------------------
+ */
+unsigned
+Ns_DbBindSupportedTypes(const Ns_DbHandle *handle)
+{
+    const DbDriver *driver = NsDbGetDriver(handle);
+
+    if (driver == NULL) {
+        return 0u;
+    }
+    if (driver->bindTypedExecProc != NULL) {
+        return driver->bindTypesProc != NULL
+            ? driver->bindTypesProc(handle)
+            : (1u << NS_DB_BIND_TEXT) | (1u << NS_DB_BIND_BINARY);
+    }
+    return driver->bindExecProc != NULL ? (1u << NS_DB_BIND_TEXT) : 0u;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Ns_DbBindExec --
+ *
+ *      Preserve the public text-binding API by dispatching with default types.
+ *
+ * Results:
+ *      NS_ROWS, NS_DML or NS_ERROR.
+ *
+ * Side effects:
+ *      See Ns_DbBindTypedExec.
+ *
+ *----------------------------------------------------------------------
+ */
+int
+Ns_DbBindExec(Tcl_Interp *interp, Ns_DbHandle *handle, const char *sql,
+              TCL_SIZE_T count, Tcl_Obj *const *names, Tcl_Obj *const *values)
+{
+    return Ns_DbBindTypedExec(interp, handle, sql, count, names, values, NULL);
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Ns_DbBindTypedExec --
+ *
+ *      Prefer the typed callback for every binding. NULL types means all text.
+ *      Retain text-only driver compatibility when every supplied type is text;
+ *      explicit binary bindings must never silently use the text callback.
+ *
+ * Results:
+ *      NS_ROWS, NS_DML or NS_ERROR, with unsupported operations reported in
+ *      the interpreter.
+ *
+ * Side effects:
+ *      Uses the existing driver SQL timing/logging path exactly once. Values
+ *      are excluded from SQL logging. Transaction handling belongs to the caller.
+ *
+ *----------------------------------------------------------------------
+ */
+int
+Ns_DbBindTypedExec(Tcl_Interp *interp, Ns_DbHandle *handle, const char *sql,
+                  TCL_SIZE_T count, Tcl_Obj *const *names, Tcl_Obj *const *values,
+                  const Ns_DbBindValueType *types)
+{
+    const DbDriver *driver = NsDbGetDriver(handle);
+    int             status = NS_ERROR;
+    bool            binary = NS_FALSE;
+    unsigned        supported = Ns_DbBindSupportedTypes(handle);
+
+    if (count > 0 && types == NULL && (supported & (1u << NS_DB_BIND_TEXT)) == 0u) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("driver does not support bind vars in SQL statements", TCL_INDEX_NONE));
+        return NS_ERROR;
+    }
+    for (TCL_SIZE_T i = 0; types != NULL && i < count; i++) {
+        if (types[i] < NS_DB_BIND_TEXT || types[i] > NS_DB_BIND_ARRAY
+            || (supported & (1u << types[i])) == 0u) {
+            const char *message = types[i] == NS_DB_BIND_ARRAY
+                ? "driver does not support SQL array bind vars in SQL statements"
+                : types[i] == NS_DB_BIND_BINARY
+                ? "driver does not support binary bind vars in SQL statements"
+                : "driver does not support bind vars in SQL statements";
+
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(message, TCL_INDEX_NONE));
+            return NS_ERROR;
+        }
+    }
+    if (handle->connected && driver != NULL && driver->bindTypedExecProc != NULL) {
+        Ns_Time start;
+
+        Ns_GetTime(&start);
+        status = driver->bindTypedExecProc(interp, handle, sql, count, names, values, types);
+        NsDbLogSql(&start, handle, sql);
+        return status;
+    }
+    for (TCL_SIZE_T i = 0; types != NULL && i < count; i++) {
+        if (types[i] == NS_DB_BIND_BINARY) {
+            binary = NS_TRUE;
+            break;
+        }
+    }
+    if (handle->connected && driver != NULL && driver->bindExecProc != NULL && !binary) {
+        Ns_Time start;
+
+        Ns_GetTime(&start);
+        status = driver->bindExecProc(interp, handle, sql, count, names, values);
+        NsDbLogSql(&start, handle, sql);
+    } else {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(binary
+            ? "driver does not support binary bind vars in SQL statements"
+            : "driver does not support bind vars in SQL statements", TCL_INDEX_NONE));
+    }
+    return status;
+}
+
+/* Drivers may choose their native marker syntax for scalar and expanded slots. */
+Ns_DbBindParameterProc *
+NsDbGetBindParameterProc(const Ns_DbHandle *handle)
+{
+    const DbDriver *driver = NsDbGetDriver(handle);
+
+    return driver == NULL ? NULL : driver->bindParameterProc;
 }
 
 /*

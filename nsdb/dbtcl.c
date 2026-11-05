@@ -191,7 +191,7 @@ NsDbAddCmds(Tcl_Interp *interp, const void *arg)
 #endif
     (void)TCL_CREATEOBJCOMMAND(interp, "ns_quotelisttolist", QuoteListToListObjCmd, idataPtr, NULL);
 
-    return TCL_OK;
+    return NsDbBatchInitInterp(interp);
 }
 
 
@@ -310,6 +310,7 @@ DbObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *co
     enum {
         ZERO_OR_ONE_ROW,
         ONE_ROW,
+        BATCHINFO, BATCHINSERT, BINDINFO,
         BINDROW,
         BOUNCEPOOL,
         CANCEL,
@@ -354,6 +355,7 @@ DbObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *co
     static const char *const subcmd[] = {
         "0or1row",
         "1row",
+        "batchinfo", "batchinsert", "bindinfo",
         "bindrow",
         "bouncepool",
         "cancel",
@@ -404,7 +406,17 @@ DbObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *co
         return TCL_ERROR;
     }
 
+    if ((cmd == EXEC || cmd == DML || cmd == SELECT || cmd == ONE_ROW || cmd == ZERO_OR_ONE_ROW)
+        && objc >= 4
+        && (strncmp(Tcl_GetString(objv[3]), "-bind", 5u) == 0
+            || strcmp(Tcl_GetString(objv[3]), "-emptynull") == 0)) {
+        return NsDbBindObjCmd(interp, objc, objv, subcmd[cmd]);
+    }
+
     switch (cmd) {
+    case BINDINFO: return NsDbBindObjCmd(interp, objc, objv, "bindinfo");
+    case BATCHINFO: return NsDbBatchObjCmd(interp, objc, objv, NS_FALSE);
+    case BATCHINSERT: return NsDbBatchObjCmd(interp, objc, objv, NS_TRUE);
     case POOLS:
         if (objc != 2) {
             Tcl_WrongNumArgs(interp, 2, objv, NULL);
@@ -603,14 +615,27 @@ DbObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *co
         }
         break;
 
-    case STATS:
-        if (objc != 2) {
-            Tcl_WrongNumArgs(interp, 2, objv, NULL);
-            result = TCL_ERROR;
-        } else if  (Ns_DbPoolStats(interp) != TCL_OK) {
-            result = TCL_ERROR;
+    case STATS: {
+        if (objc == 2) {
+            result = Ns_DbPoolStats(interp);
+        } else {
+            const char  *database = NULL;
+            Ns_ObjvSpec options[] = {
+                {"-database", Ns_ObjvString, &database, NULL},
+                {"--", Ns_ObjvBreak, NULL, NULL},
+                {NULL, NULL, NULL, NULL}
+            };
+
+            if (Ns_ParseObjv(options, NULL, interp, 3, objc, objv) != NS_OK) {
+                result = TCL_ERROR;
+            } else if (DbGetHandle(idataPtr, interp, Tcl_GetString(objv[2]), &handlePtr, NULL) != TCL_OK) {
+                result = TCL_ERROR;
+            } else {
+                result = Ns_DbStats(interp, handlePtr, database);
+            }
         }
         break;
+    }
 
     case BINDROW:        NS_FALL_THROUGH; /* fall through */
     case CANCEL:         NS_FALL_THROUGH; /* fall through */
@@ -813,7 +838,10 @@ DbObjCmd(ClientData clientData, Tcl_Interp *interp, TCL_SIZE_T objc, Tcl_Obj *co
                     Tcl_WrongNumArgs(interp, 2, objv, "/handle/ /procname/");
 
                 } else {
-                    Tcl_WrongNumArgs(interp, 2, objv, "/handle/ /sql/");
+                    Tcl_WrongNumArgs(interp, 2, objv,
+                                     "/handle/ ?-bindvars? ?-bindset /setId/? "
+                                     "?-binddict /dictionary/? ?-bindtypes /types/? "
+                                     "?-emptynull? ?--? /sql/");
                 }
                 return TCL_ERROR;
             }

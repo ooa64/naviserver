@@ -35,11 +35,18 @@
 
 #if defined(__APPLE__) && defined(__MACH__)
 # include <AvailabilityMacros.h>
+# include <mach/mach_time.h>
 #endif
 
 #ifndef _WIN32
 # include <sys/un.h>
 #endif
+
+typedef struct {
+    struct NS_SOCKADDR_STORAGE address;
+    bool started;
+    TCL_SIZE_T priority;
+} ConnectCandidate;
 
 
 /*
@@ -51,6 +58,17 @@ static NS_SOCKET SockConnect(const char *host, unsigned short port,
                              bool async, int count, int ms,
                              Ns_ReturnCode *resultPtr)
     NS_GNUC_NONNULL(1);
+
+static bool SockConnectTime(Ns_Time *timePtr) NS_GNUC_NONNULL(1);
+static void SockConnectIncrTime(Ns_Time *timePtr, time_t sec, long usec)
+    NS_GNUC_NONNULL(1);
+
+static void SockConnectAddresses(Tcl_DString *dsPtr, unsigned short port,
+                                  ConnectCandidate **candidatesPtr,
+                                  struct pollfd **pfdsPtr, TCL_SIZE_T *countPtr)
+    NS_GNUC_NONNULL(1,3,4,5);
+static void SockConnectOrder(ConnectCandidate *candidates, TCL_SIZE_T count,
+                              bool hasLocalAddress) NS_GNUC_NONNULL(1);
 
 static Ns_ReturnCode WaitForConnect(NS_SOCKET sock, int count, int ms);
 
@@ -656,9 +674,11 @@ Ns_SockSendBufs(Ns_Sock *sock, const struct iovec *bufs, int nbufs,
                    " bytes, sent %" PRIdz " timeoutPtr %p",
                    toWrite, sent, (const void*)timeoutPtr);
         }
-        if (sent == 0
-            && Ns_SockTimedWait(sock->sock, (unsigned int)NS_SOCK_WRITE,
-                                timeoutPtr) == NS_OK) {
+        if (sent == 0) {
+            if (NsDriverSendWait((Sock *)sock, timeoutPtr) != NS_OK) {
+                nWrote = -1;
+                break;
+            }
             sent = NsDriverSend((Sock *)sock, sbufPtr, nsbufs, flags);
         }
         if (sent == -1) {
@@ -1286,9 +1306,121 @@ Ns_SockAsyncConnect2(const char *host, unsigned short port, const char *lhost, u
 /*
  *----------------------------------------------------------------------
  *
+ * SockConnectTime --
+ *
+ *      Read a monotonic clock for elapsed connect budgets, independent of
+ *      adjustments to the wall clock.
+ *
+ * Results:
+ *      NS_TRUE on success, NS_FALSE on error.
+ *
+ * Side effects:
+ *      Updates the time pointed to by timePtr. Sets the socket error on
+ *      failure.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static bool
+SockConnectTime(Ns_Time *timePtr)
+{
+#ifdef _WIN32
+    ULONGLONG ticks = GetTickCount64();
+
+    timePtr->sec = (time_t)(ticks / 1000u);
+    timePtr->usec = (long)(ticks % 1000u) * 1000;
+#elif defined(__APPLE__) && defined(__MACH__)
+    mach_timebase_info_data_t info;
+    uint64_t ticks;
+    long double seconds;
+
+    /* Available before macOS 10.12, unlike clock_gettime(). No shared state. */
+    if (mach_timebase_info(&info) != KERN_SUCCESS || info.denom == 0u) {
+        Ns_SetSockErrno(EIO);
+        return NS_FALSE;
+    }
+    /* Floating-point conversion avoids overflowing ticks * info.numer. */
+    ticks = mach_absolute_time();
+    seconds = (long double)ticks * (long double)info.numer
+        / (long double)info.denom / 1000000000.0L;
+    if (seconds >= (long double)TIME_T_MAX) {
+        Ns_SetSockErrno(EOVERFLOW);
+        return NS_FALSE;
+    }
+    timePtr->sec = (time_t)seconds;
+    timePtr->usec = (long)((seconds - (long double)timePtr->sec) * 1000000.0L);
+#else
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return NS_FALSE;
+    }
+    timePtr->sec = (time_t)ts.tv_sec;
+    timePtr->usec = (long)(ts.tv_nsec / 1000);
+#endif
+    return NS_TRUE;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * SockConnectIncrTime --
+ *
+ *      Add a nonnegative interval to a normalized, nonnegative connect
+ *      timestamp. Saturate at TIME_T_MAX seconds and 999999 microseconds
+ *      when the sum, including the microsecond carry, would overflow.
+ *
+ * Results:
+ *      None.
+ *
+ * Side effects:
+ *      Updates the time pointed to by timePtr.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static void
+SockConnectIncrTime(Ns_Time *timePtr, time_t sec, long usec)
+{
+    long extra = usec / 1000000;
+    long fraction = timePtr->usec + usec % 1000000;
+
+    assert(sec >= 0 && usec >= 0);
+    if (sec > TIME_T_MAX - timePtr->sec) {
+        goto saturated;
+    }
+    timePtr->sec += sec;
+    if (extra > TIME_T_MAX - timePtr->sec) {
+        goto saturated;
+    }
+    timePtr->sec += (time_t)extra;
+    if (fraction >= 1000000) {
+        if (timePtr->sec == TIME_T_MAX) {
+            goto saturated;
+        }
+        timePtr->sec++;
+        fraction -= 1000000;
+    }
+    timePtr->usec = fraction;
+    return;
+
+saturated:
+    timePtr->sec = TIME_T_MAX;
+    timePtr->usec = 999999;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
  * Ns_SockTimedConnect, Ns_SockTimedConnect2 --
  *
- *      Like Ns_SockConnect, but with an optional timeout in seconds.
+ *      Connect using nonblocking attempts staggered by 250 milliseconds,
+ *      alternating address families while preserving their resolver order.
+ *      Resolve address families independently, allowing 50 ms for pending
+ *      IPv6 results when IPv4 arrives first. All TCP attempts share one
+ *      timeout starting after initial resolution and its optional delay.
+ *      The returned socket remains nonblocking, as in the async API.
  *
  * Results:
  *      A socket, or NS_INVALID_SOCKET on error.
@@ -1298,7 +1430,6 @@ Ns_SockAsyncConnect2(const char *host, unsigned short port, const char *lhost, u
  *
  *----------------------------------------------------------------------
  */
-
 NS_SOCKET
 Ns_SockTimedConnect(const char *host, unsigned short port, const Ns_Time *timeoutPtr)
 {
@@ -1313,83 +1444,456 @@ Ns_SockTimedConnect2(const char *host, unsigned short port, const char *lhost,
                      unsigned short lport,
                      const Ns_Time *timeoutPtr, Ns_ReturnCode *statusPtr)
 {
-    NS_SOCKET     sock;
-    socklen_t     len;
-    Ns_ReturnCode status;
-    int           count;
-    const int     ms = 100;
+    ConnectCandidate *candidates = NULL;
+    struct pollfd   *pfds = NULL;
+    Tcl_DString      ds, v6, v4;
+    Ns_DnsRequest   *requestPtr = NULL;
+    TCL_SIZE_T       n = 0, pending = 0, launched = 0;
+    int              family = AF_UNSPEC;
+    NS_SOCKET        sock = NS_INVALID_SOCKET;
+    Ns_ReturnCode    status = NS_ERROR;
+    ns_sockerrno_t   error = NS_ECONNABORTED;
+    Ns_Time          deadline = {0, 0}, next, earliest, now, diff, dnsDeadline, wait;
+    Ns_Time          resolutionDeadline = {0, 0};
+    bool             sortDirty = NS_TRUE;
+    bool             tcpStarted = NS_FALSE, resolutionWaiting = NS_FALSE;
+    bool             done6 = NS_FALSE, done4 = NS_FALSE, dnsExpired = NS_FALSE;
 
     NS_NONNULL_ASSERT(host != NULL);
     NS_NONNULL_ASSERT(timeoutPtr != NULL);
 
-    /*
-     * Connect to the host asynchronously and wait for it to connect. The
-     * connection code makes a few attempts in the interval of "ms"
-     * milliseconds. The number of attempts is determined by the timeoutPtr.
-     */
-    count = (int)Ns_TimeToMilliseconds(timeoutPtr)/ms;
-    Ns_Log(Debug, "Ns_SockTimedConnect2 for [%s]:%hu MS " NS_TIME_T_FMT " count %d",
-           host, port, NS_TIME_T_ARG(Ns_TimeToMilliseconds(timeoutPtr)), count);
+    Tcl_DStringInit(&ds);
+    Tcl_DStringInit(&v6);
+    Tcl_DStringInit(&v4);
+    if (timeoutPtr->sec < 0 || timeoutPtr->usec < 0) {
+        goto done;
+    }
+    if (!SockConnectTime(&now)) {
+        goto clockError;
+    }
+    dnsDeadline = now;
+    if (!NsDnsStart(host, &ds, &requestPtr, &wait)) {
+        error = ns_sockerrno;
+        goto done;
+    }
+    SockConnectIncrTime(&dnsDeadline, wait.sec, wait.usec);
+    SockConnectAddresses(&ds, port, &candidates, &pfds, &n);
+    next = now;
+    earliest = now;
 
-    sock = SockConnect(host, port, lhost, lport, NS_TRUE, count, ms, &status);
-    if (unlikely(sock == NS_INVALID_SOCKET)) {
-        /*Ns_Log(Warning, "SockConnect returned invalid socket");*/
+    for (;;) {
+        Ns_Time wake;
+        NS_SOCKET dnsSock = NS_INVALID_SOCKET;
+        int ready;
 
-    } else {
-        /*Ns_Log(Notice, "SockConnect for %s:%hu returned socket %d, wait for write (errno %d <%s>)",
-          host, port, sock, errno, ns_sockstrerror(errno));*/
+        if (!SockConnectTime(&now)) {
+            goto clockError;
+        }
+        if (requestPtr != NULL) {
+            TCL_SIZE_T old6 = v6.length, old4 = v4.length;
 
-        status = Ns_SockTimedWait(sock, (unsigned int)NS_SOCK_WRITE, timeoutPtr);
-        /*Ns_Log(Notice, "Ns_SockTimedWait for %s:%hu on %d returned error %d <%s> -> status %d",
-          host, port, sock, errno, ns_sockstrerror(errno), status);*/
-
-        switch (status) {
-        case NS_OK:
-            {
-                int err;
-                /*
-                 * Try to reset error status
-                 */
-                len = (socklen_t)sizeof(err);
-                if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (void *)&err, &len) == -1) {
-                    Ns_Log(Warning, "getsockopt %d returned error %d <%s>",
-                           sock, errno, ns_sockstrerror(errno));
-                    status = NS_ERROR;
+            dnsExpired = Ns_DiffTime(&dnsDeadline, &now, &diff) <= 0;
+            if (!dnsExpired) {
+                dnsSock = NsDnsResults(requestPtr, &v6, &v4, &done6, &done4);
+                if (!SockConnectTime(&now)) {
+                    goto clockError;
                 }
-                break;
+                dnsExpired = Ns_DiffTime(&dnsDeadline, &now, &diff) <= 0;
+                if (dnsExpired) {
+                    /* Keep previously received answers, not results observed too late. */
+                    Tcl_DStringSetLength(&v6, old6);
+                    Tcl_DStringSetLength(&v4, old4);
+                }
             }
-        case NS_TIMEOUT:
-            errno = NS_ETIMEDOUT;
-            break;
+            if ((done6 && done4) || dnsExpired) {
+                NsDnsCancel(requestPtr);
+                requestPtr = NULL;
+                dnsSock = NS_INVALID_SOCKET;
+                done6 = done4 = NS_TRUE;
+            }
+            if (!tcpStarted && v4.length > 0 && v6.length == 0
+                && !done6 && !resolutionWaiting) {
+                resolutionDeadline = now;
+                SockConnectIncrTime(&resolutionDeadline, 0, 50000);
+                resolutionWaiting = NS_TRUE;
+            }
+        }
+        if (tcpStarted || v6.length > 0 || done6
+            || (resolutionWaiting && Ns_DiffTime(&resolutionDeadline, &now, &diff) <= 0)) {
+            TCL_SIZE_T previous = n;
 
-        case NS_ERROR:         NS_FALL_THROUGH; /* fall through */
-        case NS_FILTER_BREAK:  NS_FALL_THROUGH; /* fall through */
-        case NS_FILTER_RETURN: NS_FALL_THROUGH; /* fall through */
-        case NS_FORBIDDEN:     NS_FALL_THROUGH; /* fall through */
-        case NS_UNAUTHORIZED:
+            SockConnectAddresses(&v6, port, &candidates, &pfds, &n);
+            SockConnectAddresses(&v4, port, &candidates, &pfds, &n);
+            sortDirty = sortDirty || n != previous;
+        }
+        if (!tcpStarted && n > 0) {
+            /* DNS waiting and initial address selection precede TCP's budget. */
+            if (timeoutPtr->sec == 0 && timeoutPtr->usec == 0) {
+                goto timedOut;
+            }
+            SockConnectOrder(candidates, n, lhost != NULL);
+            if (!SockConnectTime(&now)) {
+                goto clockError;
+            }
+            sortDirty = NS_FALSE;
+            deadline = now;
+            SockConnectIncrTime(&deadline, timeoutPtr->sec, timeoutPtr->usec);
+            tcpStarted = NS_TRUE;
+            next = now;
+            earliest = now;
+        }
+        if (tcpStarted && Ns_DiffTime(&deadline, &now, &diff) <= 0) {
+            goto timedOut;
+        }
+        if (launched == n && pending == 0 && requestPtr == NULL) {
+            if (!tcpStarted && dnsExpired) {
+                error = NS_ETIMEDOUT;
+            }
             break;
         }
+        if (launched < n
+            && Ns_DiffTime(&next, &now, &diff) <= 0) {
+            TCL_SIZE_T selected = -1, alternate = -1;
+            struct NS_SOCKADDR_STORAGE local;
+            struct sockaddr *saPtr;
+            NS_SOCKET attempt;
+
+            /* Incorporate newly arrived destinations without moving active attempts. */
+            if (sortDirty) {
+                SockConnectOrder(candidates, n, lhost != NULL);
+                if (!SockConnectTime(&now)) {
+                    goto clockError;
+                }
+                if (Ns_DiffTime(&deadline, &now, &diff) <= 0) {
+                    goto timedOut;
+                }
+                sortDirty = NS_FALSE;
+            }
+            /* Start with the first native/resolver destination, then interleave families. */
+            for (TCL_SIZE_T i = 0; i < n; i++) {
+                if (!candidates[i].started) {
+                    if (selected < 0 || candidates[i].priority < candidates[selected].priority) {
+                        selected = i;
+                    }
+                    if (family != AF_UNSPEC
+                        && ((const struct sockaddr *)&candidates[i].address)->sa_family != family
+                        && (alternate < 0 || candidates[i].priority < candidates[alternate].priority)) {
+                        alternate = i;
+                    }
+                }
+            }
+            if (alternate >= 0) {
+                selected = alternate;
+            }
+            candidates[selected].started = NS_TRUE;
+            launched++;
+            saPtr = (struct sockaddr *)&candidates[selected].address;
+            family = saPtr->sa_family;
+            /*
+             * Even failed attempts must retain RFC 8305's 10 ms lower bound.
+             */
+            earliest = now;
+            SockConnectIncrTime(&earliest, 0, 10000);
+            next = earliest;
+            attempt = BindToSameFamily(saPtr, (struct sockaddr *)&local, lhost, lport);
+            if (attempt == NS_INVALID_SOCKET) {
+                error = ns_sockerrno;
+                continue;
+            }
+            if (Ns_SockSetNonBlocking(attempt) != NS_OK) {
+                error = ns_sockerrno;
+                ns_sockclose(attempt);
+                continue;
+            }
+            if (!SockConnectTime(&now)) {
+                error = ns_sockerrno;
+                ns_sockclose(attempt);
+                goto done;
+            }
+            if (Ns_DiffTime(&deadline, &now, &diff) <= 0) {
+                ns_sockclose(attempt);
+                goto timedOut;
+            }
+            earliest = now;
+            SockConnectIncrTime(&earliest, 0, 10000);
+            next = earliest;
+            if (connect(attempt, saPtr, Ns_SockaddrGetSockLen(saPtr)) == 0) {
+                /*
+                 * Register ownership before checking the deadline or clock again.
+                 */
+                pfds[selected].fd = attempt;
+                if (!SockConnectTime(&now)) {
+                    goto clockError;
+                }
+                if (Ns_DiffTime(&deadline, &now, &diff) <= 0) {
+                    goto timedOut;
+                }
+                sock = attempt;
+                pfds[selected].fd = NS_INVALID_SOCKET;
+                status = NS_OK;
+                break;
+            }
+            error = ns_sockerrno;
+            if (error != NS_EINPROGRESS && error != NS_EWOULDBLOCK) {
+                ns_sockclose(attempt);
+                continue;
+            }
+            pfds[selected].fd = attempt;
+            pending++;
+            next = earliest;
+            SockConnectIncrTime(&next, 0, 240000);
+        }
+        wake = tcpStarted ? deadline : dnsDeadline;
+        if (requestPtr != NULL && Ns_DiffTime(&dnsDeadline, &wake, &diff) < 0) {
+            wake = dnsDeadline;
+        }
+        if (!tcpStarted && resolutionWaiting
+            && Ns_DiffTime(&resolutionDeadline, &wake, &diff) < 0) {
+            wake = resolutionDeadline;
+        }
+        if (launched < n && Ns_DiffTime(&next, &wake, &diff) < 0) {
+            wake = next;
+        }
         /*
-         * Return in all error cases an invalid socket.
+         * Recompute the remaining budget on every iteration, including EINTR.
          */
-        if (status != NS_OK) {
-            ns_sockclose(sock);
-            sock = NS_INVALID_SOCKET;
+        if (!SockConnectTime(&now)) {
+            goto clockError;
+        }
+        {
+            int waitMs = 0;
+
+            if (Ns_DiffTime(&wake, &now, &diff) > 0) {
+                /*
+                 * Bound seconds before multiplying, even with 32-bit time_t.
+                 */
+                if (diff.sec > (time_t)(INT_MAX / 1000)) {
+                    waitMs = INT_MAX;
+                } else {
+                    int whole = (int)diff.sec * 1000;
+                    int fraction = (int)(diff.usec / 1000) + 1;
+
+                    waitMs = whole > INT_MAX - fraction ? INT_MAX : whole + fraction;
+                }
+            }
+            if (requestPtr != NULL) {
+                if (pfds == NULL) {
+                    pfds = ns_calloc(1u, sizeof(struct pollfd));
+                }
+                pfds[n].fd = dnsSock;
+                pfds[n].events = POLLIN;
+                pfds[n].revents = 0;
+            }
+            if (pending == 0 && requestPtr == NULL) {
+                /*
+                 * Winsock select() rejects an empty set of sockets.
+                 */
+                Tcl_Sleep(waitMs);
+                continue;
+            }
+            ready = ns_poll(pfds, (NS_POLL_NFDS_TYPE)(n + (requestPtr != NULL ? 1 : 0)), waitMs);
+        }
+        /*
+         * Preserve poll errno across the clock read, including on EINTR.
+         */
+        if (ready < 0) {
+            error = ns_sockerrno;
+        }
+        if (!SockConnectTime(&now)) {
+            goto clockError;
+        }
+        if (tcpStarted && Ns_DiffTime(&deadline, &now, &diff) <= 0) {
+            goto timedOut;
+        }
+        if (ready < 0) {
+            if (error == NS_EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (requestPtr != NULL && pfds[n].revents != 0) {
+            ready--;
+        }
+        for (TCL_SIZE_T i = 0; i < n && ready > 0; i++) {
+            if (pfds[i].fd != NS_INVALID_SOCKET && pfds[i].revents != 0) {
+                int connectError = 0;
+                socklen_t len = (socklen_t)sizeof(connectError);
+
+                ready--;
+                if (getsockopt(pfds[i].fd, SOL_SOCKET, SO_ERROR,
+                               (void *)&connectError, &len) != 0) {
+                    connectError = (int)ns_sockerrno;
+                } else if ((pfds[i].revents & POLLNVAL) != 0) {
+                    connectError = NS_ECONNABORTED;
+                }
+                if (!SockConnectTime(&now)) {
+                    goto clockError;
+                }
+                if (Ns_DiffTime(&deadline, &now, &diff) <= 0) {
+                    goto timedOut;
+                }
+                if (connectError == 0) {
+                    sock = pfds[i].fd;
+                    pfds[i].fd = NS_INVALID_SOCKET;
+                    status = NS_OK;
+                    goto done;
+                }
+                error = (ns_sockerrno_t)connectError;
+                ns_sockclose(pfds[i].fd);
+                pfds[i].fd = NS_INVALID_SOCKET;
+                pending--;
+                next = earliest;
+            }
         }
     }
 
-    /*
-     * When a statusPtr is provided, return the status code. The client can
-     * determine, if e.g. a timeout occurred.
-     */
+    goto done;
+
+clockError:
+    error = ns_sockerrno;
+    goto done;
+
+timedOut:
+    status = NS_TIMEOUT;
+    error = NS_ETIMEDOUT;
+
+done:
+    if (requestPtr != NULL) {
+        NsDnsCancel(requestPtr);
+    }
+    Tcl_DStringFree(&v6);
+    Tcl_DStringFree(&v4);
+    for (TCL_SIZE_T i = 0; i < n; i++) {
+        if (pfds[i].fd != NS_INVALID_SOCKET) {
+            ns_sockclose(pfds[i].fd);
+        }
+    }
+    ns_free(pfds);
+    ns_free(candidates);
+    Tcl_DStringFree(&ds);
+    if (status != NS_OK) {
+        Ns_SetSockErrno(error);
+    }
     if (statusPtr != NULL) {
         *statusPtr = status;
     }
-
     return sock;
 }
 
-
+/*
+ *----------------------------------------------------------------------
+ *
+ * SockConnectAddresses --
+ *
+ *      Append newly resolved numeric addresses to the candidate and poll
+ *      arrays. Keep active sockets and candidate indices stable as later
+ *      DNS answers arrive. Reserve one extra poll slot for DNS wakeups.
+ *
+ * Results:
+ *      None.
+ *
+ * Side effects:
+ *      Grows the arrays and consumes the address DString in place.
+ *
+ *----------------------------------------------------------------------
+ */
+static void
+SockConnectAddresses(Tcl_DString *dsPtr, unsigned short port,
+                     ConnectCandidate **candidatesPtr, struct pollfd **pfdsPtr,
+                     TCL_SIZE_T *countPtr)
+{
+    TCL_SIZE_T extra = 1;
+    char      *address;
+
+    if (dsPtr->length == 0) {
+        return;
+    }
+
+    for (const char *p = dsPtr->string; *p != '\0'; p++) {
+        if (*p == ' ') {
+            extra++;
+        }
+    }
+    *candidatesPtr = ns_realloc(*candidatesPtr,
+                                (size_t)(*countPtr + extra) * sizeof(ConnectCandidate));
+    *pfdsPtr = ns_realloc(*pfdsPtr,
+                         (size_t)(*countPtr + extra + 1) * sizeof(struct pollfd));
+    for (address = dsPtr->string; address != NULL; ) {
+        struct sockaddr *saPtr = (struct sockaddr *)&(*candidatesPtr)[*countPtr].address;
+        char *nextAddress = strchr(address, ' ');
+        bool  duplicate = NS_FALSE;
+
+        if (nextAddress != NULL) {
+            *nextAddress++ = '\0';
+        }
+        if (*address != '\0' && Ns_GetSockAddr(saPtr, address, port) == NS_OK) {
+            for (TCL_SIZE_T i = 0; i < *countPtr; i++) {
+                if (memcmp(&(*candidatesPtr)[i].address, saPtr,
+                           (size_t)Ns_SockaddrGetSockLen(saPtr)) == 0) {
+                    duplicate = NS_TRUE;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                struct pollfd *pfdPtr = &(*pfdsPtr)[*countPtr];
+
+                (*candidatesPtr)[*countPtr].started = NS_FALSE;
+                (*candidatesPtr)[*countPtr].priority = *countPtr;
+                pfdPtr->fd = NS_INVALID_SOCKET;
+                pfdPtr->events = POLLOUT;
+#ifdef _WIN32
+                pfdPtr->events |= POLLPRI;
+#endif
+                pfdPtr->revents = 0;
+                (*countPtr)++;
+            }
+        }
+        address = nextAddress;
+    }
+    Tcl_DStringSetLength(dsPtr, 0);
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * SockConnectOrder --
+ *
+ *      Rank unstarted candidates using native ordering before interleaving.
+ *      Leave active and completed attempts, their sockets and poll indices
+ *      untouched when newly resolved addresses join the race.
+ *
+ * Results:
+ *      None.
+ *
+ * Side effects:
+ *      Updates private candidate priorities; allocates temporary arrays.
+ *
+ *----------------------------------------------------------------------
+ */
+static void
+SockConnectOrder(ConnectCandidate *candidates, TCL_SIZE_T count,
+                  bool hasLocalAddress)
+{
+    const struct sockaddr **addresses = ns_malloc((size_t)count * sizeof(*addresses));
+    TCL_SIZE_T *indices = ns_malloc((size_t)count * sizeof(*indices));
+    TCL_SIZE_T *order = ns_malloc((size_t)count * sizeof(*order));
+    TCL_SIZE_T  pending = 0;
+
+    for (TCL_SIZE_T i = 0; i < count; i++) {
+        if (!candidates[i].started) {
+            addresses[pending] = (const struct sockaddr *)&candidates[i].address;
+            indices[pending++] = i;
+        }
+    }
+    NsSockaddrSort(addresses, pending, hasLocalAddress, order);
+    for (TCL_SIZE_T i = 0; i < pending; i++) {
+        candidates[indices[order[i]]].priority = i;
+    }
+    ns_free(order);
+    ns_free(indices);
+    ns_free(addresses);
+}
+
 /*
  *----------------------------------------------------------------------
  *
@@ -1407,7 +1911,6 @@ Ns_SockTimedConnect2(const char *host, unsigned short port, const char *lhost,
  *
  *----------------------------------------------------------------------
  */
-
 void
 Ns_SockConnectError(Tcl_Interp *interp, const char *host, unsigned short portNr,
                     Ns_ReturnCode status, const Ns_Time *timeoutPtr)
@@ -1459,7 +1962,6 @@ Ns_SockConnectError(Tcl_Interp *interp, const char *host, unsigned short portNr,
     }
 }
 
-
 /*
  *----------------------------------------------------------------------
  *
@@ -1475,7 +1977,6 @@ Ns_SockConnectError(Tcl_Interp *interp, const char *host, unsigned short portNr,
  *
  *----------------------------------------------------------------------
  */
-
 Ns_ReturnCode
 Ns_SockSetNonBlocking(NS_SOCKET sock)
 {
