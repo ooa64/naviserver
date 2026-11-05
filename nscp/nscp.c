@@ -48,6 +48,7 @@ typedef struct Sess {
     int id;
     bool viaLoopback;
     NS_SOCKET sock;
+    socklen_t peerLength, peerCapacity;
     struct NS_SOCKADDR_STORAGE sa;
 } Sess;
 
@@ -352,8 +353,11 @@ AcceptProc(NS_SOCKET sock, void *UNUSED(arg), unsigned int why)
 
         sessPtr = ns_malloc(sizeof(Sess));
         sessPtr->modPtr = modPtr;
-        len = (socklen_t)sizeof(struct sockaddr_in);
+        /* accept() needs the full storage size, including IPv6 addresses. */
+        len = (socklen_t)sizeof(sessPtr->sa);
+        sessPtr->peerCapacity = len;
         sessPtr->sock = Ns_SockAccept(sock, (struct sockaddr *) &sessPtr->sa, &len);
+        sessPtr->peerLength = len;
         if (sessPtr->sock == NS_INVALID_SOCKET) {
             Ns_Log(Error, "nscp: accept() failed: %s",
                    ns_sockstrerror(ns_sockerrno));
@@ -548,11 +552,6 @@ GetLine(NS_SOCKET sock, const char *prompt, Tcl_DString *dsPtr, bool echo)
             goto bail;
         }
 
-        if (n > 1 && buf[n-1] == '\n' && buf[n-2] == '\r') {
-            buf[n-2] = '\n';
-            --n;
-        }
-
         /*
          * This EOT checker cannot happen in the context of telnet.
          */
@@ -587,7 +586,30 @@ GetLine(NS_SOCKET sock, const char *prompt, Tcl_DString *dsPtr, bool echo)
             }
         }
 
-        Tcl_DStringAppend(dsPtr, buf, (TCL_SIZE_T)n);
+        {
+            TCL_SIZE_T readPos = dsPtr->length, writePos;
+
+            /*
+             * Normalize every CRLF, not just the last one in a socket read.
+             * A paste can contain several lines, and a CRLF can straddle
+             * reads. Tcl requires backslash immediately followed by newline
+             * for a continuation. Preserve bare carriage returns.
+             */
+            if (readPos > 0 && dsPtr->string[readPos - 1] == '\r') {
+                --readPos;
+            }
+            Tcl_DStringAppend(dsPtr, buf, (TCL_SIZE_T)n);
+            writePos = readPos;
+            while (readPos < dsPtr->length) {
+                if (dsPtr->string[readPos] == '\r'
+                    && readPos + 1 < dsPtr->length
+                    && dsPtr->string[readPos + 1] == '\n') {
+                    ++readPos;
+                }
+                dsPtr->string[writePos++] = dsPtr->string[readPos++];
+            }
+            Tcl_DStringSetLength(dsPtr, writePos);
+        }
         result = NS_TRUE;
 
     } while (buf[n-1] != '\n');
@@ -623,6 +645,8 @@ Login(const Sess *sessPtr, Tcl_DString *unameDSPtr)
 {
     Tcl_DString uds, pds, msgDs;
     const char *user = NULL;
+    const char *authPath = "credentials-not-read", *authAuthority = "none";
+    Ns_ReturnCode authStatus = NS_ERROR;
     bool        ok = NS_FALSE;
 
     Tcl_DStringInit(&uds);
@@ -649,6 +673,8 @@ Login(const Sess *sessPtr, Tcl_DString *unameDSPtr)
 
         if (*user == '\0' && sessPtr->viaLoopback && sessPtr->modPtr->allowLoopbackEmptyUser) {
             ok = NS_TRUE;
+            authPath = "loopback-empty-user";
+            authStatus = NS_OK;
         } else if (sessPtr->modPtr->server == NULL) {
             Ns_Log(Warning, "nscp: to use AuthorizeUser, register the nscp module for a server, not globally");
             nscpUserLookup = NS_TRUE;
@@ -671,6 +697,9 @@ Login(const Sess *sessPtr, Tcl_DString *unameDSPtr)
              *
              */
             status = Ns_AuthorizeUser((const Ns_Server*)(sessPtr->modPtr->servPtr), user, pass, &authority);
+            authPath = "user-authorizer";
+            authStatus = status;
+            authAuthority = authority != NULL ? authority : "none";
             /*fprintf(stderr, "NSCP LOGIN server '%s' -> %s %d (%s)\n", sessPtr->modPtr->server,
               authority, status, Ns_ReturnCodeString(status));*/
 
@@ -700,6 +729,8 @@ Login(const Sess *sessPtr, Tcl_DString *unameDSPtr)
                            "command execution in the server process. Change the nsadmin "
                            "password before using nscp.");
                     ok = NS_FALSE;
+                    authPath = "shipped-default-refused";
+                    authStatus = NS_FORBIDDEN;
                     nscpUserLookup = NS_FALSE;
                 } else {
                     ok = NS_TRUE;
@@ -718,6 +749,9 @@ Login(const Sess *sessPtr, Tcl_DString *unameDSPtr)
         if (nscpUserLookup) {
             const Tcl_HashEntry *hPtr = Tcl_FindHashEntry(&sessPtr->modPtr->users, user);
 
+            authPath = "configured-user-fallback";
+            authStatus = NS_UNAUTHORIZED;
+
             if (hPtr != NULL) {
                 const char *encpass = Tcl_GetHashValue(hPtr);
                 char  buf[NS_ENCRYPT_BUFSIZE];
@@ -726,6 +760,7 @@ Login(const Sess *sessPtr, Tcl_DString *unameDSPtr)
 
                 if (STREQ(buf, encpass)) {
                     ok = NS_TRUE;
+                    authStatus = NS_OK;
                 }
             } else {
                 Ns_Log(Warning, "nscp: no such global user: %s", user);
@@ -749,7 +784,30 @@ Login(const Sess *sessPtr, Tcl_DString *unameDSPtr)
             Ns_InfoServerName(), Ns_InfoServerVersion(),
             Ns_InfoPlatform(), Ns_InfoBuildDate(), Ns_InfoTag());
     } else {
-        Ns_Log(Warning, "nscp: login failed: '%s'", (user != NULL) ? user : "?");
+        struct NS_SOCKADDR_STORAGE peer = {0};
+        socklen_t peerLength = (socklen_t)sizeof(peer);
+        char acceptedBuffer[NS_IPADDR_SIZE], actualBuffer[NS_IPADDR_SIZE];
+        const char *acceptedPeer, *actualPeer = NULL;
+
+        /* The independent peer lookup helps distinguish address truncation
+         * from configuration/provider failures. Never log passwords/hashes. */
+        acceptedPeer = ns_inet_ntop((const struct sockaddr *)&sessPtr->sa,
+                                    acceptedBuffer, sizeof(acceptedBuffer));
+        if (getpeername(sessPtr->sock, (struct sockaddr *)&peer, &peerLength) == 0) {
+            actualPeer = ns_inet_ntop((const struct sockaddr *)&peer,
+                                     actualBuffer, sizeof(actualBuffer));
+        }
+        Ns_Log(Warning, "nscp: login failed: '%s' "
+               "(accepted-peer %s, family %d, address-bytes %zu, accept-buffer-bytes %zu, storage %zu; "
+               "socket-peer %s, family %d; loopback %d, allowLoopbackEmptyUser %d; "
+               "auth-path %s, authority %s, status %s)",
+               user != NULL ? user : "?",
+               acceptedPeer != NULL ? acceptedPeer : "unavailable",
+               (int)((const struct sockaddr *)&sessPtr->sa)->sa_family,
+               (size_t)sessPtr->peerLength, (size_t)sessPtr->peerCapacity, sizeof(sessPtr->sa),
+               actualPeer != NULL ? actualPeer : "unavailable", (int)((const struct sockaddr *)&peer)->sa_family,
+               sessPtr->viaLoopback, sessPtr->modPtr->allowLoopbackEmptyUser,
+               authPath, authAuthority, Ns_ReturnCodeString(authStatus));
         Tcl_DStringAppend(&msgDs, "Access denied!\n", 15);
     }
     (void) ns_send(sessPtr->sock, msgDs.string, (size_t)msgDs.length, 0);

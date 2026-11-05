@@ -620,6 +620,7 @@ static nghttp3_ssize     h3_stream_read_data_cb(nghttp3_conn *UNUSED(conn), int6
 
 /* H3 submit/resume & lifecycle */
 static int               h3_stream_submit_ready_headers(StreamCtx *sc) NS_GNUC_NONNULL(1);
+static void              h3_stream_abort_response(StreamCtx *sc, uint64_t errorCode, const char *reason) NS_GNUC_NONNULL(1,3);
 static H3DrainResultCode h3_stream_drain(ConnCtx *cc, SSL *stream, uint64_t sid, const char *label) NS_GNUC_NONNULL(1);
 static bool              h3_stream_maybe_finalize(StreamCtx *sc, const char *label) NS_GNUC_NONNULL(1,2);
 static bool              h3_stream_can_free(const StreamCtx *sc) NS_GNUC_NONNULL(1);
@@ -734,6 +735,7 @@ static Ns_DriverRecvProc Recv;
 static Ns_DriverSendProc Send;
 static Ns_DriverSendReadyProc SendReady;
 static Ns_DriverSendCancelProc SendCancel;
+static Ns_DriverSendWaitProc SendWait;
 static Ns_DriverKeepProc Keep;
 static Ns_DriverCloseProc Close;
 static Ns_DriverConnInfoProc ConnInfo;
@@ -2412,8 +2414,11 @@ static bool quic_conn_can_be_freed_postloop(SSL *conn, ConnCtx *cc)
         bool no_open_streams  = quic_conn_stream_map_empty(cc);
 
         if (both_shutdown && no_open_streams) {
-            Ns_Log(Ns_LogQuicDebug, "H3 quic_conn_can_be_freed_postloop conn %p sd=%x entries=%d init=%d",
-                   (void*)conn, sd, cc->streams.numEntries, SSL_is_init_finished(conn));
+            Ns_Log(Ns_LogQuicDebug,
+                   "H3 quic_conn_can_be_freed_postloop conn %p sd=%x"
+                   " entries=%" PRITcl_Size " init=%d",
+                   (void *)conn, sd, cc->streams.numEntries,
+                   SSL_is_init_finished(conn));
         }
         return both_shutdown && no_open_streams;
     }
@@ -3382,48 +3387,9 @@ h3_conn_write_step(ConnCtx *cc)
                 const SharedTxStatus status = SharedTxStatusRead(&ssc->sh);
 
                 if (status.abort_requested) {
-                    SSL_STREAM_RESET_ARGS resetArgs = {
-                        .quic_error_code = NGHTTP3_H3_REQUEST_CANCELLED
-                    };
-                    int ok;
-
-                    /*
-                     * Permanently prevent nghttp3 from scheduling further response
-                     * data for this stream.
-                     */
-                    nghttp3_conn_shutdown_stream_write(cc->h3conn, sid);
-                    ssc->transport_blocked = NS_FALSE;
-
-                    ERR_clear_error();
-                    ok = SSL_stream_reset(ssc->ssl,
-                                          &resetArgs, sizeof(resetArgs));
-                    if (ok != 1) {
-                        const unsigned long sslErr = ERR_peek_error();
-
-                        Ns_Log(Error,
-                               "[%lld] H3[%lld] SSL_stream_reset failed: "
-                               "lib=%d reason=%d (%s)",
-                               (long long)dc->iter,
-                               (long long)sid,
-                               sslErr != 0u ? ERR_GET_LIB(sslErr) : 0,
-                               sslErr != 0u ? ERR_GET_REASON(sslErr) : 0,
-                               sslErr != 0u && ERR_reason_error_string(sslErr) != NULL
-                               ? ERR_reason_error_string(sslErr)
-                               : "no OpenSSL error");
-                        ERR_clear_error();
-                    }
-
-                    /*
-                     * Record the processed terminal state only after attempting the
-                     * transport reset.
-                     */
-                    StreamCtxIoReset(ssc);
+                    h3_stream_abort_response(ssc, NGHTTP3_H3_REQUEST_CANCELLED,
+                                             "writer abort");
                     did_progress = NS_TRUE;
-
-                    /*
-                     * Existing reset handling disables W and schedules cleanup.
-                     */
-                    (void)h3_stream_maybe_finalize(ssc, "writer abort");
                     continue;
                 }
             }
@@ -3433,8 +3399,18 @@ h3_conn_write_step(ConnCtx *cc)
              * notification for headers which were submitted concurrently.
              */
             if (SharedHdrsIsReady(&ssc->sh)) {
-                if (h3_stream_submit_ready_headers(ssc) != 0) {
-                    /* error already logged inside; continue to next sid */
+                const int rv = h3_stream_submit_ready_headers(ssc);
+
+                if (rv != 0) {
+                    if (nghttp3_err_is_fatal(rv)) {
+                        quic_conn_enter_shutdown(cc,
+                                                 "fatal response header submission failure");
+                        return NS_TRUE;
+                    }
+
+                    h3_stream_abort_response(ssc, NGHTTP3_H3_INTERNAL_ERROR,
+                                             "response header submission failed");
+                    did_progress = NS_TRUE;
                     continue;
                 }
             }
@@ -5652,6 +5628,80 @@ h3_stream_submit_ready_headers(StreamCtx *sc)
 /*
  *----------------------------------------------------------------------
  *
+ * h3_stream_abort_response --
+ *
+ *      Abort response transmission for a bidirectional request stream.
+ *      The caller must run on the owning QUIC thread with a valid
+ *      stream SSL object.
+ *
+ *      Stop further response scheduling in nghttp3, attempt a QUIC
+ *      stream reset with the supplied application error code, and
+ *      publish the local terminal state. The reason identifies the
+ *      abort in diagnostics and finalization.
+ *
+ * Results:
+ *      None.
+ *
+ * Side effects:
+ *      Marks the shared response as aborted, clears header readiness
+ *      and transport-blocked state, and wakes blocked producers.
+ *      Logs transport-reset failures. Invokes normal finalization to
+ *      disable write interest and schedule deferred cleanup, subject
+ *      to the existing resource-lifetime checks.
+ *
+ *----------------------------------------------------------------------
+ */
+static void
+h3_stream_abort_response(StreamCtx *sc, uint64_t errorCode,
+                         const char *reason)
+{
+    ConnCtx              *cc = sc->cc;
+    NsTLSConfig          *dc = cc->dc;
+    SSL_STREAM_RESET_ARGS resetArgs = {
+        .quic_error_code = errorCode
+    };
+    int                   ok;
+
+    NS_TA_ASSERT_HELD(cc, affinity);
+    assert(StreamCtxIsBidi(sc));
+    assert(sc->ssl != NULL);
+
+    SharedMarkAbortRequested(&sc->sh);
+    SharedHdrsClear(&sc->sh);
+
+    nghttp3_conn_shutdown_stream_write(cc->h3conn, h3_stream_id(sc));
+    sc->transport_blocked = NS_FALSE;
+
+    ERR_clear_error();
+    ok = SSL_stream_reset(sc->ssl, &resetArgs, sizeof(resetArgs));
+    if (ok != 1) {
+        const unsigned long sslErr = ERR_peek_error();
+        const char         *errorString =
+            sslErr != 0u ? ERR_reason_error_string(sslErr) : NULL;
+
+        Ns_Log(Error,
+               "[%lld] H3[%lld] SSL_stream_reset failed (%s): "
+               "lib=%d reason=%d (%s)",
+               (long long)dc->iter,
+               (long long)sc->quic_sid,
+               reason,
+               sslErr != 0u ? ERR_GET_LIB(sslErr) : 0,
+               sslErr != 0u ? ERR_GET_REASON(sslErr) : 0,
+               errorString != NULL ? errorString : "no OpenSSL error");
+        ERR_clear_error();
+    }
+
+    /*
+     * Publishing reset also stops sends and wakes blocked producers.
+     * Finalization disables write interest and schedules deferred cleanup.
+     */
+    StreamCtxIoReset(sc);
+    (void)h3_stream_maybe_finalize(sc, reason);
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
  * h3_stream_drain --
  *
  *      Drain readable QUIC stream data into nghttp3, driving HTTP/3
@@ -6516,7 +6566,12 @@ on_end_headers(nghttp3_conn *UNUSED(conn), int64_t stream_id, int fin,
         Tcl_DStringAppend(&line, sc->method, TCL_INDEX_NONE);
         Tcl_DStringAppend(&line, " ", 1);
         Tcl_DStringAppend(&line, sc->path, TCL_INDEX_NONE);
-        Tcl_DStringAppend(&line, " HTTP/1.1", 9);
+        /*
+         * HTTP/3 has no wire request line. Use its implicit protocol
+         * version "3.0" (RFC 9114, Section 4.3.1) in this internal
+         * representation for logging and request introspection.
+         */
+        Tcl_DStringAppend(&line, " HTTP/3.0", 9);
 
         Ns_Log(Ns_LogQuicDebug, "H3[%lld] on_end_headers peer %s request line: %s",
                (long long)stream_id, peer, line.string);
@@ -6605,8 +6660,11 @@ on_end_headers(nghttp3_conn *UNUSED(conn), int64_t stream_id, int fin,
         sockPtr->tfile = NULL;
         sockPtr->tfd = NS_INVALID_FD;
 
-        Ns_Log(Ns_LogQuicDebug, "H3[%lld] on_end_headers request with body size %ld maxupload %ld",
-               (long long)stream_id, reqPtr->contentLength, drvPtr->maxupload);
+        Ns_Log(Ns_LogQuicDebug,
+               "H3[%lld] on_end_headers request with body size %" PRIuz
+               " maxupload %" TCL_LL_MODIFIER "d",
+               (long long)stream_id, reqPtr->contentLength,
+               drvPtr->maxupload);
 
         if (drvPtr->maxupload > 0
             && reqPtr->contentLength > (size_t)drvPtr->maxupload
@@ -9397,7 +9455,7 @@ NS_EXPORT Ns_ReturnCode Ns_ModuleInit(const char *server, const char *module)
     Ns_MutexSetName2(&quicMemStats.lock, "h3", "memstats");
 #endif
 
-    init.version = NS_DRIVER_VERSION_7;
+    init.version = NS_DRIVER_VERSION_8;
     init.name = "quic";
     init.listenProc = Listen;
     init.acceptProc = Accept;
@@ -9407,6 +9465,7 @@ NS_EXPORT Ns_ReturnCode Ns_ModuleInit(const char *server, const char *module)
     init.sendFileProc = NULL;
     init.sendReadyProc = SendReady;
     init.sendCancelProc = SendCancel;
+    init.sendWaitProc = SendWait;
     init.keepProc = Keep;
     init.connInfoProc = ConnInfo;
     init.clientcertInfoProc = ClientcertInfo;
@@ -11200,6 +11259,59 @@ Send(Ns_Sock *sock, const struct iovec *iov, int niov, unsigned int UNUSED(flags
     Ns_Log(Ns_LogQuicDebug, "[%lld] H3 Send nbufs %d -> DONE (consumed %ld)",
            (long long)dc->iter, niov, consumed);
     return consumed;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * SendWait --
+ *
+ *      Wait for space in the stream's bounded response queue for a caller
+ *      which explicitly permits blocking. The QUIC event loop continues
+ *      draining the queue independently. Generic writers use SendReady()
+ *      instead, and nonblocking connection channels do not call this hook.
+ *
+ * Results:
+ *      NS_OK when sending can be retried, NS_TIMEOUT on expiry, or NS_ERROR
+ *      on a terminal stream. Store the corresponding socket send error.
+ *
+ * Side effects:
+ *      May suspend the producer until the low-water mark or termination.
+ *      Never blocks the owning QUIC event loop.
+ *
+ *----------------------------------------------------------------------
+ */
+static Ns_ReturnCode
+SendWait(Ns_Sock *sock, const Ns_Time *timeoutPtr)
+{
+    NsTLSConfig  *dc = sock->driver->arg;
+    StreamCtx    *sc = StreamCtxFromSock(dc, sock);
+    Ns_ReturnCode status;
+    unsigned long errorCode = 0u;
+
+    if (sc == NULL) {
+        status = NS_ERROR;
+        errorCode = EPIPE;
+#if NS_ENABLE_THREAD_AFFINITY
+    } else if (NS_TA_IS_OWNER(sc->cc, affinity)) {
+        /* A blocking wait here would prevent this stream from draining. */
+        status = NS_ERROR;
+        errorCode = NS_EWOULDBLOCK;
+#endif
+    } else {
+        status = SharedSendWait(&sc->sh, timeoutPtr);
+        if (status == NS_TIMEOUT) {
+            errorCode = NS_ETIMEDOUT;
+        } else if (status != NS_OK) {
+            errorCode = H3_IO_HAS(sc, H3_IO_RESET) ? NS_ECONNRESET : EPIPE;
+        }
+    }
+    if (errorCode != 0u) {
+        Ns_SockSetSendErrno(sock, errorCode);
+        Ns_SetSockErrno((ns_sockerrno_t)errorCode);
+    }
+
+    return status;
 }
 
 /*

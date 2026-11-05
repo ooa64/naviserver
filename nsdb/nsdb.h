@@ -64,6 +64,14 @@ typedef enum {
     DbFn_BestRowId,
 #endif
     DbFn_End,
+    /* Fixed extension ID: preserve all legacy IDs, including DbFn_End,
+     * whether deprecated callbacks are enabled or not. */
+    DbFn_Batch = 24,
+    DbFn_Bind = 25,
+    DbFn_BindParameter = 26,
+    DbFn_BindTyped = 27,
+    DbFn_BindTypes = 28,
+    DbFn_Stats = 29,
 } Ns_DbProcId;
 
 /*
@@ -125,6 +133,54 @@ NS_EXTERN const char *NS_EMPTY_STRING;
 /*
  * dbdrv.c:
  */
+
+/* Optional bind vars in SQL statements, including explicit binary values.
+ * Values are borrowed Tcl objects; NULL pointers
+ * represent SQL NULL. Drivers must not retain these objects after returning. */
+#define NS_DB_BIND_ABI 2
+/* Optional marker factory for scalar and expanded slots. Return a new, unreferenced Tcl
+ * string for a zero-based position. The format is fixed for this callback. */
+#define NS_DB_BIND_PARAMETER_ABI 1
+typedef Tcl_Obj *(Ns_DbBindParameterProc)(TCL_SIZE_T position);
+
+typedef int (Ns_DbBindExecProc)(Tcl_Interp *, Ns_DbHandle *, const char *,
+                              TCL_SIZE_T, Tcl_Obj *const *, Tcl_Obj *const *);
+NS_EXTERN bool Ns_DbBindSupported(const Ns_DbHandle *);
+NS_EXTERN int Ns_DbBindExec(Tcl_Interp *, Ns_DbHandle *, const char *, TCL_SIZE_T,
+                            Tcl_Obj *const *, Tcl_Obj *const *);
+
+/* Preferred callback for both text and explicit binary values. A NULL types
+ * array means all text. Registering only DbFn_BindTyped is sufficient; core
+ * retains DbFn_Bind for existing text-only drivers. Callback ABIs are unchanged. */
+typedef enum {
+    NS_DB_BIND_TEXT, NS_DB_BIND_BINARY, NS_DB_BIND_ARRAY
+} Ns_DbBindValueType;
+typedef int (Ns_DbBindTypedExecProc)(Tcl_Interp *, Ns_DbHandle *, const char *,
+                                   TCL_SIZE_T, Tcl_Obj *const *, Tcl_Obj *const *,
+                                   const Ns_DbBindValueType *);
+NS_EXTERN int Ns_DbBindTypedExec(Tcl_Interp *, Ns_DbHandle *, const char *, TCL_SIZE_T,
+                                 Tcl_Obj *const *, Tcl_Obj *const *, const Ns_DbBindValueType *);
+
+/* ABI 2 adds an optional supported-type mask and prepared array access.
+ * Absent a mask callback, typed drivers support text/binary, text-only drivers
+ * support text, and neither can receive an unknown array representation. */
+typedef unsigned (Ns_DbBindTypesProc)(const Ns_DbHandle *);
+NS_EXTERN unsigned Ns_DbBindSupportedTypes(const Ns_DbHandle *) NS_GNUC_NONNULL(1);
+NS_EXTERN int Ns_DbBindArrayGet(Tcl_Interp *, Tcl_Obj *, TCL_SIZE_T *, Tcl_Obj *const **, char *)
+    NS_GNUC_NONNULL(1,2,3,4);
+
+/* Optional, observational per-handle statistics. The callback returns a Tcl
+ * dictionary in interp. A NULL database selects the driver's default scope.
+ * Database names and the handle are borrowed for the duration of the call.
+ * Shared scalar metrics belong in connection/statement, with meaningful peaks
+ * under highwater at matching paths. Omit unavailable metrics and empty groups.
+ * Driver-specific fields belong in backend/DRIVER. Callbacks must preserve
+ * pending results, transactions and error diagnostics. See ns_db statistics
+ * documentation for metric names, units and scope. */
+#define NS_DB_STATS_ABI 1
+typedef int (Ns_DbStatsProc)(Tcl_Interp *, Ns_DbHandle *, const char *);
+NS_EXTERN int Ns_DbStats(Tcl_Interp *interp, Ns_DbHandle *handle, const char *database)
+    NS_GNUC_NONNULL(1, 2);
 
 NS_EXTERN Ns_ReturnCode Ns_DbRegisterDriver(const char *driver, const Ns_DbProc *procs);
 NS_EXTERN char         *Ns_DbDriverName(Ns_DbHandle *handle);
@@ -230,6 +286,8 @@ NS_EXTERN Ns_ReturnCode Ns_DbInterpretSqlFile(Ns_DbHandle *handle, const char *f
 
 NS_EXTERN void Ns_DbSetException(Ns_DbHandle *handle, const char *code, const char *msg)
     NS_GNUC_NONNULL(1,2,3);
+
+#include "batch.h"
 
 #endif /* NSDB_H */
 

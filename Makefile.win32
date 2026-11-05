@@ -239,7 +239,15 @@ _path=$(PWD)\nsd;$(PWD)\nsthread;$(PWD)\nsdb;$(PWD)\nsproxy;$(TCLPATH)\bin;$(OPE
 _test_cert: _cert
 	copy /y certificates\*.* tests\testserver\certificates\ > NUL
 
-_test: _test_cert
+# Build the same portable timing regression used by Unix make check.
+_test_mutex_timing:
+	cd nsthread && $(NMAKE) PGM=mutex-timing-test PGMOBJS=mutex-timing-test.o PGMLIBS=nsthread.lib all
+	setlocal
+	set PATH=$(_path)
+	$(PWD)\nsthread\mutex-timing-test.exe
+	endlocal
+
+_test: _test_mutex_timing _test_cert
 	setlocal
 	set PATH=$(_path)
 	$(PWD)\nsd\nsd.exe -c -t $(PWD)/tests/test.nscfg $(PWD)/tests/all.tcl -notfile ns_proxy.test $(TESTFLAGS) 1>> test-win-out-0.txt 2>&1

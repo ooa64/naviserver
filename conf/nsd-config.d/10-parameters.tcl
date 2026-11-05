@@ -90,6 +90,13 @@ ns_section ns/stats {
     #ns_param historyMaxBytes  64MiB
 }
 
+# SQLite history connection policy belongs to its configured pool:
+# ns_section ns/db/pool/ns_stats {
+#     ns_param journalMode WAL
+#     ns_param synchronous NORMAL
+# }
+
+
 ns_section ns/reverseproxymode {
     #
     # Enable this mode when NaviServer is running behind trusted
