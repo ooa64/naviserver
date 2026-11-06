@@ -22,6 +22,10 @@
 # include <sys/syscall.h>
 #endif
 
+#ifdef __NetBSD__
+# include <lwp.h>
+#endif
+
 #if defined(__OpenBSD__) || defined(__FreeBSD__)
 # include <sys/sysctl.h>
 # if defined(__FreeBSD__)
@@ -41,7 +45,7 @@ typedef struct Thread {
     unsigned int    flags;           /* Detached, joined, etc. */
     Ns_ThreadProc  *proc;            /* Thread startup routine. */
     void           *arg;             /* Argument to startup proc. */
-    uintptr_t       tid;             /* Id set by thread for logging. */
+    uintptr_t       tid;             /* Native thread-library ID. */
     uint64_t        ostid;           /* OS level thread id (if available) */
     unsigned char  *bottomOfStack;   /* for estimating currentStackSize */
     char            name[NS_THREAD_NAMESIZE+1];   /* Thread name. */
@@ -53,12 +57,14 @@ static Thread *GetThread(void) NS_GNUC_RETURNS_NONNULL;
 static void CleanupThread(void *arg);
 static void SetBottomOfStack(void *ptr) NS_GNUC_NONNULL(1);
 static void SetOsThreadId(Thread *thrPtr) NS_GNUC_NONNULL(1);
+static void ThreadInitialize(void);
 
 /*
  * The pointer firstThreadPtr is the anchor of a linked list of all threads.
  */
 
 static Thread *firstThreadPtr;
+static Ns_ThreadProc *threadInitProc;
 
 /*
  * The following maintains the TLS key for the thread context.
@@ -188,7 +194,13 @@ SetOsThreadId(Thread *thrPtr)
 {
     thrPtr->ostid = 0u;
 #ifdef HAVE_GETTID
-    thrPtr->ostid = (uint64_t)syscall(SYS_gettid);
+    {
+        long ostid = syscall(SYS_gettid);
+
+        if (ostid > 0) {
+            thrPtr->ostid = (uint64_t)ostid;
+        }
+    }
 #elif defined(HAVE_PTHREAD_THREADID_NP)
     {
         uint64_t ostid;
@@ -197,6 +209,8 @@ SetOsThreadId(Thread *thrPtr)
             thrPtr->ostid = ostid;
         }
     }
+#elif defined(__NetBSD__)
+    thrPtr->ostid = (uint64_t)_lwp_self();
 #elif defined(__OpenBSD__)
     thrPtr->ostid = (uint64_t)getthrid();
 #elif defined(__FreeBSD__)
@@ -242,6 +256,7 @@ NsThreadMain(void *arg)
     Ns_ThreadSetName("-thread:%" PRIxPTR "-", thrPtr->tid);
     SetBottomOfStack(&thrPtr);
     SetOsThreadId(thrPtr);
+    ThreadInitialize();
 
     /*
      * Invoke the user-supplied workhorse for this thread.
@@ -317,6 +332,92 @@ Ns_ThreadSetName(const char *fmt, ...)
 /*
  *----------------------------------------------------------------------
  *
+ * Ns_ThreadGetOsId --
+ *
+ *      Return the calling thread's cached native operating-system identifier.
+ *      Unlike Ns_ThreadId(), this is suitable for correlating OS diagnostics.
+ *
+ * Results:
+ *      Native thread identifier, or zero when unavailable.
+ *
+ * Side effects:
+ *      Register an externally created thread on its first call.
+ *
+ *----------------------------------------------------------------------
+ */
+
+uint64_t
+Ns_ThreadGetOsId(void)
+{
+    return GetThread()->ostid;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Ns_ThreadSetInitProc --
+ *
+ *      Install the process-wide thread-registration observer during startup.
+ *      The observer runs in each newly registered thread after TLS and native
+ *      identity initialization, without holding the master lock. The argument
+ *      is NULL. Existing threads are not revisited; NULL disables the observer.
+ *
+ * Results:
+ *      None.
+ *
+ * Side effects:
+ *      Subsequent thread registrations invoke the supplied callback.
+ *
+ *----------------------------------------------------------------------
+ */
+
+void
+Ns_ThreadSetInitProc(Ns_ThreadProc *proc)
+{
+    Thread *thisPtr = GetThread();
+
+    /* Refresh the configuration thread after a possible daemonizing fork. */
+    Ns_MasterLock();
+    SetOsThreadId(thisPtr);
+    threadInitProc = proc;
+    Ns_MasterUnlock();
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * ThreadInitialize --
+ *
+ *      Invoke the registration observer after publishing the thread's TLS.
+ *
+ * Results:
+ *      None.
+ *
+ * Side effects:
+ *      Defined by the observer. Recursive thread lookups reuse initialized TLS.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static void
+ThreadInitialize(void)
+{
+    Ns_ThreadProc *proc;
+
+    Ns_MasterLock();
+    proc = threadInitProc;
+    Ns_MasterUnlock();
+    if (proc != NULL) {
+        (*proc)(NULL);
+    }
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
  * Ns_ThreadGetParent --
  *
  *      Return a pointer to calling thread's parent name.
@@ -372,8 +473,10 @@ Ns_ThreadList(Tcl_DString *dsPtr, Ns_ThreadArgProc *proc)
             Tcl_DStringStartSublist(dsPtr);
             Tcl_DStringAppendElement(dsPtr, thrPtr->name);
             Tcl_DStringAppendElement(dsPtr, thrPtr->parent);
-            written = (TCL_SIZE_T)snprintf(buf, sizeof(buf), " %" PRIxPTR " %d %" PRId64,
-                                           thrPtr->tid, thrPtr->flags, (int64_t) thrPtr->ctime);
+            buf[0] = ' ';
+            written = 1 + ns_uint64tohex(buf + 1, (uint64_t)thrPtr->tid);
+            written += (TCL_SIZE_T)snprintf(buf + written, sizeof(buf) - (size_t)written,
+                                          " %d %" PRId64, thrPtr->flags, (int64_t)thrPtr->ctime);
             Tcl_DStringAppend(dsPtr, buf, written);
             if (proc != NULL) {
                 (*proc)(dsPtr, thrPtr->proc, thrPtr->arg);
@@ -464,6 +567,7 @@ static bool
 ThreadCputimeLinux(uint64_t tid, long ticksPerSecond,
                    uint64_t *userUsecPtr, uint64_t *systemUsecPtr)
 {
+    static const char pathPrefix[] = "/proc/self/task/";
     char    path[128];
     char    buffer[4096];
     char   *p;
@@ -478,8 +582,10 @@ ThreadCputimeLinux(uint64_t tid, long ticksPerSecond,
         return NS_FALSE;
     }
 
-    snprintf(path, sizeof(path),
-             "/proc/self/task/%" PRIu64 "/stat", tid);
+    memcpy(path, pathPrefix, sizeof(pathPrefix) - 1u);
+    p = path + sizeof(pathPrefix) - 1u;
+    p += ns_uint64toa(p, tid);
+    memcpy(p, "/stat", sizeof("/stat"));
 
     fd = open(path, O_RDONLY);
     if (fd == -1) {
@@ -1020,6 +1126,7 @@ GetThread(void)
         thrPtr->tid = Ns_ThreadId();
         Ns_TlsSet(&key, thrPtr);
         SetOsThreadId(thrPtr);
+        ThreadInitialize();
     }
     return thrPtr;
 }

@@ -32,13 +32,29 @@ include ../include/Makefile.build
 !ifndef 0 # \
 !else
 
-.PHONY: check clean-atomic clean-mutex-timing
-clean: clean-atomic clean-mutex-timing
-check: atomictest$(EXEEXT) atomic-fallback-test$(EXEEXT) mutex-timing-test$(EXEEXT) mutex-diagnostics-test$(EXEEXT)
+.PHONY: check clean-atomic clean-mutex-timing clean-hex
+clean: clean-atomic clean-mutex-timing clean-hex
+check: hex-test$(EXEEXT) atomictest$(EXEEXT) atomic-fallback-test$(EXEEXT) mutex-timing-test$(EXEEXT) mutex-diagnostics-test$(EXEEXT) thread-identity-test$(EXEEXT)
+	LD_LIBRARY_PATH="$(CURDIR):$${LD_LIBRARY_PATH}" DYLD_LIBRARY_PATH="$(CURDIR):$${DYLD_LIBRARY_PATH}" ./hex-test$(EXEEXT)
 	LD_LIBRARY_PATH="$(CURDIR):$${LD_LIBRARY_PATH}" DYLD_LIBRARY_PATH="$(CURDIR):$${DYLD_LIBRARY_PATH}" ./atomictest$(EXEEXT)
 	LD_LIBRARY_PATH="$(CURDIR):$${LD_LIBRARY_PATH}" DYLD_LIBRARY_PATH="$(CURDIR):$${DYLD_LIBRARY_PATH}" ./atomic-fallback-test$(EXEEXT)
 	LD_LIBRARY_PATH="$(CURDIR):$${LD_LIBRARY_PATH}" DYLD_LIBRARY_PATH="$(CURDIR):$${DYLD_LIBRARY_PATH}" ./mutex-timing-test$(EXEEXT)
 	LD_LIBRARY_PATH="$(CURDIR):$${LD_LIBRARY_PATH}" DYLD_LIBRARY_PATH="$(CURDIR):$${DYLD_LIBRARY_PATH}" ./mutex-diagnostics-test$(EXEEXT)
+
+	LD_LIBRARY_PATH="$(CURDIR):$${LD_LIBRARY_PATH}" DYLD_LIBRARY_PATH="$(CURDIR):$${DYLD_LIBRARY_PATH}" ./thread-identity-test$(EXEEXT)
+
+hex-test$(EXEEXT): hex-test.o $(LIBFILE)
+	$(CC) $(LDFLAGS) -o $@ hex-test.o $(PGMLIBS) $(CCLIBS) $(CCRPATH)
+
+hex-test.o: hex-test.c ../include/nsthread.h
+
+clean-hex:
+	$(RM) hex-test$(EXEEXT) hex-test.o
+
+thread-identity-test$(EXEEXT): thread-identity-test.o $(LIBFILE)
+	$(CC) $(LDFLAGS) -o $@ thread-identity-test.o $(PGMLIBS) $(CCLIBS) $(CCRPATH)
+
+thread-identity-test.o: thread-identity-test.c ../include/nsthread.h
 
 mutex-diagnostics-test$(EXEEXT): mutex-diagnostics-test.o $(LIBFILE)
 	$(CC) $(LDFLAGS) -o $@ mutex-diagnostics-test.o $(PGMLIBS) $(CCLIBS) $(CCRPATH)
@@ -51,7 +67,7 @@ mutex-timing-test$(EXEEXT): mutex-timing-test.o $(LIBFILE)
 mutex-timing-test.o: mutex-timing-test.c ../include/nsthread.h
 
 clean-mutex-timing:
-	$(RM) mutex-timing-test$(EXEEXT) mutex-timing-test.o mutex-diagnostics-test$(EXEEXT) mutex-diagnostics-test.o
+	$(RM) mutex-timing-test$(EXEEXT) mutex-timing-test.o mutex-diagnostics-test$(EXEEXT) mutex-diagnostics-test.o thread-identity-test$(EXEEXT) thread-identity-test.o
 
 atomictest$(EXEEXT): atomictest.o $(LIBFILE)
 	$(CC) $(LDFLAGS) -o $@ atomictest.o $(PGMLIBS) $(CCLIBS) $(CCRPATH)
