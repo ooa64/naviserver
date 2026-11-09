@@ -9,6 +9,9 @@
 #
 #
 
+# Startup-only: this script bootstraps server libraries, interpreter traces
+# and blueprint state. Reload individual libraries through ns_module instead.
+
 #
 # init.tcl --
 #
@@ -397,8 +400,9 @@ namespace eval ::ns_module {
     variable stack {}
 }
 
-# Core reload is opt-in: these files define APIs without creating persistent
-# resources. Bootstrap, tracing, scheduling and configuration files stay excluded.
+# Core reload is opt-in: these files update APIs without recreating persistent
+# resources. ns_stats relies on NX softrecreate to preserve its live objects.
+# Bootstrap, tracing, scheduling and configuration files stay excluded.
 proc _ns_module_inventory {module} {
     variable ::ns_module::files
     variable ::ns_module::loaded
@@ -409,8 +413,8 @@ proc _ns_module_inventory {module} {
         set reloadable [dict exists $loaded $key]
         if {$module eq ""} {
             set reloadable [expr {$reloadable && $name in {
-                charsets.tcl compat.tcl form.tcl http.tcl ns_crypto.tcl
-                privacy.tcl sendmail.tcl util.tcl
+                charsets.tcl compat.tcl form.tcl http.tcl ns_crypto.tcl ns_stats.tcl
+                privacy.tcl sendmail.tcl tclpro-debug.tcl util.tcl win32.tcl
             }}]
         }
         dict set result $name [dict create path [dict get $files $key] reloadable $reloadable]
