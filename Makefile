@@ -10,8 +10,12 @@
 #
 #
 #
-MAN_CSS=man-5.1.css
-HEADER_INC=header-5.1.inc
+# Select documentation assets from the configured checkout version.
+DOC_VERSION_FILE  ?= ./version_include.man
+DOC_VERSION       := $(shell sed -n 's/^\[vset version \([^]]*\)\]/\1/p' $(DOC_VERSION_FILE))
+DOC_VERSION_MINOR := $(shell printf '%s\n' '$(DOC_VERSION)' | sed 's/^\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/')
+MAN_CSS ?= man-$(DOC_VERSION_MINOR).css
+HEADER_INC ?= header-$(DOC_VERSION_MINOR).inc
 
 NSBUILD=1
 
@@ -373,17 +377,10 @@ endif
 regen-config-parameters-includes:
 	$(MAKE) config-parameters-includes REGEN_CONFIG_PARAMETERS=1
 
-# On some systems you may need a special shell script to control the
-# PATH seen by dtplite, as that influences which versions of $(TCLSH_PROG) and
-# Tcllib dtplite uses.  I personally found it necessary to use a
-# one-line script like this for the DTPLITE command:
-#   env PATH=/usr/sbin:/usr/bin:/sbin:/bin dtplite "$@"
-# --atp@piskorski.com, 2014/08/27 10:52 EDT
-
-ifeq ($(DTPLITE),)
-  DTPLITE=dtplite
-else
-  # Do nothing, use the environment variable as is.
+# Run Tcllib with the configured interpreter, independent of PATH's tclsh
+# and dtplite executables. Keep DTPLITE available as an explicit override.
+ifeq ($(strip $(DTPLITE)),)
+  DTPLITE = $(TCLSH_PROG) "$(CURDIR)/doc/tools/dtplite.tcl"
 endif
 
 build-doc: config-parameters-includes
@@ -461,9 +458,6 @@ build-doc: config-parameters-includes
 # Local copy of Source Forge Documentation
 #
 SF_HTDOCS         ?= /usr/local/ns/sf-naviserver-htdocs
-DOC_VERSION_FILE  ?= ./version_include.man
-DOC_VERSION       := $(shell sed -n 's/^\[vset version \([^]]*\)\]/\1/p' $(DOC_VERSION_FILE))
-DOC_VERSION_MINOR := $(shell printf '%s\n' '$(DOC_VERSION)' | sed 's/^\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/')
 
 install-sf-doc:
 	@if [ -z "$(DOC_VERSION)" ] || [ -z "$(DOC_VERSION_MINOR)" ]; then \
@@ -512,7 +506,7 @@ install-sf-doc:
 #
 # Testing:
 #
-NS_TEST_ENV     = LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+NS_TEST_ENV     = LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 OPENSSL="$(OPENSSL)"
 
 ifneq ($(strip $(DYLD_INSERT_LIBRARIES)),)
 NS_TEST_ENV += DYLD_INSERT_LIBRARIES="$(DYLD_INSERT_LIBRARIES)"
@@ -598,7 +592,7 @@ $(CA_CERT): $(CA_CSR) $(CA_KEY) $(CA_EXT)
 	    -days 3650 -sha256 \
 	    -extfile $(CA_EXT) -extensions ca_ext
 
-$(SERVER_EXT): | $(CERT_DIR)
+$(SERVER_EXT): Makefile | $(CERT_DIR)
 	@printf '%s\n' \
 	    '[server_ext]' \
 	    'basicConstraints = CA:FALSE' \
@@ -608,6 +602,8 @@ $(SERVER_EXT): | $(CERT_DIR)
 	    '' \
 	    '[alt_names]' \
 	    'DNS.1 = localhost' \
+	    'DNS.2 = foo' \
+	    'DNS.3 = test' \
 	    'IP.1 = 127.0.0.1' \
 	    'IP.2 = ::1' \
 	    > $@

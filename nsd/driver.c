@@ -18,6 +18,7 @@
 
 #define Ns_LogAccessDebug_DEFINED_ALREADY
 #include "nsd.h"
+#include "nsatomic.h"
 NS_EXPORT Ns_LogSeverity Ns_LogAccessDebug;
 
 #ifdef HAVE_OPENSSL_EVP_H
@@ -242,7 +243,27 @@ typedef struct AsyncWriteData {
     const char            *buf;
 } AsyncWriteData;
 
+/*
+ * The async writer is allocated once and retained until process exit.
+ * Keeping its context alive allows late shutdown logging to detect the
+ * stopped queue safely and use the synchronous fallback.
+ */
 static AsyncWriter *asyncWriter = NULL;
+static Ns_AtomicUint32 asyncWriterReady;
+
+static bool
+AsyncWriterInitReady(void)
+{
+    Ns_AtomicUint32Init(&asyncWriterReady, 0u);
+    return NS_TRUE;
+}
+
+static AsyncWriter *
+AsyncWriterGet(void)
+{
+    NS_INIT_ONCE(AsyncWriterInitReady);
+    return Ns_AtomicUint32LoadAcquire(&asyncWriterReady) != 0u ? asyncWriter : NULL;
+}
 
 #define DriverGetPort(drvPtr,n) (unsigned short)PTR2INT((drvPtr)->ports.data[(n)])
 
@@ -388,13 +409,16 @@ static int WriterGetMemunitFromDict(Tcl_Interp *interp, Tcl_Obj *dictObj, Tcl_Ob
                                     const Ns_ObjvValueRange *rangePtr, Tcl_WideInt *valuePtr)
     NS_GNUC_NONNULL(1,2,3,5);
 
+static AsyncWriteData *AsyncWriteDataCreate(int fd, const char *buffer, size_t nbyte)
+    NS_GNUC_NONNULL(2) NS_GNUC_RETURNS_NONNULL;
+static bool AsyncWriteEnqueue(int fd, const char *buffer, size_t nbyte)
+    NS_GNUC_NONNULL(2);
 static void AsyncWriterRelease(AsyncWriteData *wdPtr)
     NS_GNUC_NONNULL(1);
 
 static void WriteWarningRaw(const char *msg, int fd, size_t wantWrite, ssize_t written)
     NS_GNUC_NONNULL(1);
 static const char *SockStateString(SockState sockState) NS_GNUC_PURE;
-
 
 static Ns_ReturnCode ParseStrictContentLength(const char *s, size_t *lengthPtr)
     NS_GNUC_NONNULL(1,2);
@@ -1562,6 +1586,9 @@ DriverInit(const char *server, const char *moduleName, const char *threadName,
         drvPtr->sendReadyProc  = init->sendReadyProc;
         drvPtr->sendCancelProc = init->sendCancelProc;
     }
+    if (init->version >= NS_DRIVER_VERSION_8) {
+        drvPtr->sendWaitProc = init->sendWaitProc;
+    }
 
     drvPtr->servPtr        = servPtr;
     drvPtr->defport        = defport;
@@ -1705,6 +1732,7 @@ DriverInit(const char *server, const char *moduleName, const char *threadName,
             Ns_MutexSetName2(&queuePtr->lock, buffer, "queue");
             Ns_CondInit(&queuePtr->cond);
             queuePtr->id = i;
+            queuePtr->threadName = drvPtr->threadName;
             Push(queuePtr, spPtr->firstPtr);
         }
     } else {
@@ -1739,7 +1767,7 @@ DriverInit(const char *server, const char *moduleName, const char *threadName,
             Ns_MutexSetName2(&queuePtr->lock, buffer, "queue");
             Ns_CondInit(&queuePtr->cond);
             queuePtr->id = i;
-            queuePtr->threadName = threadName;
+            queuePtr->threadName = drvPtr->threadName;
             Push(queuePtr, wrPtr->firstPtr);
         }
     } else {
@@ -2974,6 +3002,41 @@ NsDriverSend(Sock *sockPtr, const struct iovec *bufs, int nbufs, unsigned int fl
 }
 
 
+/*
+ *----------------------------------------------------------------------
+ *
+ * NsDriverSendWait --
+ *
+ *      Wait for capacity after a nonblocking driver send made no progress.
+ *      Multiplexed transports provide a logical per-stream wait; other
+ *      drivers retain the socket-writability wait. timeoutPtr is relative,
+ *      or NULL for an indefinite wait. Only blocking callers use this helper.
+ *
+ * Results:
+ *      NS_OK when a send can be retried, NS_TIMEOUT on expiry, or NS_ERROR.
+ *
+ * Side effects:
+ *      May suspend the calling thread. The driver callback sets the socket
+ *      send error on failure.
+ *
+ *----------------------------------------------------------------------
+ */
+Ns_ReturnCode
+NsDriverSendWait(Sock *sockPtr, const Ns_Time *timeoutPtr)
+{
+    const Driver *drvPtr;
+
+    NS_NONNULL_ASSERT(sockPtr != NULL);
+    drvPtr = sockPtr->drvPtr;
+    NS_NONNULL_ASSERT(drvPtr != NULL);
+
+    if (drvPtr->sendWaitProc != NULL) {
+        return (*drvPtr->sendWaitProc)((Ns_Sock *)sockPtr, timeoutPtr);
+    }
+    return Ns_SockTimedWait(sockPtr->sock, (unsigned int)NS_SOCK_WRITE,
+                            timeoutPtr);
+}
+
 /*
  *----------------------------------------------------------------------
  *
@@ -11066,46 +11129,47 @@ void
 NsAsyncWriterQueueEnable(void)
 {
     if (Ns_ConfigBool(NS_GLOBAL_CONFIG_PARAMETERS, "asynclogwriter", NS_FALSE) == NS_TRUE) {
-        SpoolerQueue  *queuePtr;
+        AsyncWriter  *writerPtr = AsyncWriterGet();
+        SpoolerQueue *queuePtr;
 
-        /*
-         * In case, the async writer has not started, the static variable
-         * asyncWriter is NULL.
-         */
-        if (asyncWriter == NULL) {
+        if (writerPtr == NULL) {
+            bool startWorker = NS_FALSE;
+
             Ns_MutexLock(&reqLock);
-            if (likely(asyncWriter == NULL)) {
-                /*
-                 * Allocate and initialize writer thread context.
-                 */
-                asyncWriter = ns_calloc(1u, sizeof(AsyncWriter));
-                Ns_MutexUnlock(&reqLock);
-                Ns_MutexSetName2(&asyncWriter->lock, "ns:driver", "async-writer");
-                /*
-                 * Allocate and initialize a Spooler Queue for this thread.
-                 */
+            writerPtr = AsyncWriterGet();
+            if (writerPtr == NULL) {
+                writerPtr = ns_calloc(1u, sizeof(AsyncWriter));
+                Ns_MutexSetName2(&writerPtr->lock, "ns:driver", "async-writer");
+
                 queuePtr = ns_calloc(1u, sizeof(SpoolerQueue));
                 Ns_MutexSetName2(&queuePtr->lock, "ns:driver:async-writer", "queue");
                 Ns_CondInit(&queuePtr->cond);
+                if (ns_sockpair(queuePtr->pipe) != 0) {
+                    Ns_Fatal("ns_sockpair() failed: %s", ns_sockstrerror(ns_sockerrno));
+                }
 
-                asyncWriter->firstPtr = queuePtr;
-                /*
-                 * Start the spooler queue
-                 */
-                SpoolerQueueStart(queuePtr, AsyncWriterThread);
+                writerPtr->firstPtr = queuePtr;
+                asyncWriter = writerPtr;
+                Ns_AtomicUint32StoreRelease(&asyncWriterReady, 1u);
+                startWorker = NS_TRUE;
+            }
+            Ns_MutexUnlock(&reqLock);
 
-            } else {
-                Ns_MutexUnlock(&reqLock);
+            if (startWorker) {
+                queuePtr = writerPtr->firstPtr;
+                Ns_ThreadCreate(AsyncWriterThread, queuePtr, 0, &queuePtr->thread);
             }
         }
 
-
-        assert(asyncWriter != NULL);
-        queuePtr = asyncWriter->firstPtr;
-        assert(queuePtr != NULL);
+        queuePtr = writerPtr->firstPtr;
 
         Ns_MutexLock(&queuePtr->lock);
-        queuePtr->stopped = NS_FALSE;
+        /*
+         * Prevent re-enable during shutdown to avoid race.
+         */
+        if (!queuePtr->shutdown) {
+            queuePtr->stopped = NS_FALSE;
+        }
         Ns_MutexUnlock(&queuePtr->lock);
     }
 }
@@ -11115,21 +11179,39 @@ NsAsyncWriterQueueEnable(void)
  *
  * NsAsyncWriterQueueDisable --
  *
- *      Disable async writing but don't touch the writer thread.
+ *      Stop accepting asynchronous write requests and request the writer
+ *      thread to drain its queue. Wait up to the configured shutdown timeout
+ *      for notification that draining has completed.
+ *
+ *      When shutdown is NS_FALSE, the writer is disabled temporarily and
+ *      may subsequently be re-enabled by NsAsyncWriterQueueEnable(). When
+ *      shutdown is NS_TRUE, the shutdown is permanent and the writer thread
+ *      is requested to exit.
+ *
+ *      The writer context is intentionally retained after permanent
+ *      shutdown. Producers may already have observed the global writer
+ *      pointer, and the writer thread may continue accessing its context
+ *      briefly after reporting that the queue was drained. Late write
+ *      requests therefore encounter a stopped queue and use the synchronous
+ *      fallback safely.
  *
  * Results:
  *      None.
  *
  * Side effects:
- *      Disable async writing by setting stopped to 1.
+ *      Stops asynchronous queue admission, drains queued writes, and may
+ *      request termination of the writer thread. A permanent shutdown cannot
+ *      be reversed.
  *
  *----------------------------------------------------------------------
  */
 void
 NsAsyncWriterQueueDisable(bool shutdown)
 {
-    if (asyncWriter != NULL) {
-        SpoolerQueue *queuePtr = asyncWriter->firstPtr;
+    AsyncWriter *writerPtr = AsyncWriterGet();
+
+    if (writerPtr != NULL) {
+        SpoolerQueue *queuePtr = writerPtr->firstPtr;
         Ns_Time       timeout;
 
         assert(queuePtr != NULL);
@@ -11138,42 +11220,164 @@ NsAsyncWriterQueueDisable(bool shutdown)
         Ns_IncrTime(&timeout, nsconf.shutdowntimeout.sec, nsconf.shutdowntimeout.usec);
 
         Ns_MutexLock(&queuePtr->lock);
+
+        /*
+         * A shutdown is permanent. The worker has either already exited or
+         * is in the process of exiting.
+         */
+        if (queuePtr->shutdown) {
+            Ns_MutexUnlock(&queuePtr->lock);
+            return;
+        }
+
         queuePtr->stopped = NS_TRUE;
         queuePtr->shutdown = shutdown;
 
         /*
-         * Trigger the AsyncWriter Thread to drain the spooler queue.
+         * Trigger the writer thread to drain the queue and, for a permanent
+         * shutdown, exit.
          */
         SockTrigger(queuePtr->pipe[1]);
-        (void)Ns_CondTimedWait(&queuePtr->cond, &queuePtr->lock, &timeout);
+        (void)Ns_CondTimedWait(&queuePtr->cond, &queuePtr->lock,
+                               &timeout);
 
         Ns_MutexUnlock(&queuePtr->lock);
 
-        if (shutdown) {
-            ns_free(queuePtr);
-            ns_free(asyncWriter);
-            asyncWriter = NULL;
-        }
+        /*
+         * Do not free asyncWriter or queuePtr here. Producers may already
+         * have observed the global pointer, and the writer thread continues
+         * to access its context briefly after signaling that the queue was
+         * drained. Late writes see the stopped queue and use the synchronous
+         * fallback. The process reclaims this process-lifetime state.
+         */
     }
 }
 
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * AsyncWriteDataCreate --
+ *
+ *      Allocate and initialize an asynchronous write request. The supplied
+ *      buffer is copied so that the caller may release or reuse it after
+ *      this function returns.
+ *
+ * Results:
+ *      Pointer to a newly allocated AsyncWriteData structure. Ownership is
+ *      transferred to the caller.
+ *
+ * Side effects:
+ *      Allocates memory.
+ *
+ *----------------------------------------------------------------------
+ */
+static AsyncWriteData *
+AsyncWriteDataCreate(int fd, const char *buffer, size_t nbyte)
+{
+    AsyncWriteData *newPtr;
+
+    /*
+     * Allocate a writer cmd and initialize it. In order to provide an
+     * interface compatible to ns_write(), we copy the provided data,
+     * such it can be freed by the caller. When we would give up the
+     * interface, we could free the memory block after writing, and
+     * save a malloc/free operation on the data.
+     */
+    newPtr = ns_calloc(1u, sizeof(AsyncWriteData));
+    newPtr->fd = fd;
+    newPtr->bufsize = nbyte;
+    newPtr->data = ns_malloc(nbyte + 1u);
+    memcpy(newPtr->data, buffer, newPtr->bufsize);
+    newPtr->buf  = newPtr->data;
+    newPtr->size = newPtr->bufsize;
+
+    return newPtr;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * AsyncWriteEnqueue --
+ *
+ *      Attempt to enqueue an asynchronous write request. Testing whether
+ *      the writer is stopped and inserting the request are performed while
+ *      holding the queue lock. On success, ownership of the request and its
+ *      copied buffer is transferred to the writer queue.
+ *
+ * Results:
+ *      NS_TRUE when the request was accepted by the writer queue, otherwise
+ *      NS_FALSE. No data is written when the request is not accepted.
+ *
+ * Side effects:
+ *      Allocates and copies the write request, updates the queue, and may
+ *      wake the asynchronous writer thread. An unaccepted request is freed
+ *      before returning.
+ *
+ *----------------------------------------------------------------------
+ */
+static bool
+AsyncWriteEnqueue(int fd, const char *buffer, size_t nbyte)
+{
+    AsyncWriter    *writerPtr = AsyncWriterGet();
+    AsyncWriteData *newPtr;
+    SpoolerQueue   *queuePtr;
+    bool            queued = NS_FALSE;
+    bool            trigger = NS_FALSE;
+
+    if (writerPtr == NULL) {
+        return NS_FALSE;
+    }
+
+    newPtr = AsyncWriteDataCreate(fd, buffer, nbyte);
+    queuePtr = writerPtr->firstPtr;
+    assert(queuePtr != NULL);
+
+    Ns_MutexLock(&queuePtr->lock);
+
+    if (!queuePtr->stopped) {
+        trigger = queuePtr->sockPtr == NULL;
+        newPtr->nextPtr = queuePtr->sockPtr;
+        queuePtr->sockPtr = newPtr;
+        writerPtr->stats.queued++;
+        queued = NS_TRUE;
+    }
+
+    Ns_MutexUnlock(&queuePtr->lock);
+
+    if (queued) {
+        if (trigger) {
+            SockTrigger(queuePtr->pipe[1]);
+        }
+    } else {
+        AsyncWriterRelease(newPtr);
+    }
+
+    return queued;
+}
 
 /*
  *----------------------------------------------------------------------
  *
  * NsAsyncWrite --
  *
- *      Perform an asynchronous write operation via a writer thread in
- *      case a writer thread is configured and running. The intention
- *      of the asynchronous write operations is to reduce latencies in
- *      connection threads.
+ *      Write the supplied data via the asynchronous writer when it is
+ *      available. When the request cannot be enqueued, perform the write
+ *      synchronously in the calling thread.
+ *
+ *      A synchronous write failure is reported directly to stderr. Using
+ *      the normal logging facility could recursively invoke this function
+ *      and result in an infinite loop.
  *
  * Results:
- *      NS_OK, when write was performed via writer thread,
- *      NS_ERROR otherwise (but data is written).
+ *      NS_OK when the request was accepted by the asynchronous writer or
+ *      the synchronous fallback completed successfully. NS_ERROR when the
+ *      synchronous fallback could not write all supplied data.
  *
  * Side effects:
- *      I/O Operation.
+ *      Queues an asynchronous write or performs synchronous I/O. Write
+ *      failures may be reported directly to stderr.
  *
  *----------------------------------------------------------------------
  */
@@ -11184,13 +11388,13 @@ NsAsyncWrite(int fd, const char *buffer, size_t nbyte)
 
     NS_NONNULL_ASSERT(buffer != NULL);
 
-    /*
-     * If the async writer has not started or is deactivated, behave like a
-     * ns_write() command. If the ns_write() fails, we can't do much, since
-     * the writing of an error message to the log might bring us into an
-     * infinite loop. So we print simple to stderr.
-     */
-    if (asyncWriter == NULL || asyncWriter->firstPtr->stopped) {
+    if (!AsyncWriteEnqueue(fd, buffer, nbyte)) {
+        /*
+         * The asynchronous writer is unavailable or temporarily stopped.
+         * Perform the write synchronously. If this fails, report the error
+         * directly to stderr, since using Ns_Log() could recurse into this
+         * function and result in an infinite loop.
+         */
         ssize_t written = ns_write(fd, buffer, nbyte);
 
         if (unlikely(written != (ssize_t)nbyte)) {
@@ -11219,53 +11423,6 @@ NsAsyncWrite(int fd, const char *buffer, size_t nbyte)
                     break;
                 }
             } while (retries-- > 0);
-        }
-
-    } else {
-        SpoolerQueue         *queuePtr;
-        bool                  trigger = NS_FALSE;
-        const AsyncWriteData *wdPtr;
-        AsyncWriteData       *newWdPtr;
-
-        /*
-         * Allocate a writer cmd and initialize it. In order to provide an
-         * interface compatible to ns_write(), we copy the provided data,
-         * such it can be freed by the caller. When we would give up the
-         * interface, we could free the memory block after writing, and
-         * save a malloc/free operation on the data.
-         */
-        newWdPtr = ns_calloc(1u, sizeof(AsyncWriteData));
-        newWdPtr->fd = fd;
-        newWdPtr->bufsize = nbyte;
-        newWdPtr->data = ns_malloc(nbyte + 1u);
-        memcpy(newWdPtr->data, buffer, newWdPtr->bufsize);
-        newWdPtr->buf  = newWdPtr->data;
-        newWdPtr->size = newWdPtr->bufsize;
-
-        /*
-         * Now add new writer socket to the writer thread's queue. In most
-         * cases, the queue will be empty.
-         */
-        queuePtr = asyncWriter->firstPtr;
-        assert(queuePtr != NULL);
-
-        Ns_MutexLock(&queuePtr->lock);
-        wdPtr = queuePtr->sockPtr;
-        if (wdPtr != NULL) {
-            newWdPtr->nextPtr = queuePtr->sockPtr;
-            queuePtr->sockPtr = newWdPtr;
-        } else {
-            queuePtr->sockPtr = newWdPtr;
-            trigger = NS_TRUE;
-        }
-        asyncWriter->stats.queued++;
-        Ns_MutexUnlock(&queuePtr->lock);
-
-        /*
-         * Wake up writer thread if desired
-         */
-        if (trigger) {
-            SockTrigger(queuePtr->pipe[1]);
         }
     }
 
@@ -11353,6 +11510,7 @@ AsyncWriterDrainList(AsyncWriteData **listPtr, size_t *counterPtr,
 static void
 AsyncWriterThread(void *arg)
 {
+    AsyncWriter    *writerPtr = AsyncWriterGet();
     SpoolerQueue   *queuePtr = (SpoolerQueue*)arg;
     char            charBuffer[1];
     int             pollTimeout;
@@ -11412,21 +11570,21 @@ AsyncWriterThread(void *arg)
 
                 /*
                  * Drain active writer jobs. These jobs are on writePtr and are counted
-                 * both in asyncWriter->stats.writing and queuePtr->queuesize.
+                 * both in writerPtr->stats.writing and queuePtr->queuesize.
                  */
-                AsyncWriterDrainList(&writePtr, &asyncWriter->stats.writing,
+                AsyncWriterDrainList(&writePtr, &writerPtr->stats.writing,
                                      queuePtr, NS_TRUE, "drain writer");
 
                 /*
                  * Detach queued-but-not-yet-active jobs under the queue lock. These jobs
-                 * are counted in asyncWriter->stats.queued, but not in queuePtr->queuesize.
+                 * are counted in writerPtr->stats.queued, but not in queuePtr->queuesize.
                  */
                 Ns_MutexLock(&queuePtr->lock);
                 queuedPtr = queuePtr->sockPtr;
                 queuePtr->sockPtr = NULL;
                 Ns_MutexUnlock(&queuePtr->lock);
 
-                AsyncWriterDrainList(&queuedPtr, &asyncWriter->stats.queued,
+                AsyncWriterDrainList(&queuedPtr, &writerPtr->stats.queued,
                                      queuePtr, NS_FALSE, "drain queue");
 
                 /*
@@ -11450,7 +11608,7 @@ AsyncWriterThread(void *arg)
             nextPtr = curPtr->nextPtr;
             status = NS_OK;
 
-            QueueStatsDecr(asyncWriter->stats.writing, "async writer writing");
+            QueueStatsDecr(writerPtr->stats.writing, "async writer writing");
 
             /*
              * Write the actual data and allow for partial write operations.
@@ -11479,7 +11637,7 @@ AsyncWriterThread(void *arg)
                  */
                 if (curPtr->size > 0u) {
                     Push(curPtr, writePtr);
-                    asyncWriter->stats.writing++;
+                    writerPtr->stats.writing++;
                 } else {
                     AsyncWriterRelease(curPtr);
                     queuePtr->queuesize--;
@@ -11517,10 +11675,10 @@ AsyncWriterThread(void *arg)
             while (curPtr != NULL) {
                 nextPtr = curPtr->nextPtr;
 
-                QueueStatsDecr(asyncWriter->stats.queued, "async writer queued");
+                QueueStatsDecr(writerPtr->stats.queued, "async writer queued");
 
                 Push(curPtr, writePtr);
-                asyncWriter->stats.writing++;
+                writerPtr->stats.writing++;
 
                 queuePtr->queuesize++;
                 curPtr = nextPtr;
@@ -11810,12 +11968,14 @@ AsyncLogfileStatsObjCmd
     } else {
         Tcl_Obj *listObj = Tcl_NewListObj(0, NULL);
 
-        if (asyncWriter != NULL) {
+        AsyncWriter *writerPtr = AsyncWriterGet();
+
+        if (writerPtr != NULL) {
             Tcl_ListObjAppendElement(interp, listObj, NsAtomObj(NS_ATOM_writing));
-            Tcl_ListObjAppendElement(interp, listObj, Tcl_NewWideIntObj((Tcl_WideInt)asyncWriter->stats.writing));
+            Tcl_ListObjAppendElement(interp, listObj, Tcl_NewWideIntObj((Tcl_WideInt)writerPtr->stats.writing));
 
             Tcl_ListObjAppendElement(interp, listObj, NsAtomObj(NS_ATOM_queued));
-            Tcl_ListObjAppendElement(interp, listObj, Tcl_NewWideIntObj((Tcl_WideInt)asyncWriter->stats.queued));
+            Tcl_ListObjAppendElement(interp, listObj, Tcl_NewWideIntObj((Tcl_WideInt)writerPtr->stats.queued));
         }
         Tcl_SetObjResult(interp, listObj);
     }

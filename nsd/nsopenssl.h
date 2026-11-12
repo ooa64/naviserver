@@ -16,6 +16,18 @@
  * Common definitions of handling versions of openssl/libressl
  */
 
+/* Known API versions do not need the configure-time function probes. */
+# if OPENSSL_VERSION_NUMBER >= 0x10002000L
+#  if !defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER >= 0x4010000fL
+#   ifndef HAVE_X509_VERIFY_PARAM_SET1_HOST
+#    define HAVE_X509_VERIFY_PARAM_SET1_HOST 1
+#   endif
+#   ifndef HAVE_X509_VERIFY_PARAM_SET1_IP_ASC
+#    define HAVE_X509_VERIFY_PARAM_SET1_IP_ASC 1
+#   endif
+#  endif
+# endif
+
 #if defined(LIBRESSL_VERSION_NUMBER) || OPENSSL_VERSION_NUMBER < 0x10101000L
 # define HAVE_OPENSSL_PRE_1_1_1
 #endif
@@ -62,6 +74,7 @@
 #if defined(HAVE_OPENSSL_4)
 typedef struct NsTLSH3Config {
     size_t      recvbufsize;
+    size_t      sendbufsize;
     size_t      sendqueuesize;
     size_t      nr_listeners;
     int         cc_idx;

@@ -192,6 +192,7 @@ typedef enum {
 #define NS_DRIVER_VERSION_5        5    /* Library info, current connection info */
 #define NS_DRIVER_VERSION_6        6    /* driverThreadProc, headersEncodeProc */
 #define NS_DRIVER_VERSION_7        7    /* Logical send readiness notifications */
+#define NS_DRIVER_VERSION_8        8    /* Blocking logical send readiness wait */
 
 typedef struct Ns_ConfigView {
     const char *primary;
@@ -720,8 +721,18 @@ typedef void
 (Ns_DriverSendCancelProc)(Ns_Sock *sock, void *wakeArg)
     NS_GNUC_NONNULL(1,2);
 
-typedef Ns_ReturnCode
-(Ns_DriverRequestProc)(void *arg, Ns_Conn *conn)
+/*
+ * Wait for logical send capacity without blocking the transport's event loop.
+ * timeoutPtr is relative; NULL permits an indefinite wait. Return NS_OK when
+ * a send can be retried, NS_TIMEOUT on expiry, or NS_ERROR on termination.
+ * On failure, set the socket's send error. This callback is used only by
+ * callers which explicitly permit blocking; sendProc remains nonblocking.
+ */
+typedef Ns_ReturnCode Ns_DriverSendWaitProc(Ns_Sock *sock,
+                                           const Ns_Time *timeoutPtr)
+    NS_GNUC_NONNULL(1);
+
+typedef Ns_ReturnCode Ns_DriverRequestProc(void *arg, Ns_Conn *conn)
     NS_GNUC_NONNULL(1,2);
 
 typedef bool
@@ -744,7 +755,7 @@ typedef Tcl_Obj *
 
 typedef struct Ns_DriverClientInitArg {
     NS_TLS_SSL_CTX *ctx;
-    const char *sniHostname;
+    const char *sniHostname; /* Reference DNS name or IP; SNI is sent only for DNS. */
     const char *caFile;
     const char *caPath;
 } Ns_DriverClientInitArg;
@@ -779,6 +790,7 @@ typedef struct Ns_DriverInitData {
     Ns_DriverSendReadyProc  *sendReadyProc;     /* NS_DRIVER_VERSION_7: logical stream writability */
     Ns_DriverSendCancelProc *sendCancelProc;    /* NS_DRIVER_VERSION_7: cancel logical wakeup */
     const char              *fallbackPath;      /* NS_DRIVER_VERSION_7: fallback configuration section */
+    Ns_DriverSendWaitProc   *sendWaitProc;      /* NS_DRIVER_VERSION_8: blocking logical send wait */
 } Ns_DriverInitData;
 
 
@@ -1625,6 +1637,10 @@ Ns_DStringAppendTime(Tcl_DString *dsPtr, const Ns_Time *timePtr)
 
 NS_EXTERN const char *
 Ns_DStringAppendSockState(Tcl_DString *dsPtr, Ns_SockState state)
+    NS_GNUC_NONNULL(1);
+
+NS_EXTERN const char *
+Ns_DStringAppendTLSErrorStack(Tcl_DString *dsPtr, unsigned long sslERRcode)
     NS_GNUC_NONNULL(1);
 
 NS_EXTERN Tcl_Obj *

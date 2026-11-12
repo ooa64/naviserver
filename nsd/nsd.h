@@ -369,6 +369,7 @@ typedef struct {
     Ns_Time          sendTimeout;
     const char      *clientData;
     struct Callback *cbPtr;
+    bool             listener;              /* Socket owned by listen callback teardown. */
     Tcl_DString     *sendBuffer;              /* For unsent bytes in "ns_connchan write -buffered" */
     Tcl_DString     *secondarySendBuffer;     /* For unsent bytes while we have rejected data */
     Tcl_DString     *frameBuffer;             /* Buffer of for a single WebSocket frame */
@@ -507,6 +508,7 @@ typedef struct Driver {
     Ns_HeadersEncodeProc    *headersEncodeProc;/* Optional - use alternate header encode proc */
     Ns_DriverSendReadyProc  *sendReadyProc;    /* Optional logical stream send readiness. */
     Ns_DriverSendCancelProc *sendCancelProc;   /* Optional cancellation of readiness wakeup. */
+    Ns_DriverSendWaitProc   *sendWaitProc;     /* Optional blocking logical send wait. */
 
     ssize_t                              locationLength;
     const char *path;                   /* Path in the configuration namespace */
@@ -1314,6 +1316,7 @@ typedef struct {
     NsServer          *servPtr;          /* Server for doneCallback */
     NS_TLS_SSL_CTX    *ctx;              /* SSL context handle */
     NS_TLS_SSL        *ssl;              /* SSL connection handle */
+    const char        *tlsConfig;        /* TLS identity and policy cache key */
     size_t             pos;              /* needed only for HttpCancel() */
     Tcl_DString        ds;               /* for assembling request string */
     struct _NsHttpChunk *chunk;          /* for parsing chunked encodings */
@@ -1653,6 +1656,7 @@ NS_EXTERN void NsInitHttptime(void);
 NS_EXTERN void NsInitInfo(void);
 NS_EXTERN void NsInitLimits(void);
 NS_EXTERN void NsInitListen(void);
+
 NS_EXTERN void NsInitLog(void);
 NS_EXTERN void NsInitModLoad(void);
 NS_EXTERN void NsInitOpenSSL(void);
@@ -1916,6 +1920,9 @@ NS_EXTERN ssize_t NsDriverRecv(Sock *sockPtr, struct iovec *bufs, int nbufs, Ns_
 NS_EXTERN ssize_t NsDriverSend(Sock *sockPtr, const struct iovec *bufs, int nbufs, unsigned int flags)
     NS_GNUC_NONNULL(1);
 
+NS_EXTERN Ns_ReturnCode NsDriverSendWait(Sock *sockPtr, const Ns_Time *timeoutPtr)
+    NS_GNUC_NONNULL(1);
+
 NS_EXTERN ssize_t NsDriverSendFile(Sock *sockPtr, Ns_FileVec *bufs, int nbufs, unsigned int flags)
     NS_GNUC_NONNULL(1,2);
 
@@ -2015,6 +2022,16 @@ NS_EXTERN void NsLogMemoryStatsDelta(const char *context, const ConnPool *poolPt
  */
 NS_EXTERN NsLimits *NsGetRequestLimits(NsServer *servPtr, const char *method, const char *url)
     NS_GNUC_NONNULL(1,2,3);
+
+/*
+ * listen.c
+ */
+NS_EXTERN NS_SOCKET NsSockListenCallback(const char *addr, unsigned short port,
+                                         Ns_SockProc *proc, bool doBind, void *arg,
+                                         Ns_Callback *freeProc)
+    NS_GNUC_NONNULL(3,5);
+NS_EXTERN void NsSockCloseListenCallback(NS_SOCKET sock);
+
 
 /*
  * log.c
@@ -2205,6 +2222,7 @@ NS_EXTERN int NsPoll(struct pollfd *pfds, NS_POLL_NFDS_TYPE nfds, const Ns_Time 
 NS_EXTERN void NsGetSockCallbacks(Tcl_DString *dsPtr) NS_GNUC_NONNULL(1);
 NS_EXTERN void NsStartSockShutdown(void);
 NS_EXTERN void NsWaitSockShutdown(const Ns_Time *toPtr);
+NS_EXTERN bool NsSockCallbackIsCurrentThread(void);
 
 /*
  * str.c

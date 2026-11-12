@@ -2467,8 +2467,9 @@ stops execution of that ADP page}
                 ns_section ns/module/h3 {
                     ns_param https                 ns/module/https
                     # ns_param driverthreads       2
-                    ns_param writerthreads         1
-                    ns_param recvbufsize           8MB
+                    # ns_param writerthreads       1
+                    # ns_param recvbufsize         8MB
+                    # ns_param sendbufsize         8MB
                     ns_param sendqueuesize         256kB
                     ns_param idletimeout           3s
                     ns_param draintimeout          10ms
@@ -2499,14 +2500,28 @@ stops execution of that ADP page}
                 desc {Size of the UDP receive buffer used by the HTTP/3 driver}
             }
 
+            sendbufsize {
+                type size
+                default {8MB}
+                desc {
+                    A value of 0 leaves the operating-system default
+                    unchanged. The effective size is subject to
+                    operating-system limits.
+                }
+            }
+
             sendqueuesize {
                 type size
                 default {256kB}
                 desc {
                     Maximum response-body data retained in the HTTP/3
-                    stream send queue. When this limit is reached, writer
-                    delivery pauses until the queue drains to half the
-                    configured size.
+                    stream send queue, with or without writer threads.
+                    When the queue is full, asynchronous writers park;
+                    connection-thread sends wait for up to sendwait until
+                    the queue drains to half the configured size. Timed
+                    connection-channel sends use their configured timeout.
+                    Nonblocking sends return the number of bytes accepted
+                    so far.
                 }
             }
 
@@ -3056,6 +3071,47 @@ stops execution of that ADP page}
                 type boolean
                 default {false}
                 desc {Enable logging for SMTP sending operations performed by the module}
+            }
+
+            eventlogging {
+                type boolean
+                default {false}
+                desc {Enable a separate structured SMTP event log for incoming recipient decisions, applied alias expansions, greylisting outcomes and custom Tcl policy events. Does not change mail policy or the existing SMTP send log. The nsstats SMTP Events page displays charts and a filterable event table. Records contain envelope addresses but no message bodies or subjects; recipient acceptance does not establish final delivery}
+            }
+
+            eventlogfile {
+                type path
+                default {smtpevents-${server}.log}
+                desc {SMTP event log filename. Relative paths use the server log directory on NaviServer 5, or the home logs directory on older versions. The resolved path is available in the configuration database. Records are versioned, single-line Tcl dictionaries; parse them as data, never evaluate them. This first version covers incoming SMTP callbacks rather than direct ns_smtpd send operations}
+            }
+
+            eventlogmaxbackup {
+                type integer
+                default {100}
+                desc {Maximum number of rotated SMTP event log files to retain}
+            }
+
+            eventlogroll {
+                type boolean
+                default {true}
+                desc {Enable daily rotation of the SMTP event log when eventlogging is enabled}
+            }
+
+            eventlogrollfmt {
+                type string
+                desc {Optional strftime suffix format for SMTP event log rotation; without a format, use numbered backups}
+            }
+
+            eventlogrollhour {
+                type integer
+                default {0}
+                desc {Hour of day, from 0 through 23, for daily SMTP event log rotation}
+            }
+
+            eventlogrollonsignal {
+                type boolean
+                default {false}
+                desc {Rotate the SMTP event log on SIGHUP when eventlogging is enabled}
             }
 
             logfile {

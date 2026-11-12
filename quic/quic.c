@@ -542,8 +542,7 @@ static void     quic_conn_enter_shutdown(ConnCtx *cc, const char *why) NS_GNUC_N
 static bool     quic_conn_has_live_requests(ConnCtx *cc) NS_GNUC_NONNULL(1);
 static bool     quic_conn_can_be_freed(SSL *conn, uint64_t revents, ConnCtx *cc) NS_GNUC_NONNULL(1,3);
 static bool     quic_conn_set_sockaddr(SSL *ssl, struct sockaddr *saPtr, socklen_t *saLen) NS_GNUC_NONNULL(1,2,3);
-static int      quic_conn_open_server_uni_streams(ConnCtx *cc, struct h3ssl *h3ssl) NS_GNUC_NONNULL(1,2);
-
+static int      quic_conn_open_server_uni_streams(ConnCtx *cc, struct h3ssl *h3ssl, char **errorPtr) NS_GNUC_NONNULL(1,2,3);
 static void     quic_stream_accepted_null(ConnCtx *cc) NS_GNUC_NONNULL(1);
 static bool     quic_stream_keeps_conn_alive(StreamCtx *sc) NS_GNUC_NONNULL(1);
 static bool     quic_conn_stream_map_empty(ConnCtx *cc);
@@ -551,6 +550,7 @@ static bool     quic_conn_can_be_freed_postloop(SSL *conn, ConnCtx *cc) NS_GNUC_
 
 /* QUIC Utilities */
 static void     quic_udp_set_rcvbuf(int fd, size_t rcvbuf_bytes);
+static void     quic_udp_set_sndbuf(int fd, size_t sndbuf_bytes);
 static size_t   quic_varint_len(uint8_t b0);
 static uint64_t quic_varint_decode(const uint8_t *p, size_t n) NS_GNUC_NONNULL(1);
 static SSL*     quic_sid_to_stream(ConnCtx *cc, uint64_t sid) NS_GNUC_NONNULL(1);
@@ -601,6 +601,7 @@ static nghttp3_ssize     h3_stream_read_data_cb(nghttp3_conn *UNUSED(conn), int6
 
 /* H3 submit/resume & lifecycle */
 static int               h3_stream_submit_ready_headers(StreamCtx *sc) NS_GNUC_NONNULL(1);
+static void              h3_stream_abort_response(StreamCtx *sc, uint64_t errorCode, const char *reason) NS_GNUC_NONNULL(1,3);
 static H3DrainResultCode h3_stream_drain(ConnCtx *cc, SSL *stream, uint64_t sid, const char *label) NS_GNUC_NONNULL(1);
 static bool              h3_stream_maybe_finalize(StreamCtx *sc, const char *label) NS_GNUC_NONNULL(1,2);
 static bool              h3_stream_can_free(const StreamCtx *sc) NS_GNUC_NONNULL(1);
@@ -715,6 +716,7 @@ static Ns_DriverRecvProc Recv;
 static Ns_DriverSendProc Send;
 static Ns_DriverSendReadyProc SendReady;
 static Ns_DriverSendCancelProc SendCancel;
+static Ns_DriverSendWaitProc SendWait;
 static Ns_DriverKeepProc Keep;
 static Ns_DriverCloseProc Close;
 static Ns_DriverConnInfoProc ConnInfo;
@@ -1556,11 +1558,18 @@ quic_conn_finish_handshake(ConnCtx *cc)
      * The incoming-stream policy is already installed when the connection
      * is accepted. Create and bind the required local HTTP/3 streams now.
      */
-    if (quic_conn_open_server_uni_streams(cc, &cc->h3ssl) != 0) {
-        Ns_Log(Error,
-               "[%lld] H3: failed to create required server uni streams",
-               (long long)dc->iter);
-        return -1;
+    {
+        char *errorMsg = NULL;
+
+        if (quic_conn_open_server_uni_streams(cc, &cc->h3ssl, &errorMsg) != 0) {
+            Ns_Log(Error,
+                   "[%lld] H3 conn %p: server uni-stream setup failed: %s",
+                   (long long)dc->iter,
+                   (void *)conn,
+                   errorMsg != NULL ? errorMsg : "unspecified failure");
+            ns_free(errorMsg);
+            return -1;
+        }
     }
 
     ossl_conn_maybe_log_first_shutdown(cc, "after quic_conn_open_server_uni_streams");
@@ -1875,138 +1884,209 @@ quic_conn_set_sockaddr(SSL *ssl, struct sockaddr *saPtr, socklen_t *saLen)
  *
  * quic_conn_open_server_uni_streams --
  *
- *      Create and register the HTTP/3 server-initiated unidirectional
- *      streams (control, QPACK encoder, QPACK decoder) on an existing
- *      QUIC connection, and bind them to the nghttp3 connection.
+ *      Create and register the server's HTTP/3 control, QPACK encoder,
+ *      and QPACK decoder streams, then bind them to nghttp3.
+ *      SSL_STREAM_FLAG_ADVANCE permits stream creation before the peer
+ *      grants sufficient unidirectional-stream credit.
  *
- *      The function:
- *        - Allocates three unidirectional streams with
- *          SSL_STREAM_FLAG_ADVANCE, allowing their stream objects to be
- *          created before peer stream credit becomes available.
- *        - Verifies they are write-only (server-initiated uni streams).
- *        - Registers each stream with the pollset and creates StreamCtx
- *          (PollsetAddStreamRegister), recording their QUIC stream IDs
- *          into *h3ssl.
- *        - Binds the control stream with nghttp3_conn_bind_control_stream().
- *        - Binds the QPACK encoder/decoder streams with
- *          nghttp3_conn_bind_qpack_streams().
- *        - Kicks the I/O state machine (h3_conn_write_step, SSL_handle_events)
- *          to flush any pending frames.
- *
- * Arguments:
- *      cc     - Connection context holding OpenSSL and HTTP/3 state.
- *      h3ssl  - Per-connection HTTP/3/SSL bundle where the new streams
- *               and their IDs are stored.
- *      cc->h3conn (nghttp3_conn*) and h3ssl->conn (SSL*) must be valid.
+ *      Called once during HTTP/3 setup, with the server stream pointers
+ *      initially NULL. On failure, capture the failing operation and
+ *      available OpenSSL or nghttp3 error details before cleanup.
+ *      The caller is responsible for logging the returned explanation.
  *
  * Results:
- *      Returns 0 on success. On failure, logs a warning/error, unregisters
- *      any partially created StreamCtx, frees any created SSL streams,
- *      resets the stored stream pointers/IDs in *h3ssl, and returns -1.
+ *      Returns 0 on success and leaves *errorPtr NULL.
+ *      Returns -1 on failure and sets *errorPtr to an allocated error
+ *      description, which the caller must release with ns_free().
  *
  * Side effects:
- *      Allocates OpenSSL stream objects; registers them with internal
- *      pollset/mappings; updates *h3ssl with stream pointers and IDs;
- *      performs nghttp3 control/QPACK binding; may advance QUIC state
- *      via SSL_handle_events().
- *      Streams created in advance may remain transport-blocked until the
- *      peer grants sufficient unidirectional-stream credit.
+ *      Allocates stream objects, registers their contexts and poll
+ *      interest, and updates the stream pointers and IDs in *h3ssl.
+ *      Binds the streams to nghttp3 and initiates HTTP/3 output and
+ *      QUIC event processing.
+ *
+ *      On failure, detaches registered stream contexts, frees created
+ *      stream objects, and resets their stored pointers and IDs.
+ *      Capturing an OpenSSL failure drains the calling thread's error
+ *      queue. Diagnostic storage is allocated only on failure.
+ *
+ *      Does not log setup failures directly; existing debug and
+ *      connection-shutdown diagnostics remain enabled.
  *
  *----------------------------------------------------------------------
  */
 static int
-quic_conn_open_server_uni_streams(ConnCtx *cc, struct h3ssl *h3ssl)
+quic_conn_open_server_uni_streams(ConnCtx *cc, struct h3ssl *h3ssl,
+                                  char **errorPtr)
 {
     NsTLSConfig   *dc = cc->dc;
     nghttp3_conn  *h3conn = cc->h3conn;
     SSL           *conn = h3ssl->conn;
     StreamCtx     *csc = NULL, *psc = NULL, *rsc = NULL;
-    const uint64_t stream_flags =  SSL_STREAM_FLAG_UNI | SSL_STREAM_FLAG_ADVANCE;
+    const uint64_t stream_flags =
+        SSL_STREAM_FLAG_UNI | SSL_STREAM_FLAG_ADVANCE;
+    const char    *failedOperation = NULL;
+    int            bindResult = 0;
+
+    NS_NONNULL_ASSERT(errorPtr != NULL);
+    *errorPtr = NULL;
 
     if (conn == NULL) {
-        Ns_Log(Warning, "H3: quic_conn_open_server_uni_streams no connection");
+        *errorPtr = ns_strdup("no QUIC connection");
         return -1;
     }
 
-    h3ssl->conn    = conn;
+    /*
+     * Check each creation immediately, preserving its error stack
+     * before another OpenSSL operation can change it.
+     */
+    ERR_clear_error();
     h3ssl->cstream = SSL_new_stream(conn, stream_flags);
-    h3ssl->pstream = SSL_new_stream(conn, stream_flags);
-    h3ssl->rstream = SSL_new_stream(conn, stream_flags);
-
-    if (h3ssl->rstream == NULL|| h3ssl->pstream  == NULL|| h3ssl->cstream == NULL) {
-        Ns_Log(Warning, "H3: quic_conn_open_server_uni_streams: could not open uni‑streams");
-        goto cleanup_err;
+    if (h3ssl->cstream == NULL) {
+        failedOperation = "creating server control stream";
+        goto openssl_err;
     }
 
+    ERR_clear_error();
+    h3ssl->pstream = SSL_new_stream(conn, stream_flags);
+    if (h3ssl->pstream == NULL) {
+        failedOperation = "creating server QPACK encoder stream";
+        goto openssl_err;
+    }
 
-    {  // sanity test
+    ERR_clear_error();
+    h3ssl->rstream = SSL_new_stream(conn, stream_flags);
+    if (h3ssl->rstream == NULL) {
+        failedOperation = "creating server QPACK decoder stream";
+        goto openssl_err;
+    }
+
+    {
         int t0 = SSL_get_stream_type(h3ssl->cstream);
         int t1 = SSL_get_stream_type(h3ssl->pstream);
         int t2 = SSL_get_stream_type(h3ssl->rstream);
 
-        Ns_Log(Ns_LogQuicDebug, "[%lld] H3 server unis: c=%d, p=%d, r=%d (expect WRITE=%d)",
-               (long long)dc->iter, t0, t1, t2, SSL_STREAM_TYPE_WRITE);
+        Ns_Log(Ns_LogQuicDebug,
+               "[%lld] H3 server unis: c=%d, p=%d, r=%d (expect WRITE=%d)",
+               (long long)dc->iter, t0, t1, t2,
+               SSL_STREAM_TYPE_WRITE);
+
         assert(t0 == SSL_STREAM_TYPE_WRITE);
         assert(t1 == SSL_STREAM_TYPE_WRITE);
         assert(t2 == SSL_STREAM_TYPE_WRITE);
     }
-    ossl_conn_maybe_log_first_shutdown(cc, "quic_conn_open_server_uni_streams streams created");
+
+    ossl_conn_maybe_log_first_shutdown(
+        cc, "quic_conn_open_server_uni_streams streams created");
 
     ERR_clear_error();
 
     csc = PollsetAddStreamRegister(cc, h3ssl->cstream, H3_KIND_CTRL);
     if (csc == NULL) {
-        Ns_Log(Warning, "H3: could not register server control stream");
+        *errorPtr = ns_strdup("registering server control stream failed");
         goto cleanup_err;
     }
     h3ssl->cstream_id = csc->quic_sid;
 
-    psc = PollsetAddStreamRegister(cc, h3ssl->pstream, H3_KIND_QPACK_ENCODER);
+    psc = PollsetAddStreamRegister(cc, h3ssl->pstream,
+                                  H3_KIND_QPACK_ENCODER);
     if (psc == NULL) {
-        Ns_Log(Warning, "H3: could not register server QPACK encoder stream");
+        *errorPtr = ns_strdup("registering server QPACK encoder stream failed");
         goto cleanup_err;
     }
     h3ssl->pstream_id = psc->quic_sid;
 
-    rsc = PollsetAddStreamRegister(cc, h3ssl->rstream, H3_KIND_QPACK_DECODER);
+    rsc = PollsetAddStreamRegister(cc, h3ssl->rstream,
+                                  H3_KIND_QPACK_DECODER);
     if (rsc == NULL) {
-        Ns_Log(Warning, "H3: could not register server QPACK decoder stream");
+        *errorPtr = ns_strdup("registering server QPACK decoder stream failed");
         goto cleanup_err;
     }
     h3ssl->rstream_id = rsc->quic_sid;
 
-    /* Bind control first */
-    if (nghttp3_conn_bind_control_stream(h3conn, (int64_t)h3ssl->cstream_id) != 0) {
-        Ns_Log(Error, "H3: Failed to bind control stream");
-        goto cleanup_err;
+    /*
+     * Bind the control stream, followed by the local QPACK streams.
+     */
+    bindResult = nghttp3_conn_bind_control_stream(
+        h3conn, (int64_t)h3ssl->cstream_id);
+    if (bindResult != 0) {
+        failedOperation = "binding server control stream";
+        goto nghttp3_err;
     }
-    ossl_conn_maybe_log_first_shutdown(cc, "quic_conn_open_server_uni_streams cstream bound");
 
-    /* Now bind QPACK (server's local streams) */
-    if (nghttp3_conn_bind_qpack_streams(h3conn,
-                                        (int64_t)h3ssl->pstream_id,
-                                        (int64_t)h3ssl->rstream_id) != 0) {
-        Ns_Log(Warning, "H3 quic_conn_open_server_uni_streams: nghttp3_conn_bind_qpack_streams failed");
-        goto cleanup_err;
+    ossl_conn_maybe_log_first_shutdown(
+        cc, "quic_conn_open_server_uni_streams cstream bound");
+
+    bindResult = nghttp3_conn_bind_qpack_streams(
+        h3conn,
+        (int64_t)h3ssl->pstream_id,
+        (int64_t)h3ssl->rstream_id);
+    if (bindResult != 0) {
+        failedOperation = "binding server QPACK streams";
+        goto nghttp3_err;
     }
-    ossl_conn_maybe_log_first_shutdown(cc, "quic_conn_open_server_uni_streams qpack bound");
 
-    h3_conn_write_step(cc);
+    ossl_conn_maybe_log_first_shutdown(
+        cc, "quic_conn_open_server_uni_streams qpack bound");
+
+    (void)h3_conn_write_step(cc);
     {
         int rv = SSL_handle_events(conn);
-        Ns_Log(Ns_LogQuicDebug, "[%lld] SSL_handle_events in quic_conn_open_server_uni_streams conn %p => %d",
-               (long long)dc->iter, (void*)cc->h3ssl.conn, rv);
+
+        Ns_Log(Ns_LogQuicDebug,
+               "[%lld] SSL_handle_events in "
+               "quic_conn_open_server_uni_streams conn %p => %d",
+               (long long)dc->iter, (void *)conn, rv);
     }
 
-    Ns_Log(Ns_LogQuicDebug, "[%lld] H3 quic_conn_open_server_uni_streams: cstream %llu %p pstream %llu %p rstream %llu %p",
+    Ns_Log(Ns_LogQuicDebug,
+           "[%lld] H3 quic_conn_open_server_uni_streams:"
+           " cstream %" PRIu64 " %p"
+           " pstream %" PRIu64 " %p"
+           " rstream %" PRIu64 " %p",
            (long long)dc->iter,
-           (long long)h3ssl->cstream_id, (void*)h3ssl->cstream,
-           (long long)h3ssl->pstream_id, (void*)h3ssl->pstream,
-           (long long)h3ssl->rstream_id, (void*)h3ssl->rstream
-           );
+           h3ssl->cstream_id, (void *)h3ssl->cstream,
+           h3ssl->pstream_id, (void *)h3ssl->pstream,
+           h3ssl->rstream_id, (void *)h3ssl->rstream);
     return 0;
 
- cleanup_err:
+nghttp3_err:
+    {
+        Tcl_DString ds;
+        char        codeBuffer[32];
+
+        Tcl_DStringInit(&ds);
+        Tcl_DStringAppend(&ds, failedOperation, TCL_INDEX_NONE);
+        Tcl_DStringAppend(&ds, " failed: ", 9);
+        Tcl_DStringAppend(&ds, nghttp3_strerror(bindResult), TCL_INDEX_NONE);
+
+        snprintf(codeBuffer, sizeof(codeBuffer), " (%d)", bindResult);
+        Tcl_DStringAppend(&ds, codeBuffer, TCL_INDEX_NONE);
+
+        *errorPtr = Ns_DStringExport(&ds);
+    }
+    goto cleanup_err;
+
+openssl_err:
+    {
+        Tcl_DString   ds;
+        unsigned long errorCode = ERR_get_error();
+
+        Tcl_DStringInit(&ds);
+        Tcl_DStringAppend(&ds, failedOperation, TCL_INDEX_NONE);
+        Tcl_DStringAppend(&ds, " failed", 7);
+
+        if (errorCode != 0u) {
+            Ns_DStringAppendTLSErrorStack(&ds, errorCode);
+        } else {
+            Tcl_DStringAppend(&ds, ": OpenSSL error stack empty",
+                              TCL_INDEX_NONE);
+        }
+
+        *errorPtr = Ns_DStringExport(&ds);
+    }
+
+cleanup_err:
     if (rsc != NULL) {
         PollsetDetachStream(rsc, "server QPACK decoder setup failed");
     }
@@ -2026,8 +2106,10 @@ quic_conn_open_server_uni_streams(ConnCtx *cc, struct h3ssl *h3ssl)
     if (h3ssl->cstream != NULL) {
         SSL_free(h3ssl->cstream);
     }
-    h3ssl->rstream    = h3ssl->pstream    = h3ssl->cstream = NULL;
-    h3ssl->rstream_id = h3ssl->pstream_id = h3ssl->cstream_id = (uint64_t)-1;
+
+    h3ssl->rstream = h3ssl->pstream = h3ssl->cstream = NULL;
+    h3ssl->rstream_id = h3ssl->pstream_id =
+        h3ssl->cstream_id = (uint64_t)-1;
 
     return -1;
 }
@@ -2347,6 +2429,55 @@ quic_udp_set_rcvbuf(int fd, size_t rcvbuf_bytes)
         }
         if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &got, &glen) == 0) {
             Ns_Log(Ns_LogQuicDebug, "udp(fd=%d): SO_RCVBUF requested=%ld, actual=%ld",
+                   fd, size, got);
+        }
+    }
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * quic_udp_set_sndbuf --
+ *
+ *      Configure the send buffer size (SO_SNDBUF) for a UDP socket
+ *      used by the QUIC listener or transport thread. This helps tune
+ *      performance for high-throughput or high-concurrency QUIC traffic.
+ *
+ *      The function sets the kernel send buffer size to the requested
+ *      value and then queries it back via getsockopt() to report the
+ *      effective value (some platforms may double or clamp it).
+ *
+ * Arguments:
+ *      fd            - File descriptor of the UDP socket.
+ *      sndbuf_bytes  - Desired SO_SNDBUF size in bytes; if 0, the kernel
+ *                      default is left unchanged.
+ * Results:
+ *      None.
+ *
+ * Side effects:
+ *      May adjust the kernel send buffer size for the socket.
+ *      Logs both the requested and actual buffer sizes for diagnostics.
+ *
+ *----------------------------------------------------------------------
+ */
+static void
+quic_udp_set_sndbuf(int fd, size_t sndbuf_bytes)
+{
+    /* sndbuf_bytes == 0 means: leave kernel default */
+    if (sndbuf_bytes > 0) {
+        int       size = (int)sndbuf_bytes, got = 0;
+        socklen_t glen = (socklen_t)sizeof(got);
+
+        if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &got, &glen) != 0) {
+            Ns_Log(Warning, "udp(fd=%d): getsockopt(SO_SNDBUF) failed: %s",
+                   fd, strerror(errno));
+
+        } else if (got < size) {
+            Ns_Log(Warning, "udp(fd=%d): SO_SNDBUF requested=%d, effective=%d",
+                   fd, size, got);
+
+        } else {
+            Ns_Log(Ns_LogQuicDebug,"udp(fd=%d): SO_SNDBUF requested=%d, effective=%d",
                    fd, size, got);
         }
     }
@@ -3218,48 +3349,9 @@ h3_conn_write_step(ConnCtx *cc)
                 const SharedTxStatus status = SharedTxStatusRead(&ssc->sh);
 
                 if (status.abort_requested) {
-                    SSL_STREAM_RESET_ARGS resetArgs = {
-                        .quic_error_code = NGHTTP3_H3_REQUEST_CANCELLED
-                    };
-                    int ok;
-
-                    /*
-                     * Permanently prevent nghttp3 from scheduling further response
-                     * data for this stream.
-                     */
-                    nghttp3_conn_shutdown_stream_write(cc->h3conn, sid);
-                    ssc->transport_blocked = NS_FALSE;
-
-                    ERR_clear_error();
-                    ok = SSL_stream_reset(ssc->ssl,
-                                          &resetArgs, sizeof(resetArgs));
-                    if (ok != 1) {
-                        const unsigned long sslErr = ERR_peek_error();
-
-                        Ns_Log(Error,
-                               "[%lld] H3[%lld] SSL_stream_reset failed: "
-                               "lib=%d reason=%d (%s)",
-                               (long long)dc->iter,
-                               (long long)sid,
-                               sslErr != 0u ? ERR_GET_LIB(sslErr) : 0,
-                               sslErr != 0u ? ERR_GET_REASON(sslErr) : 0,
-                               sslErr != 0u && ERR_reason_error_string(sslErr) != NULL
-                               ? ERR_reason_error_string(sslErr)
-                               : "no OpenSSL error");
-                        ERR_clear_error();
-                    }
-
-                    /*
-                     * Record the processed terminal state only after attempting the
-                     * transport reset.
-                     */
-                    StreamCtxIoReset(ssc);
+                    h3_stream_abort_response(ssc, NGHTTP3_H3_REQUEST_CANCELLED,
+                                             "writer abort");
                     did_progress = NS_TRUE;
-
-                    /*
-                     * Existing reset handling disables W and schedules cleanup.
-                     */
-                    (void)h3_stream_maybe_finalize(ssc, "writer abort");
                     continue;
                 }
             }
@@ -3269,8 +3361,18 @@ h3_conn_write_step(ConnCtx *cc)
              * notification for headers which were submitted concurrently.
              */
             if (SharedHdrsIsReady(&ssc->sh)) {
-                if (h3_stream_submit_ready_headers(ssc) != 0) {
-                    /* error already logged inside; continue to next sid */
+                const int rv = h3_stream_submit_ready_headers(ssc);
+
+                if (rv != 0) {
+                    if (nghttp3_err_is_fatal(rv)) {
+                        quic_conn_enter_shutdown(cc,
+                                                 "fatal response header submission failure");
+                        return NS_TRUE;
+                    }
+
+                    h3_stream_abort_response(ssc, NGHTTP3_H3_INTERNAL_ERROR,
+                                             "response header submission failed");
+                    did_progress = NS_TRUE;
                     continue;
                 }
             }
@@ -3466,6 +3568,21 @@ h3_conn_write_step(ConnCtx *cc)
         //Ns_Log(Ns_LogQuicDebug, "[%lld] H3 write map: nghttp3 sid=%lld -> ssl %p (sid=%llu) kind=%s",
         //       (long long)dc->iter, (long long)sid, (void*)stream, (uint64_t)SSL_get_stream_id(stream),
         //       sc ? H3StreamKind_str(sc->kind) : "no-ctx");
+
+        if (sc != NULL && sc->transport_blocked) {
+            Ns_Log(Ns_LogQuicDebug,
+                   "[%lld] H3[%lld] nghttp3 selected transport-blocked stream:"
+                   " conn %p stream %p nvec %ld fin %d"
+                   " remaining %zu want-count %" PRIu64,
+                   (long long)dc->iter,
+                   (long long)sid,
+                   (void *)cc->h3ssl.conn,
+                   (void *)stream,
+                   (long)nvec,
+                   fin,
+                   sc->write_want_remaining,
+                   sc->write_want_count);
+        }
 
         /* Re-check connection shutdown just before IO */
         if (SSL_get_shutdown(cc->h3ssl.conn) != 0) {
@@ -3897,11 +4014,19 @@ h3_conn_write_step(ConnCtx *cc)
          */
 
         if (hit_want) {
+            Ns_Log(Ns_LogQuicDebug,
+                   "[%lld] H3[%lld] ending write pass after WANT:"
+                   " progress %d local-retry %d",
+                   (long long)dc->iter,
+                   (long long)sid,
+                   (int)did_progress,
+                   (int)need_local_retry);
+
             /*
-             * nghttp3 now knows that this stream is transport-blocked and can
-             * select another writable stream.
+             * Yield to driver event processing rather than immediately
+             * selecting the same unconsumed vector again.
              */
-            continue;
+            break;
         }
 
     next_sid:
@@ -4818,6 +4943,8 @@ h3_stream_feed_pending(StreamCtx *sc, uint64_t sid)
  *        - If SSL signals EOF (SSL_ERROR_ZERO_RETURN), it marks either an
  *          immediate or deferred FIN depending on whether data was already
  *          buffered, and returns DRAIN_EOF.
+ *        - Stream resets and connection-shutdown errors are logged at
+ *          Ns_LogQuicDebug and reported as DRAIN_ERROR.
  *        - Any other error is logged via ossl_log_error_detail() and
  *          reported as DRAIN_ERROR.
  *
@@ -4882,24 +5009,27 @@ h3_stream_read_into_hold(StreamCtx *sc, SSL *stream)
         }
 
         {
-            unsigned long osslErr = ERR_peek_error();
+            const unsigned long osslErr = ERR_peek_error();
+            const int           reason = ERR_GET_REASON(osslErr);
 
             if (err == SSL_ERROR_SSL
                 && osslErr != 0u
                 && ERR_GET_LIB(osslErr) == ERR_LIB_SSL
-                && ERR_GET_REASON(osslErr)
-                   == SSL_R_PROTOCOL_IS_SHUTDOWN) {
+                && (reason == SSL_R_PROTOCOL_IS_SHUTDOWN
+                    || reason == SSL_R_STREAM_RESET)) {
 
                 /*
-                 * This commonly occurs when a stream is examined after
-                 * its owning connection has entered shutdown. Preserve
-                 * the existing DRAIN_ERROR control flow, but do not
-                 * report the expected shutdown condition as an error.
+                 * Stream resets and reads after connection shutdown
+                 * are expected terminal conditions. Preserve the
+                 * DRAIN_ERROR control flow for stream cleanup, but
+                 * report these conditions only at debug severity.
                  */
                 Ns_Log(Ns_LogQuicDebug,
-                       "H3[%lld] stream drain stopped after "
-                       "connection shutdown",
-                       (long long)sc->quic_sid);
+                       "H3[%lld] stream drain stopped: %s",
+                       (long long)sc->quic_sid,
+                       reason == SSL_R_STREAM_RESET
+                       ? "stream reset"
+                       : "connection shutdown");
 
                 ERR_clear_error();
             } else {
@@ -5455,6 +5585,80 @@ h3_stream_submit_ready_headers(StreamCtx *sc)
     }
 
     return 0;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * h3_stream_abort_response --
+ *
+ *      Abort response transmission for a bidirectional request stream.
+ *      The caller must run on the owning QUIC thread with a valid
+ *      stream SSL object.
+ *
+ *      Stop further response scheduling in nghttp3, attempt a QUIC
+ *      stream reset with the supplied application error code, and
+ *      publish the local terminal state. The reason identifies the
+ *      abort in diagnostics and finalization.
+ *
+ * Results:
+ *      None.
+ *
+ * Side effects:
+ *      Marks the shared response as aborted, clears header readiness
+ *      and transport-blocked state, and wakes blocked producers.
+ *      Logs transport-reset failures. Invokes normal finalization to
+ *      disable write interest and schedule deferred cleanup, subject
+ *      to the existing resource-lifetime checks.
+ *
+ *----------------------------------------------------------------------
+ */
+static void
+h3_stream_abort_response(StreamCtx *sc, uint64_t errorCode,
+                         const char *reason)
+{
+    ConnCtx              *cc = sc->cc;
+    NsTLSConfig          *dc = cc->dc;
+    SSL_STREAM_RESET_ARGS resetArgs = {
+        .quic_error_code = errorCode
+    };
+    int                   ok;
+
+    NS_TA_ASSERT_HELD(cc, affinity);
+    assert(StreamCtxIsBidi(sc));
+    assert(sc->ssl != NULL);
+
+    SharedMarkAbortRequested(&sc->sh);
+    SharedHdrsClear(&sc->sh);
+
+    nghttp3_conn_shutdown_stream_write(cc->h3conn, h3_stream_id(sc));
+    sc->transport_blocked = NS_FALSE;
+
+    ERR_clear_error();
+    ok = SSL_stream_reset(sc->ssl, &resetArgs, sizeof(resetArgs));
+    if (ok != 1) {
+        const unsigned long sslErr = ERR_peek_error();
+        const char         *errorString =
+            sslErr != 0u ? ERR_reason_error_string(sslErr) : NULL;
+
+        Ns_Log(Error,
+               "[%lld] H3[%lld] SSL_stream_reset failed (%s): "
+               "lib=%d reason=%d (%s)",
+               (long long)dc->iter,
+               (long long)sc->quic_sid,
+               reason,
+               sslErr != 0u ? ERR_GET_LIB(sslErr) : 0,
+               sslErr != 0u ? ERR_GET_REASON(sslErr) : 0,
+               errorString != NULL ? errorString : "no OpenSSL error");
+        ERR_clear_error();
+    }
+
+    /*
+     * Publishing reset also stops sends and wakes blocked producers.
+     * Finalization disables write interest and schedules deferred cleanup.
+     */
+    StreamCtxIoReset(sc);
+    (void)h3_stream_maybe_finalize(sc, reason);
 }
 
 /*
@@ -6214,7 +6418,29 @@ static int on_recv_header(nghttp3_conn *UNUSED(conn), int64_t UNUSED(stream_id),
             }
         }
 
-        Ns_SetPutSz(hdrs, (const char*)n.base, (TCL_SIZE_T)n.len, (const char*)v.base, (TCL_SIZE_T)v.len);
+        /*
+         * RFC 9114, Section 4.2.1: concatenate split Cookie fields
+         * with "; " before passing them to the application.
+         */
+        if (n.len == 6 && memcmp(n.base, "cookie", 6) == 0) {
+            int idx = Ns_SetFind(hdrs, "cookie");
+
+            if (idx >= 0) {
+                Tcl_DString ds;
+
+                Tcl_DStringInit(&ds);
+                Tcl_DStringAppend(&ds, Ns_SetValue(hdrs, (size_t)idx),
+                                  TCL_INDEX_NONE);
+                Tcl_DStringAppend(&ds, "; ", 2);
+                Tcl_DStringAppend(&ds, (const char *)v.base, (TCL_SIZE_T)v.len);
+                Ns_SetPutValueSz(hdrs, (size_t)idx, ds.string, ds.length);
+                Tcl_DStringFree(&ds);
+
+                return 0;
+            }
+        }
+        Ns_SetPutSz(hdrs, (const char*)n.base, (TCL_SIZE_T)n.len,
+                    (const char*)v.base, (TCL_SIZE_T)v.len);
     }
     return 0;
 }
@@ -6302,7 +6528,12 @@ on_end_headers(nghttp3_conn *UNUSED(conn), int64_t stream_id, int fin,
         Tcl_DStringAppend(&line, sc->method, TCL_INDEX_NONE);
         Tcl_DStringAppend(&line, " ", 1);
         Tcl_DStringAppend(&line, sc->path, TCL_INDEX_NONE);
-        Tcl_DStringAppend(&line, " HTTP/1.1", 9);
+        /*
+         * HTTP/3 has no wire request line. Use its implicit protocol
+         * version "3.0" (RFC 9114, Section 4.3.1) in this internal
+         * representation for logging and request introspection.
+         */
+        Tcl_DStringAppend(&line, " HTTP/3.0", 9);
 
         Ns_Log(Ns_LogQuicDebug, "H3[%lld] on_end_headers peer %s request line: %s",
                (long long)stream_id, peer, line.string);
@@ -8723,18 +8954,17 @@ PollsetSweep(NsTLSConfig *dc, size_t poll_result_count)
         Ns_DListSetLength(&h3->dead_items, writeIdx);
         Ns_Log(Ns_LogQuicDebug, "[%lld] PollsetSweep compacted dead items from %zu to %zu", (long long)dc->iter, oldLength, writeIdx);
 
-        if (writeIdx > 0) {
-            size_t i;
-
-            for (i = 0u; i < writeIdx; i++) {
+        if (writeIdx > 0
+            && Ns_LogSeverityEnabled(Ns_LogQuicDebug)) {
+            for (size_t i = 0u; i < writeIdx; i++) {
                 SSL       *ssl = h3->dead_items.data[i];
                 StreamCtx *sc  = SSL_get_ex_data(ssl, h3->sc_idx);
 
                 if (sc != NULL) {
                     const unsigned int deliveryRefs = StreamCtxDeliveryRefs(sc);
 
-                    Ns_Log(Notice,
-                           "[%lld] PollsetSweep: defer dead stream SSL %p "
+                    Ns_Log(Ns_LogQuicDebug,
+                           "[%lld] PollsetSweep: retain detached stream SSL %p "
                            "sc %p deliveryRefs %u",
                            (long long)dc->iter,
                            (void *)ssl,
@@ -8743,8 +8973,8 @@ PollsetSweep(NsTLSConfig *dc, size_t poll_result_count)
                 } else {
                     ConnCtx *cc = SSL_get_ex_data(ssl, h3->cc_idx);
 
-                    Ns_Log(Notice,
-                           "[%lld] PollsetSweep: defer dead connection SSL %p "
+                    Ns_Log(Ns_LogQuicDebug,
+                           "[%lld] PollsetSweep: retain detached connection SSL %p "
                            "cc %p",
                            (long long)dc->iter,
                            (void *)ssl,
@@ -9155,7 +9385,9 @@ NS_EXPORT Ns_ReturnCode Ns_ModuleInit(const char *server, const char *module)
                "address-validation Retry packets will not be sent");
     }
     dc->u.h3.recvbufsize = (size_t)Ns_ConfigMemUnitRange(section, "recvbufsize", "8MB",
-                                                         1024*8000, 0, INT_MAX);
+                                                                  8 * 1024 * 1024, 0, INT_MAX);
+    dc->u.h3.sendbufsize = (size_t)Ns_ConfigMemUnitRange(section, "sendbufsize", "8MB",
+                                                                  8 * 1024 * 1024, 0, INT_MAX);
     dc->u.h3.sendqueuesize =
         (size_t)Ns_ConfigMemUnitRange(section, "sendqueuesize", "256kB",
                                       256 * 1024, 1024, INT_MAX);
@@ -9173,7 +9405,7 @@ NS_EXPORT Ns_ReturnCode Ns_ModuleInit(const char *server, const char *module)
     Ns_MutexSetName2(&quicMemStats.lock, "h3", "memstats");
 #endif
 
-    init.version = NS_DRIVER_VERSION_7;
+    init.version = NS_DRIVER_VERSION_8;
     init.name = "quic";
     init.listenProc = Listen;
     init.acceptProc = Accept;
@@ -9183,6 +9415,7 @@ NS_EXPORT Ns_ReturnCode Ns_ModuleInit(const char *server, const char *module)
     init.sendFileProc = NULL;
     init.sendReadyProc = SendReady;
     init.sendCancelProc = SendCancel;
+    init.sendWaitProc = SendWait;
     init.keepProc = Keep;
     init.connInfoProc = ConnInfo;
     init.clientcertInfoProc = ClientcertInfo;
@@ -9744,6 +9977,7 @@ TLSConfigClone(const NsTLSConfig *source)
         const bool           validate_client_address =
             source->u.h3.validate_client_address;
         const size_t         recvbufsize   = source->u.h3.recvbufsize;
+        const size_t         sendbufsize   = source->u.h3.sendbufsize;
         const size_t         sendqueuesize = source->u.h3.sendqueuesize;
         const struct timeval idle_timeout  = source->u.h3.idle_timeout;
         const struct timeval drain_timeout = source->u.h3.drain_timeout;
@@ -9754,6 +9988,7 @@ TLSConfigClone(const NsTLSConfig *source)
 
         dc->u.h3.validate_client_address = validate_client_address;
         dc->u.h3.recvbufsize             = recvbufsize;
+        dc->u.h3.sendbufsize             = sendbufsize;
         dc->u.h3.sendqueuesize           = sendqueuesize;
         dc->u.h3.idle_timeout            = idle_timeout;
         dc->u.h3.drain_timeout           = drain_timeout;
@@ -10705,6 +10940,7 @@ Listen(Ns_Driver *driver, const char *address, unsigned short port, int UNUSED(b
 
         (void) Ns_SockSetNonBlocking(sock);
         quic_udp_set_rcvbuf(sock, h3->recvbufsize);
+        quic_udp_set_sndbuf(sock, h3->sendbufsize);
 
         /*
          * Set app data of listener ssl to listen fd
@@ -10977,6 +11213,59 @@ Send(Ns_Sock *sock, const struct iovec *iov, int niov, unsigned int UNUSED(flags
     Ns_Log(Ns_LogQuicDebug, "[%lld] H3 Send nbufs %d -> DONE (consumed %ld)",
            (long long)dc->iter, niov, consumed);
     return consumed;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * SendWait --
+ *
+ *      Wait for space in the stream's bounded response queue for a caller
+ *      which explicitly permits blocking. The QUIC event loop continues
+ *      draining the queue independently. Generic writers use SendReady()
+ *      instead, and nonblocking connection channels do not call this hook.
+ *
+ * Results:
+ *      NS_OK when sending can be retried, NS_TIMEOUT on expiry, or NS_ERROR
+ *      on a terminal stream. Store the corresponding socket send error.
+ *
+ * Side effects:
+ *      May suspend the producer until the low-water mark or termination.
+ *      Never blocks the owning QUIC event loop.
+ *
+ *----------------------------------------------------------------------
+ */
+static Ns_ReturnCode
+SendWait(Ns_Sock *sock, const Ns_Time *timeoutPtr)
+{
+    NsTLSConfig  *dc = sock->driver->arg;
+    StreamCtx    *sc = StreamCtxFromSock(dc, sock);
+    Ns_ReturnCode status;
+    unsigned long errorCode = 0u;
+
+    if (sc == NULL) {
+        status = NS_ERROR;
+        errorCode = EPIPE;
+#if NS_ENABLE_THREAD_AFFINITY
+    } else if (NS_TA_IS_OWNER(sc->cc, affinity)) {
+        /* A blocking wait here would prevent this stream from draining. */
+        status = NS_ERROR;
+        errorCode = NS_EWOULDBLOCK;
+#endif
+    } else {
+        status = SharedSendWait(&sc->sh, timeoutPtr);
+        if (status == NS_TIMEOUT) {
+            errorCode = NS_ETIMEDOUT;
+        } else if (status != NS_OK) {
+            errorCode = H3_IO_HAS(sc, H3_IO_RESET) ? NS_ECONNRESET : EPIPE;
+        }
+    }
+    if (errorCode != 0u) {
+        Ns_SockSetSendErrno(sock, errorCode);
+        Ns_SetSockErrno((ns_sockerrno_t)errorCode);
+    }
+
+    return status;
 }
 
 /*
