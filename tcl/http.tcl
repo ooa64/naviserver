@@ -541,6 +541,7 @@ if {[dict get [ns_info buildinfo] with_deprecated]} {
     proc _ns_http_gets {timeout sock} {
         ns_deprecated "" "helper of deprecated proc"
 
+        _ns_http_readable $timeout $sock
         while {[gets $sock line] == -1} {
             if {[eof $sock]} {
                 return -code error "_ns_http_gets: premature end of data"
