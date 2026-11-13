@@ -355,10 +355,19 @@ Ns_ParseRequest(Ns_Request *request, const char *line, size_t len)
         } else {
             /*
              * The last token does not have the form of an HTTP-version
-             * string. Report result as invalid request.
+             * string.
              */
+#ifdef HTTP09_UNSAFE_URL
+            /* Allow spaces in URL for HTTP 0.9. Note the comment below. */
+            if (*url != '/') {
+            	errorMsg = "HTTP 0.9 URL does not start with a slash";
+                goto error;
+            }
+#else
+			/*  Report result as invalid request. */
             errorMsg = "version information invalid";
             goto error;
+#endif
         }
     } else {
         /*
