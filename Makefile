@@ -10,8 +10,12 @@
 #
 #
 #
-MAN_CSS=man-5.0.css
-HEADER_INC=header-5.0.inc
+# Select documentation assets from the configured checkout version.
+DOC_VERSION_FILE  ?= ./version_include.man
+DOC_VERSION       := $(shell sed -n 's/^\[vset version \([^]]*\)\]/\1/p' $(DOC_VERSION_FILE))
+DOC_VERSION_MINOR := $(shell printf '%s\n' '$(DOC_VERSION)' | sed 's/^\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/')
+MAN_CSS ?= man-$(DOC_VERSION_MINOR).css
+HEADER_INC ?= header-$(DOC_VERSION_MINOR).inc
 
 NSBUILD=1
 include include/Makefile.global
@@ -174,17 +178,10 @@ install-examples:
 	done
 
 
-# On some systems you may need a special shell script to control the
-# PATH seen by dtplite, as that influences which versions of tclsh and
-# Tcllib dtplite uses.  I personally found it necessary to use a
-# one-line script like this for the DTPLITE command:
-#   env PATH=/usr/sbin:/usr/bin:/sbin:/bin dtplite "$@"
-# --atp@piskorski.com, 2014/08/27 10:52 EDT
-
-ifeq ($(DTPLITE),)
-  DTPLITE=dtplite
-else
-  # Do nothing, use the environment variable as is.
+# Run Tcllib with the configured interpreter, independent of PATH's tclsh
+# and dtplite executables. Keep DTPLITE available as an explicit override.
+ifeq ($(strip $(DTPLITE)),)
+  DTPLITE = $(TCLSH_PROG) "$(CURDIR)/doc/tools/dtplite.tcl"
 endif
 
 build-doc:
@@ -240,9 +237,6 @@ build-doc:
 # Local copy of Source Forge Documentation
 #
 SF_HTDOCS         ?= /usr/local/ns/sf-naviserver-htdocs
-DOC_VERSION_FILE  ?= ./version_include.man
-DOC_VERSION       := $(shell sed -n 's/^\[vset version \([^]]*\)\]/\1/p' $(DOC_VERSION_FILE))
-DOC_VERSION_MINOR := $(shell printf '%s\n' '$(DOC_VERSION)' | sed 's/^\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/')
 
 install-sf-doc:
 	@if [ -z "$(DOC_VERSION)" ] || [ -z "$(DOC_VERSION_MINOR)" ]; then \
@@ -300,6 +294,7 @@ NS_TEST_CFG	= -c -d -t $(srcdir)/tests/test.nscfg
 endif
 
 
+NS_TEST_ENV     = OPENSSL="$(OPENSSL)"
 NS_TEST_ALL	= $(srcdir)/tests/all.tcl $(TESTFLAGS)
 NS_LD_LIBRARY_PATH	= \
    LD_LIBRARY_PATH="$(srcdir)/nsd:$(srcdir)/nsthread:$(srcdir)/nsdb:$(srcdir)/nsproxy:$$LD_LIBRARY_PATH" \
@@ -316,7 +311,7 @@ ifneq ($(OPENSSL_LIBS),)
   EXTRA_TEST_REQ    = $(PEM_FILE)
 endif
 
-$(PEM_FILE): $(PEM_PRIVATE)
+$(PEM_FILE): $(PEM_PRIVATE) $(SSLCONFIG)
 	$(OPENSSL) genrsa 2048 > host.key
 	# openssl rejects on some platforms building certificates with SHA1, which requires TLS>1.0, excluding Windows XP.
 	$(OPENSSL) req -new -config $(SSLCONFIG) -x509 -nodes -sha256 -days 365 -key host.key > host.cert
@@ -339,22 +334,22 @@ test: all $(EXTRA_TEST_REQ)
 	@if [ $(shell id -u) = 0 ]; then \
 	    $(CHOWN) -R nsadmin $(srcdir)/tests ; \
 	fi;
-	$(NS_LD_LIBRARY_PATH) ./nsd/nsd $(NS_TEST_CFG) $(NS_TEST_ALL)
+	$(NS_TEST_ENV) $(NS_LD_LIBRARY_PATH) ./nsd/nsd $(NS_TEST_CFG) $(NS_TEST_ALL)
 	@for i in $(EXTRA_TEST_DIRS); do \
 		( cd $$i && $(MAKE) test ) || exit 1; \
 	done
 
 runtest: all
-	$(NS_LD_LIBRARY_PATH) ./nsd/nsd $(NS_TEST_CFG)
+	$(NS_TEST_ENV) $(NS_LD_LIBRARY_PATH) ./nsd/nsd $(NS_TEST_CFG)
 
 gdbtest: all
-	$(NS_LD_LIBRARY_PATH) gdb -ex=run --args ./nsd/nsd $(NS_TEST_CFG) $(NS_TEST_ALL)
+	$(NS_TEST_ENV) $(NS_LD_LIBRARY_PATH) gdb -ex=run --args ./nsd/nsd $(NS_TEST_CFG) $(NS_TEST_ALL)
 #	@echo set args $(NS_TEST_CFG) $(NS_TEST_ALL) > gdb.run
-#	$(NS_LD_LIBRARY_PATH) gdb -x gdb.run ./nsd/nsd
+#	$(NS_TEST_ENV) $(NS_LD_LIBRARY_PATH) gdb -x gdb.run ./nsd/nsd
 #	$(RM) gdb.run
 
 lldbtest: all
-	$(NS_LD_LIBRARY_PATH) lldb -- ./nsd/nsd $(NS_TEST_CFG) $(NS_TEST_ALL)
+	$(NS_TEST_ENV) $(NS_LD_LIBRARY_PATH) lldb -- ./nsd/nsd $(NS_TEST_CFG) $(NS_TEST_ALL)
 
 lldb-sample: all
 	lldb -o run -- $(DESTDIR)$(NAVISERVER)/bin/nsd -f -u nsadmin -t $(DESTDIR)$(NAVISERVER)/conf/nsd-config.tcl
@@ -362,13 +357,13 @@ lldb-sample: all
 
 gdbruntest: all
 	@echo set args $(NS_TEST_CFG) > gdb.run
-	$(NS_LD_LIBRARY_PATH) gdb -x gdb.run ./nsd/nsd
+	$(NS_TEST_ENV) $(NS_LD_LIBRARY_PATH) gdb -x gdb.run ./nsd/nsd
 	$(RM) gdb.run
 
 memcheck: all
-	$(NS_LD_LIBRARY_PATH) valgrind --tool=memcheck ./nsd/nsd $(NS_TEST_CFG) $(NS_TEST_ALL)
+	$(NS_TEST_ENV) $(NS_LD_LIBRARY_PATH) valgrind --tool=memcheck ./nsd/nsd $(NS_TEST_CFG) $(NS_TEST_ALL)
 helgrind: all
-	$(NS_LD_LIBRARY_PATH) valgrind --tool=helgrind ./nsd/nsd $(NS_TEST_CFG) $(NS_TEST_ALL)
+	$(NS_TEST_ENV) $(NS_LD_LIBRARY_PATH) valgrind --tool=helgrind ./nsd/nsd $(NS_TEST_CFG) $(NS_TEST_ALL)
 
 CPPCHECK_SYS_INCLUDES=-I/usr/include
 #CPPCHECK_SYS_INCLUDES=-I`xcrun --show-sdk-path`/usr/include

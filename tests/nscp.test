@@ -19,6 +19,162 @@ test nscp-2.0 {return users from config file} -constraints nscpLoaded -body {
     nscp users
 } -returnCodes {ok error} -result {{} nsadmin}
 
+
+# Keep server-side rejection diagnostics visible in CI, restoring the previous
+# severity setting after this test file. Passwords/hashes are never logged.
+set nscpWarningEnabled [ns_logctl severity warning true]
+
+proc nscpFailureContext {sock suffix} {
+    set details [dict create expectedPrompt $suffix]
+    foreach {key script} [list \
+        server {ns_info server} \
+        loopback {ns_config test loopback} \
+        listener {list [ns_config ns/server/test/module/nscp address] [ns_config ns/server/test/module/nscp port]} \
+        allowLoopbackEmptyUser {ns_config -bool ns/server/test/module/nscp allowLoopbackEmptyUser false} \
+        echopasswd {ns_config -bool ns/server/test/module/nscp echopasswd false} \
+        channelStatus [list ns_connchan status $sock] \
+        authTestCalls {expr {[nsv_exists nscpLoopbackTest calls] ? [nsv_get nscpLoopbackTest calls] : "inactive"}}] {
+        if {[catch {uplevel 1 $script} value]} {set value "unavailable: $value"}
+        dict set details $key $value
+    }
+    return $details
+}
+
+# Use NaviServer's native connector, including for IPv6 on Tcl 8.5. Raw
+# connection-channel I/O preserves CR/LF without Tcl channel encodings.
+proc nscpOpenTestConnection {} {
+    set sock [ns_connchan connect -timeout 5s [ns_config test loopback] \
+                  [ns_config ns/server/test/module/nscp port]]
+    set code [catch {
+        # Only handle socket-thread shutdown; reads remain synchronous here.
+        ns_connchan callback -receivetimeout 5s -sendtimeout 5s \
+            $sock {apply {{reason} {return 0}}} x
+    } message options]
+    if {$code != 0} {
+        ns_connchan close $sock
+        return -options $options $message
+    }
+    return $sock
+}
+
+proc nscpWrite {sock data} {
+    set deadline [expr {[clock milliseconds] + 5000}]
+    ns_connchan write $sock $data
+    # Partial writes are queued by ns_connchan; flush without resending data.
+    while {[dict get [ns_connchan status $sock] sendbuffer] > 0} {
+        if {[clock milliseconds] > $deadline} {
+            error "nscp write timed out; diagnostics: [nscpFailureContext $sock {}]"
+        }
+        after 1
+        ns_connchan write $sock ""
+    }
+}
+
+proc nscpReadUntil {sock suffix} {
+    set result ""
+    set deadline [expr {[clock milliseconds] + 5000}]
+    while {![string match *$suffix $result]} {
+        if {[catch {ns_connchan read $sock} data]} {
+            error "nscp read failed: $data; diagnostics: [nscpFailureContext $sock $suffix]"
+        }
+        append result $data
+        if {[string match *$suffix $result]} {return $result}
+        if {$data eq "" || [clock milliseconds] > $deadline} {
+            error "nscp prompt missing: [list $result]; diagnostics: [nscpFailureContext $sock $suffix]"
+        }
+        after 1
+    }
+    return $result
+}
+
+foreach {number description chunks expected} [list \
+    3.0 {pasted CRLF continuations} \
+        [list "list first \\\r\n second \\\r\n third\r\n"] {first second third} \
+    3.1 {CRLF split between socket reads} \
+        [list "list first \\\r" "\n second\r\n"] {first second} \
+    3.2 {interactive CRLF continuations} \
+        [list "list first \\\r\n" " second\r\n"] {first second} \
+    3.3 {LF continuations} \
+        [list "list first \\\n second\n"] {first second} \
+    3.4 {escaped backslash is not a continuation} \
+        [list "list first \\\\\r\n"] {first \\} \
+    3.5 {braced multiline value} \
+        [list "set value {first\r\nsecond}\r\n"] "first\nsecond"] {
+    test nscp-$number $description -constraints nscpLoaded -setup {
+        set sock ""
+        set sock [nscpOpenTestConnection]
+        nscpReadUntil $sock "login: "
+        nscpWrite $sock "\r\n"
+        nscpReadUntil $sock "Password: "
+        nscpWrite $sock "\r\n"
+        nscpReadUntil $sock "test:nscp 1> "
+    } -body {
+        foreach chunk $chunks {
+            nscpWrite $sock $chunk
+            after 50
+        }
+        set response [nscpReadUntil $sock "test:nscp 2> "]
+        if {[string first "$expected\r\n" $response] < 0} {
+            error "unexpected nscp response: [list $response]; diagnostics: [nscpFailureContext $sock {test:nscp 2> }]"
+        }
+        expr {1}
+    } -cleanup {
+        if {$sock ne "" && [ns_connchan exists $sock]} {ns_connchan close $sock}
+    } -result 1
+}
+# Exercise the loopback opt-in separately from password authentication. The
+# guarded provider rejects normal authentication while these tests run, so an
+# empty crypt salt cannot accidentally make a broken loopback check pass.
+# It remains inert after cleanup and does not change the configured users.
+proc nscpDenyUserAuthForTest {} {
+    if {![nsv_exists nscpLoopbackTest registered]} {
+        ns_register_auth -first -authority nscp-loopback-test user [list apply {{user password} {
+            if {[nsv_exists nscpLoopbackTest active]
+                && [nsv_get nscpLoopbackTest active]} {
+                nsv_incr nscpLoopbackTest calls
+                return -code break FORBIDDEN
+            }
+            return UNAUTHORIZED
+        }}]
+        nsv_set nscpLoopbackTest registered 1
+    }
+    nsv_set nscpLoopbackTest active 1
+    nsv_set nscpLoopbackTest calls 0
+}
+
+foreach {number description login suffix expected} [list \
+    4.0 {empty loopback user bypasses rejecting user authentication} \
+        {} "test:nscp 1> " {FORBIDDEN 1 1} \
+    4.1 {named loopback user still requires user authentication} \
+        nscp-loopback-denied "Access denied!\n" {FORBIDDEN 2 1}] {
+    test nscp-$number $description -constraints nscpLoaded -setup {
+        set sock ""
+        nscpDenyUserAuthForTest
+        # Prove that the rejecting provider is active before opening nscp.
+        set directAuth [ns_auth user $login unused-test-password]
+        set sock [nscpOpenTestConnection]
+        nscpReadUntil $sock "login: "
+        nscpWrite $sock "$login\r\n"
+        nscpReadUntil $sock "Password: "
+        nscpWrite $sock "unused-test-password\r\n"
+    } -body {
+        set response [nscpReadUntil $sock $suffix]
+        list $directAuth [nsv_get nscpLoopbackTest calls] \
+            [string match *$suffix $response]
+    } -cleanup {
+        nsv_set nscpLoopbackTest active 0
+        if {$sock ne "" && [ns_connchan exists $sock]} {ns_connchan close $sock}
+    } -result $expected
+}
+rename nscpDenyUserAuthForTest {}
+
+rename nscpWrite {}
+rename nscpReadUntil {}
+rename nscpOpenTestConnection {}
+rename nscpFailureContext {}
+ns_logctl severity warning $nscpWarningEnabled
+unset nscpWarningEnabled
+
 cleanupTests
 
 # Local variables:
